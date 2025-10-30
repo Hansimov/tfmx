@@ -1,0 +1,19 @@
+[project]
+name = "tfmx"
+version = "0.0.1"
+authors = [
+    { name="Hansimov" },
+]
+description = "Serve Transformers in one line"
+readme = "README.md"
+requires-python = ">=3.6"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/Hansimov/tfmx"
+Issues = "https://github.com/Hansimov/tfmx/issues"
