@@ -1,6 +1,6 @@
 [project]
 name = "tfmx"
-version = "0.0.1"
+version = "0.1"
 authors = [
     { name="Hansimov" },
 ]
@@ -12,7 +12,7 @@ classifiers = [
     "License :: OSI Approved :: MIT License",
     "Operating System :: OS Independent",
 ]
-dependencies = []
+dependencies = [ "tclogger", "numpy", "requests" ]
 
 [project.urls]
 Homepage = "https://github.com/Hansimov/tfmx"
