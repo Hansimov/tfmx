@@ -107,5 +107,10 @@ def main():
 if __name__ == "__main__":
     main()
 
+    # Case 1: gte-multilingual-base
     # python -m tfmx.embed_server -t "tei" -p 28888 -m "Alibaba-NLP/gte-multilingual-base" -id "Alibaba-NLP--gte-multilingual-base" -b
     # python -m tfmx.embed_server -t "tei" -id "Alibaba-NLP--gte-multilingual-base" -k
+
+    # Case 2: bge-large-zh-v1.5
+    # python -m tfmx.embed_server -t "tei" -p 28889 -m "BAAI/bge-large-zh-v1.5" -id "BAAI--bge-large-zh-v1.5" -b
+    # python -m tfmx.embed_server -t "tei" -id "BAAI--bge-large-zh-v1.5" -k

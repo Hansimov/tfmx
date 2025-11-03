@@ -30,16 +30,15 @@ done
 
 # paths
 TFMX_DIR=${TFMX_DIR:-"$HOME/repos/tfmx"}
-TFMX_DOCKER_DATA_DIR=${TFMX_DOCKER_DATA_DIR:-"$TFMX_DIR/data/docker_data"}
 CACHE_HF=${CACHE_HF:-".cache/huggingface"}
 CACHE_HF_HUB=${CACHE_HF_HUB:-"$CACHE_HF/hub"}
-TEI_IMAGE=${TEI_IMAGE:-"ghcr.io/huggingface/text-embeddings-inference:1.8"}
-CONFIG_SENTFM_JSON=${CONFIG_SENTFM_JSON:-"config_sentence_transformers.json"}
+HF_ENDPOINT="https://hf-mirror.com"
 
 # patch config file to avoid redundant download
 MODEL_NAME_DASH="$(printf '%s' "$MODEL_NAME" | sed 's,/,--,g')"
 MODEL_SNAPSHOT_DIR=$(find "$HOME/$CACHE_HF_HUB" -type d -path "*/models--$MODEL_NAME_DASH/snapshots/*" -print -quit || true)
 if [[ -n "${MODEL_SNAPSHOT_DIR:-}" ]]; then
+    CONFIG_SENTFM_JSON="config_sentence_transformers.json"
     TARGET_SENTFM_CONFIG="$MODEL_SNAPSHOT_DIR/$CONFIG_SENTFM_JSON"
     SOURCE_SENTFM_CONFIG="$TFMX_DIR/src/tfmx/$CONFIG_SENTFM_JSON"
     if [[ -f "$TARGET_SENTFM_CONFIG" ]]; then
@@ -55,15 +54,20 @@ if [[ -n "$CONTAINER_EXISTS" ]]; then
     docker start "$INSTANCE_ID"
     echo "[tfmx] Container '$INSTANCE_ID' (:$PORT) is existed"
 else
+    ROOT_CACHE_HF_HUB="/root/$CACHE_HF_HUB"
+    ROOT_CACHE_HF="/root/$CACHE_HF"
+    TFMX_DOCKER_DATA_DIR="$TFMX_DIR/data/docker_data"
+    TEI_IMAGE=${TEI_IMAGE:-"ghcr.io/huggingface/text-embeddings-inference:1.8"}
     mkdir -p "$TFMX_DOCKER_DATA_DIR"
     docker run --gpus all -d --name "$INSTANCE_ID" -p "$PORT:80" \
-        -v "$HOME/$CACHE_HF":"/root/$CACHE_HF" \
+        -v "$HOME/$CACHE_HF":"$ROOT_CACHE_HF" \
         -v "$TFMX_DOCKER_DATA_DIR":/data \
-        -e HF_HOME="/root/$CACHE_HF" \
-        -e HF_HUB_CACHE="/root/$CACHE_HF_HUB" \
-        -e HUGGINGFACE_HUB_CACHE="/root/$CACHE_HF_HUB" \
+        -e HF_ENDPOINT="$HF_ENDPOINT" \
+        -e HF_HOME="$ROOT_CACHE_HF" \
+        -e HF_HUB_CACHE="$ROOT_CACHE_HF_HUB" \
+        -e HUGGINGFACE_HUB_CACHE="$ROOT_CACHE_HF_HUB" \
         --pull always "$TEI_IMAGE" \
-        --huggingface-hub-cache "/root/$CACHE_HF_HUB" \
+        --huggingface-hub-cache "$ROOT_CACHE_HF_HUB" \
         --model-id "$MODEL_NAME" --dtype float16
     echo "[tfmx] Container '$INSTANCE_ID' (:$PORT) is started"
 fi
