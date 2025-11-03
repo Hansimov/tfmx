@@ -3,6 +3,7 @@ import shlex
 
 from pathlib import Path
 from tclogger import logger, shell_cmd
+from typing import TypedDict
 
 
 class TEIEmbedServerConfigsType(TypedDict):
