@@ -1,17 +1,22 @@
-import requests
+import argparse
 import numpy as np
+import requests
+import shlex
 
-from tclogger import StrsType, logger
+from pathlib import Path
+from tclogger import StrsType, logger, shell_cmd
 from typing import Literal, TypedDict, Optional, Union
 
-EmbedApiType = Literal["openai", "tei"]
+EmbedApiFormat = Literal["openai", "tei"]
+EmbedResFormat = Literal["ndarray", "list2d"]
 
 
 class EmbedConfigsType(TypedDict):
     endpoint: str
     api_key: Optional[str]
     model: str
-    api_format: EmbedApiType = "tei"
+    api_format: EmbedApiFormat = "tei"
+    res_format: EmbedResFormat = "list2d"
 
 
 class EmbedClient:
@@ -20,15 +25,15 @@ class EmbedClient:
         endpoint: str,
         model: str = None,
         api_key: str = None,
-        api_format: EmbedApiType = "tei",
-        output_format: Literal["list2d", "ndarray"] = "ndarray",
+        api_format: EmbedApiFormat = "tei",
+        res_format: EmbedResFormat = "list2d",
         verbose: bool = False,
     ):
         self.endpoint = endpoint
         self.model = model
         self.api_key = api_key
         self.api_format = api_format
-        self.output_format = output_format
+        self.res_format = res_format
         self.verbose = verbose
 
     def log_resp_status(self, resp: requests.Response):
@@ -55,7 +60,7 @@ class EmbedClient:
             return []
         embeddings = resp.json()
         self.log_embed_res(embeddings)
-        if self.output_format == "ndarray":
+        if self.res_format == "ndarray":
             return np.array(embeddings)
         else:
             return embeddings
@@ -64,3 +69,96 @@ class EmbedClient:
 class EmbedClientByConfig(EmbedClient):
     def __init__(self, configs: EmbedConfigsType):
         super().__init__(**configs)
+
+
+class EmbedServerByTEI:
+    def __init__(
+        self,
+        port: int = None,
+        model_name: str = None,
+        instance_id: str = None,
+        verbose: bool = False,
+    ):
+        self.port = port
+        self.model_name = model_name
+        self.instance_id = instance_id
+        self.verbose = verbose
+
+    def run(self):
+        script_path = Path(__file__).resolve().parent / "run_tei.sh"
+        if not script_path.exists():
+            logger.warn(f"× Missing `run_tei.sh`: {script_path}")
+            return
+
+        run_parts = ["bash", str(script_path)]
+        if self.port:
+            run_parts.extend(["-p", str(self.port)])
+        if self.model_name:
+            run_parts.extend(["-m", self.model_name])
+        if self.instance_id:
+            run_parts.extend(["-id", self.instance_id])
+        cmd_run = shlex.join(run_parts)
+        shell_cmd(cmd_run)
+
+        if self.verbose:
+            cmd_logs = f'docker logs -f "{self.instance_id}"'
+            shell_cmd(cmd_logs)
+
+    def kill(self):
+        if not self.instance_id:
+            logger.warn("× Missing arg: -id (--instance-id)")
+            return
+
+        cmd_kill = f'docker stop "{self.instance_id}"'
+        shell_cmd(cmd_kill)
+
+
+class EmbedServerByTEIArgParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_argument("-p", "--port", type=int, default=28888)
+        self.add_argument(
+            "-m",
+            "--model-name",
+            type=str,
+            default="Alibaba-NLP/gte-multilingual-base",
+        )
+        self.add_argument(
+            "-id",
+            "--instance-id",
+            type=str,
+            default="Alibaba-NLP--gte-multilingual-base",
+        )
+        self.add_argument("-k", "--kill", action="store_true")
+        self.add_argument("-b", "--verbose", action="store_true")
+        self.args, _ = self.parse_known_args()
+
+
+class EmbedServerArgParser(argparse.ArgumentParser):
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.add_argument("-t", "--type", type=str, choices=["tei"], default="tei")
+        self.args, _ = self.parse_known_args()
+
+
+def main():
+    main_args = EmbedServerArgParser().args
+    if main_args.type == "tei":
+        args = EmbedServerByTEIArgParser().args
+        embed_server = EmbedServerByTEI(
+            port=args.port,
+            model_name=args.model_name,
+            instance_id=args.instance_id,
+            verbose=args.verbose,
+        )
+        if args.kill:
+            embed_server.kill()
+        else:
+            embed_server.run()
+
+
+if __name__ == "__main__":
+    main()
+
+    # python -m tfmx.embed -t "tei" -p 28888 -m "Alibaba-NLP/gte-multilingual-base" -id "Alibaba-NLP--gte-multilingual-base" -b
+    # python -m tfmx.embed -t "tei" -id "Alibaba-NLP--gte-multilingual-base" -k
