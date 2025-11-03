@@ -1,6 +1,10 @@
+[build-system]
+requires = ["setuptools>=62"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "tfmx"
-version = "0.1"
+version = "0.2"
 authors = [
     { name="Hansimov" },
 ]
@@ -17,3 +21,16 @@ dependencies = [ "tclogger", "numpy", "requests" ]
 [project.urls]
 Homepage = "https://github.com/Hansimov/tfmx"
 Issues = "https://github.com/Hansimov/tfmx/issues"
+
+[tool.setuptools]
+include-package-data = true
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+"tfmx" = [
+    "config_sentence_transformers.json",
+    "ping_tei.sh",
+    "run_tei.sh",
+]
