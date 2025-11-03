@@ -1,77 +1,18 @@
 import argparse
-import numpy as np
-import requests
 import shlex
 
 from pathlib import Path
-from tclogger import StrsType, logger, shell_cmd
-from typing import Literal, TypedDict, Optional, Union
-
-EmbedApiFormat = Literal["openai", "tei"]
-EmbedResFormat = Literal["ndarray", "list2d"]
+from tclogger import logger, shell_cmd
 
 
-class EmbedConfigsType(TypedDict):
-    endpoint: str
-    api_key: Optional[str]
-    model: str
-    api_format: EmbedApiFormat = "tei"
-    res_format: EmbedResFormat = "list2d"
+class TEIEmbedServerConfigsType(TypedDict):
+    port: int
+    model_name: str
+    instance_id: str
+    verbose: bool
 
 
-class EmbedClient:
-    def __init__(
-        self,
-        endpoint: str,
-        model: str = None,
-        api_key: str = None,
-        api_format: EmbedApiFormat = "tei",
-        res_format: EmbedResFormat = "list2d",
-        verbose: bool = False,
-    ):
-        self.endpoint = endpoint
-        self.model = model
-        self.api_key = api_key
-        self.api_format = api_format
-        self.res_format = res_format
-        self.verbose = verbose
-
-    def log_resp_status(self, resp: requests.Response):
-        if self.verbose:
-            logger.warn(f"× Embed error: {resp.status_code} {resp.text}")
-
-    def log_embed_res(self, embeddings: list[list[float]]):
-        if self.verbose:
-            num = len(embeddings)
-            dim = len(embeddings[0]) if num > 0 else 0
-            val_type = type(embeddings[0][0]).__name__ if dim > 0 else "N/A"
-            logger.okay(f"✓ Embed success: num={num}, dim={dim}, type={val_type}")
-
-    def embed(self, inputs: StrsType) -> Union[list[list[float]], np.ndarray]:
-        headers = {
-            "content-type": "application/json",
-        }
-        payload = {
-            "inputs": inputs,
-        }
-        resp = requests.post(self.endpoint, headers=headers, json=payload)
-        if resp.status_code != 200:
-            self.log_resp_status(resp)
-            return []
-        embeddings = resp.json()
-        self.log_embed_res(embeddings)
-        if self.res_format == "ndarray":
-            return np.array(embeddings)
-        else:
-            return embeddings
-
-
-class EmbedClientByConfig(EmbedClient):
-    def __init__(self, configs: EmbedConfigsType):
-        super().__init__(**configs)
-
-
-class EmbedServerByTEI:
+class TEIEmbedServer:
     def __init__(
         self,
         port: int = None,
@@ -113,7 +54,12 @@ class EmbedServerByTEI:
         shell_cmd(cmd_kill)
 
 
-class EmbedServerByTEIArgParser(argparse.ArgumentParser):
+class TEIEmbedServerByConfig(TEIEmbedServer):
+    def __init__(self, configs: TEIEmbedServerConfigsType):
+        super().__init__(**configs)
+
+
+class TEIEmbedServerArgParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.add_argument("-p", "--port", type=int, default=28888)
@@ -144,8 +90,8 @@ class EmbedServerArgParser(argparse.ArgumentParser):
 def main():
     main_args = EmbedServerArgParser().args
     if main_args.type == "tei":
-        args = EmbedServerByTEIArgParser().args
-        embed_server = EmbedServerByTEI(
+        args = TEIEmbedServerArgParser().args
+        embed_server = TEIEmbedServer(
             port=args.port,
             model_name=args.model_name,
             instance_id=args.instance_id,
@@ -160,5 +106,5 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # python -m tfmx.embed -t "tei" -p 28888 -m "Alibaba-NLP/gte-multilingual-base" -id "Alibaba-NLP--gte-multilingual-base" -b
-    # python -m tfmx.embed -t "tei" -id "Alibaba-NLP--gte-multilingual-base" -k
+    # python -m tfmx.embed_server -t "tei" -p 28888 -m "Alibaba-NLP/gte-multilingual-base" -id "Alibaba-NLP--gte-multilingual-base" -b
+    # python -m tfmx.embed_server -t "tei" -id "Alibaba-NLP--gte-multilingual-base" -k
