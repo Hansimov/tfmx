@@ -68,7 +68,8 @@ else
         -e HUGGINGFACE_HUB_CACHE="$ROOT_CACHE_HF_HUB" \
         --pull always "$TEI_IMAGE" \
         --huggingface-hub-cache "$ROOT_CACHE_HF_HUB" \
-        --model-id "$MODEL_NAME" --dtype float16
+        --model-id "$MODEL_NAME" \
+        --dtype float16 --max-batch-tokens 32768
     echo "[tfmx] Container '$INSTANCE_ID' (:$PORT) is started"
 fi
 
