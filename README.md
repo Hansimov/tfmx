@@ -7,16 +7,3 @@
 ```sh
 pip install tfmx --upgrade
 ```
-
-## Usage
-
-Run example:
-
-```sh
-python example.py
-```
-
-See: [example.py](https://github.com/Hansimov/tfmx/blob/main/example.py)
-
-```python
-```

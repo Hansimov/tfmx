@@ -19,12 +19,17 @@ class TEIEmbedServer:
         port: int = None,
         model_name: str = None,
         instance_id: str = None,
+        hf_token: str = None,
         verbose: bool = False,
     ):
         self.port = port
         self.model_name = model_name
-        self.instance_id = instance_id
+        self.instance_id = instance_id or self.default_instance_id()
+        self.hf_token = hf_token
         self.verbose = verbose
+
+    def default_instance_id(self) -> str:
+        return self.model_name.replace("/", "--")
 
     def run(self):
         script_path = Path(__file__).resolve().parent / "run_tei.sh"
@@ -39,6 +44,8 @@ class TEIEmbedServer:
             run_parts.extend(["-m", self.model_name])
         if self.instance_id:
             run_parts.extend(["-id", self.instance_id])
+        if self.hf_token:
+            run_parts.extend(["-u", self.hf_token])
         cmd_run = shlex.join(run_parts)
         shell_cmd(cmd_run)
 
@@ -63,21 +70,12 @@ class TEIEmbedServerByConfig(TEIEmbedServer):
 class TEIEmbedServerArgParser(argparse.ArgumentParser):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        self.add_argument("-m", "--model-name", type=str, default=None)
+        self.add_argument("-id", "--instance-id", type=str, default=None)
+        self.add_argument("-u", "--hf-token", type=str, default=None)
         self.add_argument("-p", "--port", type=int, default=28888)
-        self.add_argument(
-            "-m",
-            "--model-name",
-            type=str,
-            default="Alibaba-NLP/gte-multilingual-base",
-        )
-        self.add_argument(
-            "-id",
-            "--instance-id",
-            type=str,
-            default="Alibaba-NLP--gte-multilingual-base",
-        )
-        self.add_argument("-k", "--kill", action="store_true")
         self.add_argument("-b", "--verbose", action="store_true")
+        self.add_argument("-k", "--kill", action="store_true")
         self.args, _ = self.parse_known_args()
 
 
@@ -96,6 +94,7 @@ def main():
             port=args.port,
             model_name=args.model_name,
             instance_id=args.instance_id,
+            hf_token=args.hf_token,
             verbose=args.verbose,
         )
         if args.kill:
@@ -108,9 +107,16 @@ if __name__ == "__main__":
     main()
 
     # Case 1: gte-multilingual-base
-    # python -m tfmx.embed_server -t "tei" -p 28888 -m "Alibaba-NLP/gte-multilingual-base" -id "Alibaba-NLP--gte-multilingual-base" -b
-    # python -m tfmx.embed_server -t "tei" -id "Alibaba-NLP--gte-multilingual-base" -k
+    # python -m tfmx.embed_server -t "tei" -m "Alibaba-NLP/gte-multilingual-base" -p 28888 -b
+    # python -m tfmx.embed_server -t "tei" -m "Alibaba-NLP/gte-multilingual-base" -k
 
     # Case 2: bge-large-zh-v1.5
-    # python -m tfmx.embed_server -t "tei" -p 28889 -m "BAAI/bge-large-zh-v1.5" -id "BAAI--bge-large-zh-v1.5" -b
-    # python -m tfmx.embed_server -t "tei" -id "BAAI--bge-large-zh-v1.5" -k
+    # python -m tfmx.embed_server -t "tei" -m "BAAI/bge-large-zh-v1.5" -p 28889 -b
+    # python -m tfmx.embed_server -t "tei" -m "BAAI/bge-large-zh-v1.5" -k
+
+    # Case 3: Qwen/Qwen3-Embedding-0.6B
+    # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -p 28887 -b
+    # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -k
+
+    # Case 4: Use HF_TOKEN
+    # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -p 28887 -b -u hf_****Y
