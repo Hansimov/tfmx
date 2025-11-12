@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfmx"
-version = "0.2"
+version = "0.3"
 authors = [
     { name="Hansimov" },
 ]
@@ -30,6 +30,7 @@ where = ["src"]
 
 [tool.setuptools.package-data]
 "tfmx" = [
+    "config_qwen3_embedding_06b.json",
     "config_sentence_transformers.json",
     "ping_tei.sh",
     "run_tei.sh",
