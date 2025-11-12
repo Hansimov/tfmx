@@ -51,7 +51,9 @@ class EmbedClient:
         # https://huggingface.github.io/text-embeddings-inference/#/Text%20Embeddings%20Inference/embed
         payload = {
             "inputs": inputs,
+            "normalize": True,
             "truncate": True,
+            "truncation_direction": "right",
         }
         resp = requests.post(self.endpoint, headers=headers, json=payload)
         if resp.status_code != 200:
