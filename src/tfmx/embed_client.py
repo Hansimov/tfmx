@@ -34,8 +34,10 @@ class EmbedClient:
         self.verbose = verbose
 
     def log_resp_status(self, resp: requests.Response):
+        err_mesg = f"× Embed error: {resp.status_code} {resp.text}"
         if self.verbose:
-            logger.warn(f"× Embed error: {resp.status_code} {resp.text}")
+            logger.warn(err_mesg)
+        raise ValueError(err_mesg)
 
     def log_embed_res(self, embeddings: list[list[float]]):
         if self.verbose:
@@ -53,7 +55,6 @@ class EmbedClient:
             "inputs": inputs,
             "normalize": True,
             "truncate": True,
-            "truncation_direction": "right",
         }
         resp = requests.post(self.endpoint, headers=headers, json=payload)
         if resp.status_code != 200:

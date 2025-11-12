@@ -50,7 +50,7 @@ class TEIEmbedServer:
         shell_cmd(cmd_run)
 
         if self.verbose:
-            cmd_logs = f'docker logs -f "{self.instance_id}"'
+            cmd_logs = f'docker logs -f --tail 0 "{self.instance_id}"'
             shell_cmd(cmd_logs)
 
     def kill(self):
