@@ -5,25 +5,42 @@ from typing import Literal
 BitsType = list[Literal[0, 1]]
 
 
-def floats_to_bits(floats: list[float], k: int = 2) -> BitsType:
+def floats_to_bits(
+    floats: list[float],
+    k: int = 2,
+    min_max: tuple[float, float] = None,
+    auto_min_max: bool = True,
+) -> BitsType:
     """
     Inputs:
         - k: 1 float map to k bits.
             For 1024-dim float-vector, if k is 2, it would become 2048-dim bit-vector.
-        - floats: is already normalized to [-1, 1].
+        - min_max: if set, use as bounds;
+        - auto_min_max:
+            - if True, use min(floats) and max(floats) as bounds;
+            - if False, use default bounds [-1, 1].
     Outputs:
         - bits: list of 0/1, dim is len(floats) * k
     Core idea:
-        - map float in [-1, 1] to int in [0, 2^n - 1]
-        - convert ints to bits.
+        - determine mapping bounds (set or auto or default)
+        - map floats to [0, 2^k - 1]
+        - convert ints to bits
     """
     n = len(floats) * k
     bits = [0] * n
     levels = 2**k - 1
+    # bounds: set, auto, default
+    if min_max:
+        min_val, max_val = min_max
+    elif auto_min_max:
+        min_val, max_val = min(floats), max(floats)
+    else:
+        min_val, max_val = -1.0, 1.0
+    # map floats to bits
     for float_idx, f in enumerate(floats):
-        # map [-1, 1] to [0, 2^k-1]
-        f = max(-1.0, min(1.0, float(f)))
-        q = round((f + 1.0) * 0.5 * levels)
+        # map [min_val, max_val] to [0, 2^k-1]
+        f = max(min_val, min(max_val, float(f)))
+        q = round((f - min_val) / (max_val - min_val) * levels)
         q = min(max(q, 0), levels)
         # MSB -> LSB
         for bit_idx, i in enumerate(range(k - 1, -1, -1)):
