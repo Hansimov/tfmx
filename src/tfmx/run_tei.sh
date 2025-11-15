@@ -94,7 +94,7 @@ else
         --huggingface-hub-cache "$ROOT_CACHE_HF_HUB" \
         --model-id "$MODEL_NAME" \
         --hf-token "$HF_TOKEN" \
-        --dtype float16 --max-batch-tokens 32768
+        --dtype float16 --max-batch-tokens 32768 --max-client-batch-size 100
     echo "[tfmx] Container '$INSTANCE_ID' (:$PORT) is started"
 fi
 

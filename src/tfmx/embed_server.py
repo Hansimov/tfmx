@@ -61,6 +61,14 @@ class TEIEmbedServer:
         cmd_kill = f'docker stop "{self.instance_id}"'
         shell_cmd(cmd_kill)
 
+    def remove(self):
+        if not self.instance_id:
+            logger.warn("× Missing arg: -id (--instance-id)")
+            return
+
+        cmd_rm = f'docker rm -f "{self.instance_id}"'
+        shell_cmd(cmd_rm)
+
 
 class TEIEmbedServerByConfig(TEIEmbedServer):
     def __init__(self, configs: TEIEmbedServerConfigsType):
@@ -75,6 +83,7 @@ class TEIEmbedServerArgParser(argparse.ArgumentParser):
         self.add_argument("-u", "--hf-token", type=str, default=None)
         self.add_argument("-p", "--port", type=int, default=28888)
         self.add_argument("-b", "--verbose", action="store_true")
+        self.add_argument("-rm", "--remove", action="store_true")
         self.add_argument("-k", "--kill", action="store_true")
         self.args, _ = self.parse_known_args()
 
@@ -97,7 +106,9 @@ def main():
             hf_token=args.hf_token,
             verbose=args.verbose,
         )
-        if args.kill:
+        if args.remove:
+            embed_server.remove()
+        elif args.kill:
             embed_server.kill()
         else:
             embed_server.run()
@@ -117,6 +128,7 @@ if __name__ == "__main__":
     # Case 3: Qwen/Qwen3-Embedding-0.6B
     # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -p 28887 -b
     # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -k
+    # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -rm
 
     # Case 4: Use HF_TOKEN
     # python -m tfmx.embed_server -t "tei" -m "Qwen/Qwen3-Embedding-0.6B" -p 28887 -b -u hf_****Y
