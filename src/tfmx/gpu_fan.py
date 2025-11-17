@@ -42,6 +42,19 @@ def parse_fan_percent(fan_percent: int) -> int:
     return int(min(max(fan_percent, MIN_FAN_PERCENT), MAX_FAN_PERCENT))
 
 
+def parse_idx_vals(s: str):
+    """Examples:
+    * "-fs 0":    get fan 0 speed
+    * "-fs 0,1":  get fan 0 and 1 speed
+    * "-fs a":    get all fans speed
+    * "-fs 0:40":          set fan 0 speed to 40%
+    * "-fs 0,1:50":        set fan 0 and 1 speed to 50%
+    * "-fs 0,1:50;2,3:80": set fan 0 and 1 speed to 50%, set fan 2 and 3 speed to 80%
+    * "-fs a:70":          set all fans speed to 70%
+    """
+    pass
+
+
 def parse_fan_control_state(state: Union[str, int]) -> int:
     """GPUFanControlState: 0, 1"""
     if state not in [0, 1, "0", "1"]:
@@ -57,51 +70,55 @@ class GPUFanController:
 
     def get_gpus(self) -> str:
         """Get GPU list"""
-        cmd = f"{NV_SETTINGS} -q gpus | {GREP_GPU}"
+        get_s = "-q gpus"
+        cmd = f"{NV_SETTINGS} {get_s} | {GREP_GPU}"
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def get_gpu_core_temp(self, gpu_idx: int) -> str:
+        get_s = f"-q '[gpu:{gpu_idx}]/GPUCoreTemp'"
         if self.terse:
-            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUCoreTemp' -t"
+            cmd = f"{NV_SETTINGS} {get_s} -t"
         else:
-            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUCoreTemp' | {GREP_GPU}"
+            cmd = f"{NV_SETTINGS} {get_s} | {GREP_GPU}"
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def get_gpu_fan_control_state(self, gpu_idx: int) -> str:
         """Get GPU fan control state"""
+        get_s = f"-q '[gpu:{gpu_idx}]/GPUFanControlState'"
         if self.terse:
-            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' -t"
+            cmd = f"{NV_SETTINGS} {get_s} -t"
         else:
-            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' | {GREP_GPU}"
+            cmd = f"{NV_SETTINGS} {get_s} | {GREP_GPU}"
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def set_gpu_fan_control_state(self, gpu_idx: int, control_state: int):
         """Set GPU fan control state"""
-        control_state = parse_fan_control_state(control_state)
-        cmd = f"{NV_SETTINGS} -a '[gpu:{gpu_idx}]/GPUFanControlState={control_state}' | {GREP_GPU}"
+        set_s = f"-a '[gpu:{gpu_idx}]/GPUFanControlState={control_state}'"
+        cmd = f"{NV_SETTINGS} {set_s} | {GREP_GPU}"
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
 
     def get_gpu_fan_speed_percent(self, fan_idx: int) -> str:
         """Get GPU fan speed percentage"""
+        get_s = f"-q '[fan:{fan_idx}]/GPUCurrentFanSpeed'"
         if self.terse:
-            cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' -t"
+            cmd = f"{NV_SETTINGS} {get_s} -t"
         else:
-            cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' | {GREP_FAN}"
+            cmd = f"{NV_SETTINGS} {get_s} | {GREP_FAN}"
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def set_gpu_fan_speed_percent(self, fan_idx: int, fan_percent: int):
         """Set GPU fan speed percentage"""
-        fan_percent = parse_fan_percent(fan_percent)
-        cmd = f"{NV_SETTINGS} -a '[fan:{fan_idx}]/GPUTargetFanSpeed={fan_percent}' | {GREP_FAN}"
+        set_s = f"-a '[fan:{fan_idx}]/GPUTargetFanSpeed={fan_percent}'"
+        cmd = f"{NV_SETTINGS} {set_s} | {GREP_FAN}"
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
 
