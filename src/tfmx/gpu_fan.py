@@ -11,6 +11,48 @@ GREP_GPU = "grep -Ei 'gpu:'"
 GREP_FAN = "grep -Ei 'fan:'"
 GREP_GPU_OR_FAN = "grep -Ei '(gpu:|fan:)'"
 
+OpKeyType = Literal["gpus", "control_state", "core_temp", "fan_speed"]
+NvKeyType = Literal["gpus", "GPUFanControlState", "GPUCoreTemp", "GPUCurrentFanSpeed"]
+DeviceType = Literal["gpu", "fan"]
+OpsType = list[tuple[OpKeyType, Literal["set", "get"], str, Union[str, None]]]
+NO_IDX_OP_KEYS = ["gpus"]
+NO_VAL_OP_KEYS = ["gpus", "core_temp"]
+
+OP_NV_KEYS = {
+    "gpus": "gpus",
+    "core_temp": "GPUCoreTemp",
+    "control_state": "GPUFanControlState",
+    "fan_speed": "GPUCurrentFanSpeed",
+}
+OP_DEVICES = {
+    "gpus": "gpu",
+    "core_temp": "gpu",
+    "control_state": "gpu",
+    "fan_speed": "fan",
+}
+
+
+def is_none_or_empty(val: Union[str, None]) -> bool:
+    """val is None or empty"""
+    return val is None or val.strip() == ""
+
+
+def is_str_and_all(idx: str) -> bool:
+    """idx starts with 'a'"""
+    if isinstance(idx, str) and idx.strip().lower().startswith("a"):
+        return True
+    return False
+
+
+def is_op_key_has_no_idx(op_key: str) -> bool:
+    """op_key should not have idx"""
+    return op_key in NO_IDX_OP_KEYS
+
+
+def is_op_key_has_no_val(op_key: str) -> bool:
+    """op_key should not have val"""
+    return op_key in NO_VAL_OP_KEYS
+
 
 def parse_idx(idx: Union[str, int]) -> int:
     try:
@@ -21,7 +63,9 @@ def parse_idx(idx: Union[str, int]) -> int:
         return None
 
 
-def parse_val(val: Union[str, int]) -> int:
+def parse_val(val: Union[str, int]) -> Union[int, None]:
+    if is_none_or_empty(val):
+        return None
     try:
         val = int(val)
         return val
@@ -48,48 +92,42 @@ def parse_fan_idx(idx: Union[str, int]) -> int:
         return None
 
 
-def parse_control_state(state: Union[str, int]) -> int:
+def parse_control_state(control_state: Union[str, int]) -> Union[int, None]:
     """GPUFanControlState: 0, 1"""
-    if state not in [0, 1, "0", "1"]:
-        log_error(f"× Invalid GPUFanControlState input: {state}")
+    if is_none_or_empty(control_state):
         return None
-    return int(state)
+    if control_state not in [0, 1, "0", "1"]:
+        log_error(f"× Invalid control_state: {control_state}")
+        return None
+    return int(control_state)
 
 
 def parse_fan_speed(fan_speed: int) -> int:
     """GPUTargetFanSpeed: 0 ~ 100"""
+    if is_none_or_empty(fan_speed):
+        return None
     try:
         fan_speed = int(fan_speed)
     except Exception as e:
-        log_error(f"× Invalid GPUTargetFanSpeed input: {fan_speed}")
+        log_error(f"× Invalid fan_speed: {fan_speed}")
         return None
     if not (0 <= fan_speed <= 100):
-        log_error(f"× Invalid GPUTargetFanSpeed input: {fan_speed}")
+        log_error(f"× Invalid fan_speed: {fan_speed}")
         return None
     return int(min(max(fan_speed, MIN_FAN_PERCENT), MAX_FAN_PERCENT))
 
 
-OpKeyType = Literal["gpus", "control_state", "core_temp", "fan_speed"]
-NvKeyType = Literal["gpus", "GPUFanControlState", "GPUCoreTemp", "GPUCurrentFanSpeed"]
-DeviceType = Literal["gpu", "fan"]
-OpsType = list[tuple[Literal["set", "get"], int, Union[int, None]]]
-
-OP_NV_KEYS = {
-    "gpus": "gpus",
-    "core_temp": "GPUCoreTemp",
-    "control_state": "GPUFanControlState",
-    "fan_speed": "GPUCurrentFanSpeed",
-}
-OP_DEVICES = {
-    "gpus": "gpu",
-    "core_temp": "gpu",
-    "control_state": "gpu",
-    "fan_speed": "fan",
-}
+def parse_val_by_op_key(val: str, op_key: OpKeyType) -> Union[int, None]:
+    if op_key == "fan_speed":
+        return parse_fan_speed(val)
+    elif op_key == "control_state":
+        return parse_control_state(val)
+    else:
+        return parse_val(val)
 
 
 class NvidiaSettingsParser:
-    def idx_vals_to_ops(self, s: str) -> OpsType:
+    def key_idx_val_to_ops(self, op_key: OpKeyType, idx_val_str: str) -> OpsType:
         """Usages:
         * "-fs 0":    get fan 0 speed
         * "-fs 0,1":  get fan 0 and 1 speed
@@ -110,37 +148,41 @@ class NvidiaSettingsParser:
         * ";": sep <idx>:<val> groups
         * ",": sep idxs
         * ":": sep <idx> and <val>
+
+        Return:
+        * list of (op_key, op:"get"/"set", idx:str, val:str)
         """
+        if is_op_key_has_no_idx(op_key):
+            return [(op_key, "get", None, None)]
         ops: OpsType = []
-        idx_vals = s.split(";")
+        idx_vals = idx_val_str.split(";")
         for idx_val in idx_vals:
-            idx, val = idx_val.split(":")
-            if idx.lower().startswith("a"):
-                idx = "a"
-            else:
-                idx = parse_idx(idx)
-            if val == "":
+            sep_res = idx_val.split(":", maxsplit=1)
+            idx_str = sep_res[0]
+            if len(sep_res) == 1 or is_op_key_has_no_val(op_key):
                 op, val = "get", None
             else:
-                op, val = "set", parse_val(val)
-            ops.append((op, idx, val))
+                op, val = "set", sep_res[1]
+            idxs = idx_str.split(",")
+            for idx in idxs:
+                ops.append((op_key, op, idx, val))
         return ops
 
-    def ops_to_nv_args(self, ops: OpsType, op_key: OpKeyType) -> list[str]:
+    def ops_to_nv_args(self, ops: OpsType) -> list[str]:
         nv_args: list[str] = []
-        nv_key: NvKeyType = OP_NV_KEYS[op_key]
-        dv_key: DeviceType = OP_DEVICES[op_key]
-        for op, idx, val in ops:
-            if idx == "a":
-                if op == "get":
-                    nv_arg = f"-q '{nv_key}'"
-                else:  # set
-                    nv_arg = f"-a '{nv_key}={val}'"
-            else:  # idx
-                if op == "get":
-                    nv_arg = f"-q '[{dv_key}:{idx}]/{nv_key}'"
-                else:  # set
-                    nv_arg = f"-a '[{dv_key}:{idx}]/{nv_key}={val}'"
+        for op_key, op, idx, val in ops:
+            nv_key: NvKeyType = OP_NV_KEYS[op_key]
+            dv_key: DeviceType = OP_DEVICES[op_key]
+            if is_op_key_has_no_idx(op_key) or is_str_and_all(idx):
+                key_str = f"{nv_key}"
+            else:
+                idx = parse_idx(idx)
+                key_str = f"[{dv_key}:{idx}]/{nv_key}"
+            if op == "get":
+                nv_arg = f"-q '{key_str}'"
+            else:  # set
+                val = parse_val_by_op_key(val, op_key)
+                nv_arg = f"-a '{key_str}={val}'"
             nv_args.append(nv_arg)
         return nv_args
 
@@ -204,20 +246,24 @@ class GPUFanController:
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
 
+    def execute(self, nv_args: list[str]):
+        nv_args_str = " ".join(nv_args)
+        if self.terse:
+            cmd = f"{NV_SETTINGS} {nv_args_str} -t"
+        else:
+            cmd = f"{NV_SETTINGS} {nv_args_str} | {GREP_GPU_OR_FAN}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
+
 
 class GPUFanArgParser(argparse.ArgumentParser):
     def __init__(self):
         super().__init__(description="GPU Fan Control")
-        # info args
+        # op_key args
         self.add_argument("-gs", "--gpus", action="store_true")
-        self.add_argument("-gt", "--gpu-temp", action="store_true")
-        self.add_argument("-fs", "--fan-speed", action="store_true")  # support set
-        self.add_argument("-cs", "--control-state", action="store_true")  # support set
-        # idx args
-        self.add_argument("-gi", "--gpu-idx", type=str)
-        self.add_argument("-fi", "--fan-idx", type=str)
-        # set args
-        self.add_argument("-s", "--set", type=int)
+        self.add_argument("-gt", "--gpu-temp", type=str)
+        self.add_argument("-cs", "--control-state", type=str)
+        self.add_argument("-fs", "--fan-speed", type=str)
         # log args
         self.add_argument("-q", "--quiet", action="store_true")
         self.add_argument("-t", "--terse", action="store_true")
@@ -227,29 +273,21 @@ class GPUFanArgParser(argparse.ArgumentParser):
 def control_gpu_fan():
     args = GPUFanArgParser().args
     c = GPUFanController(verbose=not args.quiet, terse=args.terse)
+    p = NvidiaSettingsParser()
+    key_idxval_strs = []
 
     if args.gpus:
-        c.get_gpus()
-
+        key_idxval_strs.append(("gpus", ""))
     if args.gpu_temp:
-        gpu_idx = parse_gpu_idx(args.gpu_idx)
-        c.get_core_temp(gpu_idx)
-
-    if args.control_state:
-        gpu_idx = parse_gpu_idx(args.gpu_idx)
-        if args.set:
-            value = parse_control_state(args.set)
-            c.set_control_state(gpu_idx, value)
-        else:
-            c.get_control_state(gpu_idx)
-
-    if args.fan_speed:
-        fan_idx = parse_fan_idx(args.fan_idx)
-        if args.set is not None:
-            fan_speed = parse_fan_speed(args.set)
-            c.set_fan_speed(fan_idx, fan_speed)
-        else:
-            c.get_fan_speed(fan_idx)
+        key_idxval_strs.append(("core_temp", args.gpu_temp))
+    if args.control_state is not None:
+        key_idxval_strs.append(("control_state", args.control_state))
+    if args.fan_speed is not None:
+        key_idxval_strs.append(("fan_speed", args.fan_speed))
+    for op_key, idx_val_str in key_idxval_strs:
+        ops = p.key_idx_val_to_ops(op_key, idx_val_str)
+    nv_args = p.ops_to_nv_args(ops)
+    print(nv_args)
 
 
 if __name__ == "__main__":
@@ -259,18 +297,24 @@ if __name__ == "__main__":
     # python -m tfmx.gpu_fan -gs
 
     # Case: Get GPU0 core temperature
-    # python -m tfmx.gpu_fan -gt -gi 0
-    # python -m tfmx.gpu_fan -gt -gi 0 -q
-    # python -m tfmx.gpu_fan -gt -gi 0 -t
+    # python -m tfmx.gpu_fan -gt 0
+    # python -m tfmx.gpu_fan -gt 0 -q
+    # python -m tfmx.gpu_fan -gt 0 -t
+    # python -m tfmx.gpu_fan -gt 0,1
+    # python -m tfmx.gpu_fan -gt a
 
     # Case: Get/Set GPU0 fan control state
-    # python -m tfmx.gpu_fan -cs -gi 0
-    # python -m tfmx.gpu_fan -cs -gi 0 -q
-    # python -m tfmx.gpu_fan -cs -gi 0 -t
-    # python -m tfmx.gpu_fan -cs -gi 0 -s 1
+    # python -m tfmx.gpu_fan -cs 0
+    # python -m tfmx.gpu_fan -cs 0 -q
+    # python -m tfmx.gpu_fan -cs 0 -t
+    # python -m tfmx.gpu_fan -cs a
+    # python -m tfmx.gpu_fan -cs a:1
+    # python -m tfmx.gpu_fan -cs 0:1
 
     # Case: Get/Set Fan0 speed percentage
-    # python -m tfmx.gpu_fan -fs -fi 0
-    # python -m tfmx.gpu_fan -fs -fi 0 -q
-    # python -m tfmx.gpu_fan -fs -fi 0 -t
-    # python -m tfmx.gpu_fan -fs -fi 0 -s 50
+    # python -m tfmx.gpu_fan -fs 0
+    # python -m tfmx.gpu_fan -fs 0 -q
+    # python -m tfmx.gpu_fan -fs 0 -t
+    # python -m tfmx.gpu_fan -fs 0,1:50
+    # python -m tfmx.gpu_fan -fs a:80
+    # python -m tfmx.gpu_fan -fs "0,1:50;2,3:80"
