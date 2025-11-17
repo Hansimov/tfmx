@@ -6,4 +6,5 @@ from .embed_client import EmbedClient, EmbedClientByConfig
 from .embed_server import TEIEmbedServerConfigsType
 from .embed_server import TEIEmbedServer, TEIEmbedServerByConfig
 from .embed_server import TEIEmbedServerArgParser, EmbedServerArgParser
-from .gpu_fan import GPUFanController, GPUFanArgParser, control_gpu_fan
+from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
+from .gpu_fan import control_gpu_fan

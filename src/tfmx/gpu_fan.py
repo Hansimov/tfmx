@@ -12,17 +12,29 @@ GREP_FAN = "grep -Ei 'fan:'"
 GREP_GPU_OR_FAN = "grep -Ei '(gpu:|fan:)'"
 
 OpKeyType = Literal["gpus", "control_state", "core_temp", "fan_speed"]
-NvKeyType = Literal["gpus", "GPUFanControlState", "GPUCoreTemp", "GPUCurrentFanSpeed"]
+NvKeyType = Literal[
+    "gpus",
+    "GPUFanControlState",
+    "GPUCoreTemp",
+    "GPUCurrentFanSpeed",
+    "GPUTargetFanSpeed",
+]
 DeviceType = Literal["gpu", "fan"]
 OpsType = list[tuple[OpKeyType, Literal["set", "get"], str, Union[str, None]]]
 NO_IDX_OP_KEYS = ["gpus"]
 NO_VAL_OP_KEYS = ["gpus", "core_temp"]
 
-OP_NV_KEYS = {
+OP_NV_GET_KEYS = {
     "gpus": "gpus",
     "core_temp": "GPUCoreTemp",
     "control_state": "GPUFanControlState",
     "fan_speed": "GPUCurrentFanSpeed",
+}
+OP_NV_SET_KEYS = {
+    "gpus": "gpus",
+    "core_temp": "GPUCoreTemp",
+    "control_state": "GPUFanControlState",
+    "fan_speed": "GPUTargetFanSpeed",
 }
 OP_DEVICES = {
     "gpus": "gpu",
@@ -171,7 +183,10 @@ class NvidiaSettingsParser:
     def ops_to_nv_args(self, ops: OpsType) -> list[str]:
         nv_args: list[str] = []
         for op_key, op, idx, val in ops:
-            nv_key: NvKeyType = OP_NV_KEYS[op_key]
+            if op == "get":
+                nv_key: NvKeyType = OP_NV_GET_KEYS[op_key]
+            else:  # set
+                nv_key: NvKeyType = OP_NV_SET_KEYS[op_key]
             dv_key: DeviceType = OP_DEVICES[op_key]
             if is_op_key_has_no_idx(op_key) or is_str_and_all(idx):
                 key_str = f"{nv_key}"
@@ -274,20 +289,19 @@ def control_gpu_fan():
     args = GPUFanArgParser().args
     c = GPUFanController(verbose=not args.quiet, terse=args.terse)
     p = NvidiaSettingsParser()
-    key_idxval_strs = []
-
+    kivs = []
     if args.gpus:
-        key_idxval_strs.append(("gpus", ""))
+        kivs.append(("gpus", ""))
     if args.gpu_temp:
-        key_idxval_strs.append(("core_temp", args.gpu_temp))
+        kivs.append(("core_temp", args.gpu_temp))
     if args.control_state is not None:
-        key_idxval_strs.append(("control_state", args.control_state))
+        kivs.append(("control_state", args.control_state))
     if args.fan_speed is not None:
-        key_idxval_strs.append(("fan_speed", args.fan_speed))
-    for op_key, idx_val_str in key_idxval_strs:
+        kivs.append(("fan_speed", args.fan_speed))
+    for op_key, idx_val_str in kivs:
         ops = p.key_idx_val_to_ops(op_key, idx_val_str)
     nv_args = p.ops_to_nv_args(ops)
-    print(nv_args)
+    c.execute(nv_args)
 
 
 if __name__ == "__main__":
@@ -298,18 +312,18 @@ if __name__ == "__main__":
 
     # Case: Get GPU0 core temperature
     # python -m tfmx.gpu_fan -gt 0
-    # python -m tfmx.gpu_fan -gt 0 -q
-    # python -m tfmx.gpu_fan -gt 0 -t
     # python -m tfmx.gpu_fan -gt 0,1
     # python -m tfmx.gpu_fan -gt a
+    # python -m tfmx.gpu_fan -gt 0 -q
+    # python -m tfmx.gpu_fan -gt 0 -t
 
     # Case: Get/Set GPU0 fan control state
     # python -m tfmx.gpu_fan -cs 0
-    # python -m tfmx.gpu_fan -cs 0 -q
-    # python -m tfmx.gpu_fan -cs 0 -t
     # python -m tfmx.gpu_fan -cs a
     # python -m tfmx.gpu_fan -cs a:1
     # python -m tfmx.gpu_fan -cs 0:1
+    # python -m tfmx.gpu_fan -cs 0 -q
+    # python -m tfmx.gpu_fan -cs 0 -t
 
     # Case: Get/Set Fan0 speed percentage
     # python -m tfmx.gpu_fan -fs 0
@@ -317,4 +331,4 @@ if __name__ == "__main__":
     # python -m tfmx.gpu_fan -fs 0 -t
     # python -m tfmx.gpu_fan -fs 0,1:50
     # python -m tfmx.gpu_fan -fs a:80
-    # python -m tfmx.gpu_fan -fs "0,1:50;2,3:80"
+    # python -m tfmx.gpu_fan -fs "0,1:35;2,3:30"
