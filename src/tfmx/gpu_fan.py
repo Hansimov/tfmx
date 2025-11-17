@@ -1,10 +1,9 @@
 import argparse
 
 from tclogger import logger, shell_cmd, log_error
-from time import sleep
 from typing import Union
 
-MIN_FAN_PERCENT = 30
+MIN_FAN_PERCENT = 0
 MAX_FAN_PERCENT = 100
 
 NV_SETTINGS = "DISPLAY=:0 nvidia-settings"
@@ -51,59 +50,60 @@ def parse_fan_control_state(state: Union[str, int]) -> int:
     return int(state)
 
 
-def get_gpus() -> str:
-    """Get GPU list"""
-    cmd = f"{NV_SETTINGS} -q gpus | {GREP_GPU}"
-    output: str = shell_cmd(cmd, getoutput=True, showcmd=True)
-    logger.okay(output)
-    return output
+class GPUFanController:
+    def __init__(self, verbose: bool = False, terse: bool = False):
+        self.verbose = verbose
+        self.terse = terse
 
+    def get_gpus(self) -> str:
+        """Get GPU list"""
+        cmd = f"{NV_SETTINGS} -q gpus | {GREP_GPU}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
+        return output
 
-def get_gpu_core_temp(gpu_idx: int = 0, verbose: bool = False) -> str:
-    if verbose:
-        cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUCoreTemp' | {GREP_GPU}"
-    else:
-        cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUCoreTemp' -t"
-    output: str = shell_cmd(cmd, getoutput=True, showcmd=True)
-    logger.okay(output)
-    return output
+    def get_gpu_core_temp(self, gpu_idx: int) -> str:
+        if self.terse:
+            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUCoreTemp' -t"
+        else:
+            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUCoreTemp' | {GREP_GPU}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
+        return output
 
+    def get_gpu_fan_control_state(self, gpu_idx: int) -> str:
+        """Get GPU fan control state"""
+        if self.terse:
+            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' -t"
+        else:
+            cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' | {GREP_GPU}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
+        return output
 
-def get_gpu_fan_control_state(gpu_idx: int = 0, verbose: bool = False) -> str:
-    """Get GPU fan control state"""
-    if verbose:
-        cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' | {GREP_GPU}"
-    else:
-        cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' -t"
-    output: str = shell_cmd(cmd, getoutput=True, showcmd=True)
-    logger.okay(output)
-    return output
+    def set_gpu_fan_control_state(self, gpu_idx: int, control_state: int):
+        """Set GPU fan control state"""
+        control_state = parse_fan_control_state(control_state)
+        cmd = f"{NV_SETTINGS} -a '[gpu:{gpu_idx}]/GPUFanControlState={control_state}' | {GREP_GPU}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
 
+    def get_gpu_fan_speed_percent(self, fan_idx: int) -> str:
+        """Get GPU fan speed percentage"""
+        if self.terse:
+            cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' -t"
+        else:
+            cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' | {GREP_FAN}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
+        return output
 
-def set_gpu_fan_control_state(gpu_idx: int = 0, state: int = 1):
-    """Set GPU fan control state"""
-    cmd = f"{NV_SETTINGS} -a '[gpu:{gpu_idx}]/GPUFanControlState={state}' | {GREP_GPU}"
-    output: str = shell_cmd(cmd, getoutput=True, showcmd=True)
-    logger.okay(output)
-
-
-def get_gpu_fan_speed_percent(fan_idx: int = 0, verbose: bool = False) -> str:
-    """Get GPU fan speed percentage"""
-    if verbose:
-        cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' | {GREP_FAN}"
-    else:
-        cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' -t"
-    output: str = shell_cmd(cmd, getoutput=True, showcmd=True)
-    logger.okay(output)
-    return output
-
-
-def set_gpu_fan_speed_percent(fan_idx: int, fan_percent: int):
-    """Set GPU fan speed percentage"""
-    fan_percent = parse_fan_percent(fan_percent)
-    cmd = f"{NV_SETTINGS} -a '[fan:{fan_idx}]/GPUTargetFanSpeed={fan_percent}' | {GREP_FAN}"
-    output: str = shell_cmd(cmd, getoutput=True, showcmd=True)
-    logger.okay(output)
+    def set_gpu_fan_speed_percent(self, fan_idx: int, fan_percent: int):
+        """Set GPU fan speed percentage"""
+        fan_percent = parse_fan_percent(fan_percent)
+        cmd = f"{NV_SETTINGS} -a '[fan:{fan_idx}]/GPUTargetFanSpeed={fan_percent}' | {GREP_FAN}"
+        output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
+        logger.okay(output, verbose=self.verbose)
 
 
 class GPUFanArgParser(argparse.ArgumentParser):
@@ -119,37 +119,38 @@ class GPUFanArgParser(argparse.ArgumentParser):
         self.add_argument("-fi", "--fan-idx", type=str)
         # set args
         self.add_argument("-s", "--set", type=int)
-        # verbose args
-        self.add_argument("-v", "--verbose", action="store_true")
+        # log args
+        self.add_argument("-q", "--quiet", action="store_true")
+        self.add_argument("-t", "--terse", action="store_true")
         self.args, _ = self.parse_known_args()
 
 
 def control_gpu_fan():
     args = GPUFanArgParser().args
-    verbose = args.verbose
+    c = GPUFanController(verbose=not args.quiet, terse=args.terse)
 
     if args.gpus:
-        get_gpus()
+        c.get_gpus()
 
     if args.gpu_temp:
         gpu_idx = parse_gpu_idx(args.gpu_idx)
-        get_gpu_core_temp(gpu_idx, verbose=verbose)
+        c.get_gpu_core_temp(gpu_idx)
 
     if args.control_state:
         gpu_idx = parse_gpu_idx(args.gpu_idx)
         if args.set:
             value = parse_fan_control_state(args.set)
-            set_gpu_fan_control_state(gpu_idx, value)
+            c.set_gpu_fan_control_state(gpu_idx, value)
         else:
-            get_gpu_fan_control_state(gpu_idx, verbose=verbose)
+            c.get_gpu_fan_control_state(gpu_idx)
 
     if args.fan_speed:
         fan_idx = parse_fan_idx(args.fan_idx)
         if args.set is not None:
             fan_percent = parse_fan_percent(args.set)
-            set_gpu_fan_speed_percent(fan_idx, fan_percent)
+            c.set_gpu_fan_speed_percent(fan_idx, fan_percent)
         else:
-            get_gpu_fan_speed_percent(fan_idx, verbose=verbose)
+            c.get_gpu_fan_speed_percent(fan_idx)
 
 
 if __name__ == "__main__":
@@ -160,14 +161,17 @@ if __name__ == "__main__":
 
     # Case: Get GPU0 core temperature
     # python -m tfmx.gpu_fan -gt -gi 0
-    # python -m tfmx.gpu_fan -gt -gi 0 -v
+    # python -m tfmx.gpu_fan -gt -gi 0 -q
+    # python -m tfmx.gpu_fan -gt -gi 0 -t
 
     # Case: Get/Set GPU0 fan control state
     # python -m tfmx.gpu_fan -cs -gi 0
-    # python -m tfmx.gpu_fan -cs -gi 0 -v
+    # python -m tfmx.gpu_fan -cs -gi 0 -q
+    # python -m tfmx.gpu_fan -cs -gi 0 -t
     # python -m tfmx.gpu_fan -cs -gi 0 -s 1
 
     # Case: Get/Set Fan0 speed percentage
     # python -m tfmx.gpu_fan -fs -fi 0
-    # python -m tfmx.gpu_fan -fs -fi 0 -v
+    # python -m tfmx.gpu_fan -fs -fi 0 -q
+    # python -m tfmx.gpu_fan -fs -fi 0 -t
     # python -m tfmx.gpu_fan -fs -fi 0 -s 50
