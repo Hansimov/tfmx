@@ -34,8 +34,19 @@ while [[ $# -gt 0 ]]; do
 done
 
 # paths
-TFMX_DIR=${TFMX_DIR:-"$HOME/repos/tfmx"}
-TFMX_SRC="$TFMX_DIR/src/tfmx"
+if [[ -d "$HOME/repos/tfmx" ]]; then
+    TFMX_DIR=${TFMX_DIR:-"$HOME/repos/tfmx"}
+    TFMX_SRC="$TFMX_DIR/src/tfmx"
+else
+    TFMX_PIP=$(pip show tfmx 2>/dev/null | grep "Location:" | awk '{print $2}')
+    if [[ -n "$TFMX_PIP" ]]; then
+        TFMX_DIR=${TFMX_DIR:-"$TFMX_PIP/tfmx"}
+        TFMX_SRC="$TFMX_DIR"
+    else
+        TFMX_DIR=${TFMX_DIR:-"$HOME/repos/tfmx"}
+        TFMX_SRC="$TFMX_DIR/src/tfmx"
+    fi
+fi
 CACHE_HF=${CACHE_HF:-".cache/huggingface"}
 CACHE_HF_HUB=${CACHE_HF_HUB:-"$CACHE_HF/hub"}
 HF_ENDPOINT="https://hf-mirror.com"
