@@ -92,7 +92,29 @@ else
     ROOT_CACHE_HF_HUB="/root/$CACHE_HF_HUB"
     ROOT_CACHE_HF="/root/$CACHE_HF"
     TFMX_DOCKER_DATA_DIR="$TFMX_DIR/data/docker_data"
-    TEI_IMAGE=${TEI_IMAGE:-"ghcr.io/huggingface/text-embeddings-inference:89-1.8"}
+    
+    # determine image tag by GPU compute capability
+    GPU_COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader | head -n1)
+    case "$GPU_COMPUTE_CAP" in
+        8.0) ARCH_TAG="1.8" ;;     # Ampere 80 (A100, A30)
+        8.6) ARCH_TAG="86-1.8" ;;  # Ampere 86 (A10, A40, RTX 3080)
+        8.9) ARCH_TAG="89-1.8" ;;  # Ada Lovelace (RTX 4090)
+        *) ARCH_TAG="86-1.8" ;;    # Fallback to Ampere 86
+    esac
+
+    TEI_IMAGE_BY_ARCH="ghcr.io/huggingface/text-embeddings-inference:${ARCH_TAG}"
+    TEI_IMAGE=${TEI_IMAGE:-"$TEI_IMAGE_BY_ARCH"}
+    echo "[tfmx] Detected GPU compute capability: $GPU_COMPUTE_CAP, using image: $TEI_IMAGE"
+
+    # pull image from mirror if not exists locally
+    if ! docker image inspect "$TEI_IMAGE" &>/dev/null; then
+        MIRROR_IMAGE="m.daocloud.io/$TEI_IMAGE"
+        echo "[tfmx] Pulling image from mirror: $MIRROR_IMAGE"
+        docker pull "$MIRROR_IMAGE"
+        docker tag "$MIRROR_IMAGE" "$TEI_IMAGE"
+        echo "[tfmx] Image tagged as: $TEI_IMAGE"
+    fi
+
     mkdir -p "$TFMX_DOCKER_DATA_DIR"
     docker run --gpus all -d --name "$INSTANCE_ID" -p "$PORT:80" \
         -v "$HOME/$CACHE_HF":"$ROOT_CACHE_HF" \
@@ -101,7 +123,7 @@ else
         -e HF_HOME="$ROOT_CACHE_HF" \
         -e HF_HUB_CACHE="$ROOT_CACHE_HF_HUB" \
         -e HUGGINGFACE_HUB_CACHE="$ROOT_CACHE_HF_HUB" \
-        --pull always "$TEI_IMAGE" \
+        "$TEI_IMAGE" \
         --huggingface-hub-cache "$ROOT_CACHE_HF_HUB" \
         --model-id "$MODEL_NAME" \
         --hf-token "$HF_TOKEN" \
@@ -115,3 +137,6 @@ fi
 
 # Clear cache in host if download corrupted files
 # sudo rm -rf ~/.cache/huggingface/hub/models--Qwen--Qwen3-Embedding-0.6B
+
+# remove container
+# docker rm -f "tei--Qwen--Qwen3-Embedding-0.6B"

@@ -29,7 +29,7 @@ class TEIEmbedServer:
         self.verbose = verbose
 
     def default_instance_id(self) -> str:
-        return self.model_name.replace("/", "--")
+        return "tei--" + self.model_name.replace("/", "--")
 
     def run(self):
         script_path = Path(__file__).resolve().parent / "run_tei.sh"
