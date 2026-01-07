@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfmx"
-version = "0.4.2"
+version = "0.4.3"
 authors = [
     { name="Hansimov" },
 ]
@@ -22,6 +22,10 @@ dependencies = [ "tclogger", "numpy", "requests" ]
 Homepage = "https://github.com/Hansimov/tfmx"
 Issues = "https://github.com/Hansimov/tfmx/issues"
 
+[project.scripts]
+tei_server = "tfmx.tei_server:main"
+tei_compose = "tfmx.tei_compose:main"
+
 [tool.setuptools]
 include-package-data = true
 
@@ -32,6 +36,4 @@ where = ["src"]
 "tfmx" = [
     "config_qwen3_embedding_06b.json",
     "config_sentence_transformers.json",
-    "ping_tei.sh",
-    "run_tei.sh",
 ]
