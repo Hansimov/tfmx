@@ -4,7 +4,8 @@
 CLI_EPILOG = """
 Examples:
   # Set model as environment variable for convenience
-  export MODEL="Alibaba-NLP/gte-multilingual-base"
+  # export MODEL="Alibaba-NLP/gte-multilingual-base"
+  export MODEL="Qwen/Qwen3-Embedding-0.6B"
   
   # Basic operations
   tei_compose -m "$MODEL" up                    # Start on all GPUs
@@ -245,116 +246,108 @@ class ComposeFileGenerator:
 
     def __init__(
         self,
-        cache_hf: str = CACHE_HF,
-        cache_hf_hub: str = CACHE_HF_HUB,
-        hf_endpoint: str = HF_ENDPOINT,
-    ):
-        self.cache_hf = cache_hf
-        self.cache_hf_hub = cache_hf_hub
-        self.hf_endpoint = hf_endpoint
-
-    def generate(
-        self,
         gpus: list[GPUInfo],
         model_name: str,
         port: int,
         project_name: str,
         data_dir: Path,
         hf_token: Optional[str] = None,
-    ) -> str:
-        """Generate docker-compose.yml content."""
-        lines = self._generate_header(model_name, project_name, gpus)
+        cache_hf: str = CACHE_HF,
+        cache_hf_hub: str = CACHE_HF_HUB,
+        hf_endpoint: str = HF_ENDPOINT,
+    ):
+        self.gpus = gpus
+        self.model_name = model_name
+        self.port = port
+        self.project_name = project_name
+        self.data_dir = data_dir
+        self.hf_token = hf_token
+        self.cache_hf = cache_hf
+        self.cache_hf_hub = cache_hf_hub
+        self.hf_endpoint = hf_endpoint
+
+    def generate(self) -> str:
+        """Generate docker-compose.yml content with YAML anchors for common config."""
+        lines = self._generate_header()
+        # Add x-common-config anchor for shared configuration
+        lines.extend(self._generate_common_config())
         lines.append("services:")
-
-        for gpu in gpus:
-            service_lines = self._generate_service(
-                gpu=gpu,
-                model_name=model_name,
-                port=port,
-                project_name=project_name,
-                data_dir=data_dir,
-                hf_token=hf_token,
-            )
+        for i, gpu in enumerate(self.gpus):
+            service_lines = self._generate_service(gpu=gpu)
             lines.extend(service_lines)
-
         return "\n".join(lines)
 
-    def _generate_header(
-        self, model_name: str, project_name: str, gpus: list[GPUInfo]
-    ) -> list[str]:
+    def _generate_header(self) -> list[str]:
         """Generate compose file header."""
         return [
             f"# TEI Multi-GPU Deployment",
-            f"# Model: {model_name}",
-            f"# GPUs: {[g.index for g in gpus]}",
+            f"# Model: {self.model_name}",
+            f"# GPUs: {[g.index for g in self.gpus]}",
             f"",
-            f"name: {project_name}",
+            f"name: {self.project_name}",
             f"",
         ]
 
-    def _generate_service(
-        self,
-        gpu: GPUInfo,
-        model_name: str,
-        port: int,
-        project_name: str,
-        data_dir: Path,
-        hf_token: Optional[str] = None,
-    ) -> list[str]:
-        """Generate service definition for a single GPU."""
-        service_port = port + gpu.index
-        container_name = f"{project_name}--gpu{gpu.index}"
+    def _generate_common_config(self) -> list[str]:
+        """Generate common configuration as YAML anchor."""
+        lines = [
+            "x-common-config: &common-config",
+            f"  volumes:",
+            f"    - ${{HOME}}/{self.cache_hf}:/root/{self.cache_hf}",
+            f"    - {self.data_dir}:/data",
+            f"  environment:",
+            f"    - HF_ENDPOINT={self.hf_endpoint}",
+            f"    - HF_HOME=/root/{self.cache_hf}",
+            f"    - HF_HUB_CACHE=/root/{self.cache_hf_hub}",
+            f"    - HUGGINGFACE_HUB_CACHE=/root/{self.cache_hf_hub}",
+            f"  command:",
+            f"    - --huggingface-hub-cache",
+            f"    - /root/{self.cache_hf_hub}",
+            f"    - --model-id",
+            f"    - {self.model_name}",
+        ]
+        if self.hf_token:
+            lines.extend([f"    - --hf-token", f"    - {self.hf_token}"])
+        lines.extend(
+            [
+                f"    - --dtype",
+                f"    - float16",
+                f"    - --max-batch-tokens",
+                f'    - "32768"',
+                f"    - --max-client-batch-size",
+                f'    - "100"',
+                f"  restart: unless-stopped",
+                f"  healthcheck:",
+                f'    test: ["CMD", "curl", "-f", "http://localhost:80/health"]',
+                f"    interval: 30s",
+                f"    timeout: 10s",
+                f"    retries: 3",
+                f"    start_period: 60s",
+                f"",
+            ]
+        )
+        return lines
 
+    def _generate_service(self, gpu: GPUInfo) -> list[str]:
+        """Generate service definition for a single GPU using YAML anchor."""
+        service_port = self.port + gpu.index
+        container_name = f"{self.project_name}--gpu{gpu.index}"
         lines = [
             f"  tei-gpu{gpu.index}:",
+            f"    <<: *common-config",
             f"    image: {gpu.image}",
             f"    container_name: {container_name}",
             f"    ports:",
             f'      - "{service_port}:80"',
-            f"    volumes:",
-            f"      - ${{HOME}}/{self.cache_hf}:/root/{self.cache_hf}",
-            f"      - {data_dir}:/data",
-            f"    environment:",
-            f"      - HF_ENDPOINT={self.hf_endpoint}",
-            f"      - HF_HOME=/root/{self.cache_hf}",
-            f"      - HF_HUB_CACHE=/root/{self.cache_hf_hub}",
-            f"      - HUGGINGFACE_HUB_CACHE=/root/{self.cache_hf_hub}",
-            f"    command:",
-            f"      - --huggingface-hub-cache",
-            f"      - /root/{self.cache_hf_hub}",
-            f"      - --model-id",
-            f"      - {model_name}",
+            f"    deploy:",
+            f"      resources:",
+            f"        reservations:",
+            f"          devices:",
+            f"            - driver: nvidia",
+            f'              device_ids: ["{gpu.index}"]',
+            f"              capabilities: [gpu]",
+            f"",
         ]
-
-        if hf_token:
-            lines.extend([f"      - --hf-token", f"      - {hf_token}"])
-
-        lines.extend(
-            [
-                f"      - --dtype",
-                f"      - float16",
-                f"      - --max-batch-tokens",
-                f'      - "32768"',
-                f"      - --max-client-batch-size",
-                f'      - "100"',
-                f"    deploy:",
-                f"      resources:",
-                f"        reservations:",
-                f"          devices:",
-                f"            - driver: nvidia",
-                f'              device_ids: ["{gpu.index}"]',
-                f"              capabilities: [gpu]",
-                f"    restart: unless-stopped",
-                f"    healthcheck:",
-                f'      test: ["CMD", "curl", "-f", "http://localhost:80/health"]',
-                f"      interval: 30s",
-                f"      timeout: 10s",
-                f"      retries: 3",
-                f"      start_period: 60s",
-                f"",
-            ]
-        )
-
         return lines
 
 
@@ -392,7 +385,6 @@ class TEIComposer:
         self.gpus = GPUDetector.detect(gpu_ids)
         self.model_config_manager = ModelConfigManager()
         self.image_manager = DockerImageManager()
-        self.compose_generator = ComposeFileGenerator()
 
     def _ensure_compose_dir(self) -> None:
         """Ensure compose directory exists."""
@@ -409,8 +401,7 @@ class TEIComposer:
         """Generate the docker-compose.yml file."""
         self._ensure_compose_dir()
         data_dir = self._ensure_data_dir()
-
-        content = self.compose_generator.generate(
+        compose_generator = ComposeFileGenerator(
             gpus=self.gpus,
             model_name=self.model_name,
             port=self.port,
@@ -418,7 +409,7 @@ class TEIComposer:
             data_dir=data_dir,
             hf_token=self.hf_token,
         )
-
+        content = compose_generator.generate()
         self.compose_file.write_text(content)
         logger.okay(f"[tfmx] Generated: {self.compose_file}")
         return self.compose_file
