@@ -35,8 +35,10 @@ Examples:
 """
 
 import argparse
+import re
 import shutil
 import subprocess
+
 from pathlib import Path
 from typing import Optional
 
@@ -368,9 +370,10 @@ class TEIComposer:
         self.gpu_ids = gpu_ids
         self.hf_token = hf_token
 
-        # Project name from model (must be lowercase, alphanumeric with - and _)
-        model_dash = model_name.replace("/", "--").lower()
-        self.project_name = project_name or f"tei--{model_dash}"
+        # project name must match: '^[a-z0-9][a-z0-9_-]*$'
+        project_dash = model_name.replace("/", "--").lower()
+        project_dash = re.sub(r"[^a-z0-9_-]", "_", project_dash)
+        self.project_name = project_name or f"tei--{project_dash}"
 
         # Compose file location (default to script directory)
         if compose_dir:
