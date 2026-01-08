@@ -9,7 +9,6 @@ This tool is designed for:
 - Custom deployment workflows
 """
 
-import os
 import shutil
 import subprocess
 from pathlib import Path
@@ -17,7 +16,10 @@ from typing import Optional
 
 from tclogger import logger
 
-# ============ Constants ============
+
+# ============================================================================
+# Constants
+# ============================================================================
 
 SERVER_PORT = 28880
 MODEL_NAME = "Alibaba-NLP/gte-multilingual-base"
@@ -38,7 +40,9 @@ TEI_IMAGE_BASE = "ghcr.io/huggingface/text-embeddings-inference"
 TEI_IMAGE_MIRROR = "m.daocloud.io"
 
 
-# ============ GPU Detection ============
+# ============================================================================
+# GPU Information
+# ============================================================================
 
 
 class GPUInfo:
@@ -54,211 +58,275 @@ class GPUInfo:
         return f"GPU({self.index}, cap={self.compute_cap}, tag={self.arch_tag})"
 
 
-def detect_gpus(gpu_ids: Optional[str] = None) -> list[GPUInfo]:
-    """Detect available GPUs and their compute capabilities."""
-    try:
-        result = subprocess.run(
-            [
-                "nvidia-smi",
-                "--query-gpu=index,compute_cap",
-                "--format=csv,noheader,nounits",
-            ],
-            capture_output=True,
-            text=True,
-            check=True,
-        )
-        gpus = []
-        for line in result.stdout.strip().split("\n"):
-            if line.strip():
-                parts = line.split(",")
-                index = int(parts[0].strip())
-                compute_cap = parts[1].strip()
-                gpus.append(GPUInfo(index, compute_cap))
+class GPUDetector:
+    """GPU detection and management."""
 
-        # Filter by specified GPU IDs
-        if gpu_ids:
-            specified = [int(x.strip()) for x in gpu_ids.split(",")]
-            gpus = [g for g in gpus if g.index in specified]
+    @staticmethod
+    def detect(gpu_ids: Optional[str] = None) -> list[GPUInfo]:
+        """Detect available GPUs and their compute capabilities."""
+        try:
+            result = subprocess.run(
+                "nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader,nounits",
+                shell=True,
+                capture_output=True,
+                text=True,
+                check=True,
+            )
+            gpus = []
+            for line in result.stdout.strip().split("\n"):
+                if line.strip():
+                    parts = line.split(",")
+                    index = int(parts[0].strip())
+                    compute_cap = parts[1].strip()
+                    gpus.append(GPUInfo(index, compute_cap))
 
-        return gpus
-    except (subprocess.CalledProcessError, FileNotFoundError) as e:
-        logger.warn(f"× Failed to detect GPUs: {e}")
-        return []
+            # Filter by specified GPU IDs
+            if gpu_ids:
+                specified = [int(x.strip()) for x in gpu_ids.split(",")]
+                gpus = [g for g in gpus if g.index in specified]
 
-
-# ============ Config Patching ============
+            return gpus
+        except (subprocess.CalledProcessError, FileNotFoundError) as e:
+            logger.warn(f"× Failed to detect GPUs: {e}")
+            return []
 
 
-def get_tfmx_src_dir() -> Path:
-    """Get the tfmx source directory."""
-    # First check if running from source
-    src_dir = Path(__file__).resolve().parent
-    if (src_dir / "config_sentence_transformers.json").exists():
+# ============================================================================
+# Configuration Management
+# ============================================================================
+
+
+class ConfigManager:
+    """Manages HuggingFace model configuration files."""
+
+    def __init__(self, cache_hf_hub: str = CACHE_HF_HUB):
+        self.cache_hf_hub = cache_hf_hub
+
+    @staticmethod
+    def get_tfmx_src_dir() -> Path:
+        """Get the tfmx source directory."""
+        # First check if running from source
+        src_dir = Path(__file__).resolve().parent
+        if (src_dir / "config_sentence_transformers.json").exists():
+            return src_dir
+
+        # Fallback to home repos
+        home_src = Path.home() / "repos" / "tfmx" / "src" / "tfmx"
+        if home_src.exists():
+            return home_src
+
         return src_dir
 
-    # Fallback to home repos
-    home_src = Path.home() / "repos" / "tfmx" / "src" / "tfmx"
-    if home_src.exists():
-        return home_src
+    def get_model_snapshot_dir(self, model_name: str) -> Optional[Path]:
+        """Find the model snapshot directory in HuggingFace cache."""
+        model_name_dash = model_name.replace("/", "--")
+        cache_path = Path.home() / self.cache_hf_hub
 
-    return src_dir
+        if not cache_path.exists():
+            return None
 
+        # Find snapshot directory
+        model_dir = cache_path / f"models--{model_name_dash}"
+        if not model_dir.exists():
+            return None
 
-def get_model_snapshot_dir(
-    model_name: str, cache_hf_hub: str = CACHE_HF_HUB
-) -> Optional[Path]:
-    """Find the model snapshot directory in HuggingFace cache."""
-    model_name_dash = model_name.replace("/", "--")
-    cache_path = Path.home() / cache_hf_hub
+        snapshots_dir = model_dir / "snapshots"
+        if not snapshots_dir.exists():
+            return None
 
-    if not cache_path.exists():
+        # Get the first snapshot (usually there's only one)
+        for snapshot in snapshots_dir.iterdir():
+            if snapshot.is_dir():
+                return snapshot
+
         return None
 
-    # Find snapshot directory
-    model_dir = cache_path / f"models--{model_name_dash}"
-    if not model_dir.exists():
-        return None
+    def patch_config_files(self, model_name: str) -> None:
+        """Patch config files to fix issues with some models."""
+        snapshot_dir = self.get_model_snapshot_dir(model_name)
+        if not snapshot_dir:
+            logger.mesg(f"[tfmx] Model cache not found, skipping patch")
+            return
 
-    snapshots_dir = model_dir / "snapshots"
-    if not snapshots_dir.exists():
-        return None
+        tfmx_src = self.get_tfmx_src_dir()
 
-    # Get the first snapshot (usually there's only one)
-    for snapshot in snapshots_dir.iterdir():
-        if snapshot.is_dir():
-            return snapshot
+        # Patch config_sentence_transformers.json
+        self._patch_sentence_transformers_config(snapshot_dir, tfmx_src)
 
-    return None
+        # Patch config.json (check for corruption)
+        self._patch_main_config(snapshot_dir, tfmx_src)
 
+    def _patch_sentence_transformers_config(
+        self, snapshot_dir: Path, tfmx_src: Path
+    ) -> None:
+        """Patch config_sentence_transformers.json if missing."""
+        config_name = "config_sentence_transformers.json"
+        target = snapshot_dir / config_name
+        source = tfmx_src / config_name
 
-def patch_config_files(model_name: str, cache_hf_hub: str = CACHE_HF_HUB) -> None:
-    """Patch config files to fix issues with some models."""
-    snapshot_dir = get_model_snapshot_dir(model_name, cache_hf_hub)
-    if not snapshot_dir:
-        logger.mesg(f"[tfmx] Model cache not found, skipping patch")
-        return
+        if target.exists():
+            logger.mesg(f"[tfmx] Skip existed: '{target}'")
+        elif source.exists():
+            shutil.copy(source, target)
+            logger.success(f"[tfmx] Copied: '{target}'")
 
-    tfmx_src = get_tfmx_src_dir()
+    def _patch_main_config(self, snapshot_dir: Path, tfmx_src: Path) -> None:
+        """Patch config.json, fixing corruption if needed."""
+        config_name = "config.json"
+        target = snapshot_dir / config_name
+        source = tfmx_src / "config_qwen3_embedding_06b.json"
 
-    # Patch config_sentence_transformers.json
-    config_st = "config_sentence_transformers.json"
-    target_st = snapshot_dir / config_st
-    source_st = tfmx_src / config_st
-
-    if target_st.exists():
-        logger.mesg(f"[tfmx] Skip existed: '{target_st}'")
-    elif source_st.exists():
-        shutil.copy(source_st, target_st)
-        logger.success(f"[tfmx] Copied: '{target_st}'")
-
-    # Patch config.json (check for corruption)
-    config_json = "config.json"
-    target_config = snapshot_dir / config_json
-    source_config = tfmx_src / "config_qwen3_embedding_06b.json"
-
-    if target_config.exists():
-        # Check if file is corrupted (doesn't end with })
-        content = target_config.read_text().strip()
-        if not content.endswith("}"):
-            logger.warn(f"[tfmx] Corrupted: '{target_config}'")
-            target_config.unlink()
-            if source_config.exists():
-                shutil.copy(source_config, target_config)
-                logger.success(f"[tfmx] Patched: '{target_config}'")
-        else:
-            logger.mesg(f"[tfmx] Skip existed: '{target_config}'")
-    elif source_config.exists():
-        shutil.copy(source_config, target_config)
-        logger.success(f"[tfmx] Copied: '{target_config}'")
+        if target.exists():
+            # Check if file is corrupted (doesn't end with })
+            content = target.read_text().strip()
+            if not content.endswith("}"):
+                logger.warn(f"[tfmx] Corrupted: '{target}'")
+                target.unlink()
+                if source.exists():
+                    shutil.copy(source, target)
+                    logger.success(f"[tfmx] Patched: '{target}'")
+            else:
+                logger.mesg(f"[tfmx] Skip existed: '{target}'")
+        elif source.exists():
+            shutil.copy(source, target)
+            logger.success(f"[tfmx] Copied: '{target}'")
 
 
-# ============ Docker Image Management ============
+# ============================================================================
+# Docker Image Management
+# ============================================================================
 
 
-def ensure_tei_image(image: str) -> bool:
-    """Ensure TEI image is available, pull from mirror if needed."""
-    # Check if image exists locally
-    result = subprocess.run(["docker", "image", "inspect", image], capture_output=True)
-    if result.returncode == 0:
-        return True
+class DockerImageManager:
+    """Manages Docker image operations."""
 
-    # Pull from mirror
-    mirror_image = f"{TEI_IMAGE_MIRROR}/{image}"
-    logger.mesg(f"[tfmx] Pulling image from mirror: {mirror_image}")
+    @staticmethod
+    def ensure_image(image: str) -> bool:
+        """Ensure TEI image is available, pull from mirror if needed."""
+        # Check if image exists locally
+        result = subprocess.run(
+            f"docker image inspect {image}",
+            shell=True,
+            capture_output=True,
+        )
+        if result.returncode == 0:
+            return True
 
-    try:
-        subprocess.run(["docker", "pull", mirror_image], check=True)
-        subprocess.run(["docker", "tag", mirror_image, image], check=True)
-        logger.success(f"[tfmx] Image tagged as: {image}")
-        return True
-    except subprocess.CalledProcessError as e:
-        logger.warn(f"× Failed to pull image: {e}")
-        return False
+        # Pull from mirror
+        mirror_image = f"{TEI_IMAGE_MIRROR}/{image}"
+        logger.mesg(f"[tfmx] Pulling image from mirror: {mirror_image}")
+
+        try:
+            subprocess.run(
+                f"docker pull {mirror_image}",
+                shell=True,
+                check=True,
+            )
+            subprocess.run(
+                f"docker tag {mirror_image} {image}",
+                shell=True,
+                check=True,
+            )
+            logger.success(f"[tfmx] Image tagged as: {image}")
+            return True
+        except subprocess.CalledProcessError as e:
+            logger.warn(f"× Failed to pull image: {e}")
+            return False
 
 
-# ============ Compose File Generation ============
+# ============================================================================
+# Docker Compose File Generator
+# ============================================================================
 
 
-def generate_compose_content(
-    gpus: list[GPUInfo],
-    model_name: str,
-    port: int,
-    project_name: str,
-    hf_token: Optional[str] = None,
-    cache_hf: str = CACHE_HF,
-    cache_hf_hub: str = CACHE_HF_HUB,
-    hf_endpoint: str = HF_ENDPOINT,
-    data_dir: Optional[Path] = None,
-) -> str:
-    """Generate docker-compose.yml content."""
-    # Default data directory
-    if data_dir is None:
-        data_dir = Path.home() / ".tfmx" / "docker_data"
+class ComposeFileGenerator:
+    """Generates docker-compose.yml content for TEI deployment."""
 
-    lines = [
-        f"# TEI Multi-GPU Deployment",
-        f"# Model: {model_name}",
-        f"# GPUs: {[g.index for g in gpus]}",
-        f"",
-        f"name: {project_name}",
-        f"",
-        f"services:",
-    ]
+    def __init__(
+        self,
+        cache_hf: str = CACHE_HF,
+        cache_hf_hub: str = CACHE_HF_HUB,
+        hf_endpoint: str = HF_ENDPOINT,
+    ):
+        self.cache_hf = cache_hf
+        self.cache_hf_hub = cache_hf_hub
+        self.hf_endpoint = hf_endpoint
 
-    for gpu in gpus:
+    def generate(
+        self,
+        gpus: list[GPUInfo],
+        model_name: str,
+        port: int,
+        project_name: str,
+        hf_token: Optional[str] = None,
+        data_dir: Optional[Path] = None,
+    ) -> str:
+        """Generate docker-compose.yml content."""
+        if data_dir is None:
+            data_dir = Path.home() / ".tfmx" / "docker_data"
+
+        lines = self._generate_header(model_name, project_name, gpus)
+        lines.append("services:")
+
+        for gpu in gpus:
+            service_lines = self._generate_service(
+                gpu, model_name, port, project_name, hf_token, data_dir
+            )
+            lines.extend(service_lines)
+
+        return "\n".join(lines)
+
+    def _generate_header(
+        self, model_name: str, project_name: str, gpus: list[GPUInfo]
+    ) -> list[str]:
+        """Generate compose file header."""
+        return [
+            f"# TEI Multi-GPU Deployment",
+            f"# Model: {model_name}",
+            f"# GPUs: {[g.index for g in gpus]}",
+            f"",
+            f"name: {project_name}",
+            f"",
+        ]
+
+    def _generate_service(
+        self,
+        gpu: GPUInfo,
+        model_name: str,
+        port: int,
+        project_name: str,
+        hf_token: Optional[str],
+        data_dir: Path,
+    ) -> list[str]:
+        """Generate service definition for a single GPU."""
         service_port = port + gpu.index
         container_name = f"{project_name}--gpu{gpu.index}"
 
-        service_lines = [
+        lines = [
             f"  tei-gpu{gpu.index}:",
             f"    image: {gpu.image}",
             f"    container_name: {container_name}",
             f"    ports:",
             f'      - "{service_port}:80"',
             f"    volumes:",
-            f"      - ${{HOME}}/{cache_hf}:/root/{cache_hf}",
+            f"      - ${{HOME}}/{self.cache_hf}:/root/{self.cache_hf}",
             f"      - {data_dir}:/data",
             f"    environment:",
-            f"      - HF_ENDPOINT={hf_endpoint}",
-            f"      - HF_HOME=/root/{cache_hf}",
-            f"      - HF_HUB_CACHE=/root/{cache_hf_hub}",
-            f"      - HUGGINGFACE_HUB_CACHE=/root/{cache_hf_hub}",
+            f"      - HF_ENDPOINT={self.hf_endpoint}",
+            f"      - HF_HOME=/root/{self.cache_hf}",
+            f"      - HF_HUB_CACHE=/root/{self.cache_hf_hub}",
+            f"      - HUGGINGFACE_HUB_CACHE=/root/{self.cache_hf_hub}",
             f"    command:",
             f"      - --huggingface-hub-cache",
-            f"      - /root/{cache_hf_hub}",
+            f"      - /root/{self.cache_hf_hub}",
             f"      - --model-id",
             f"      - {model_name}",
         ]
 
         if hf_token:
-            service_lines.extend(
-                [
-                    f"      - --hf-token",
-                    f"      - {hf_token}",
-                ]
-            )
+            lines.extend([f"      - --hf-token", f"      - {hf_token}"])
 
-        service_lines.extend(
+        lines.extend(
             [
                 f"      - --dtype",
                 f"      - float16",
@@ -284,12 +352,12 @@ def generate_compose_content(
             ]
         )
 
-        lines.extend(service_lines)
-
-    return "\n".join(lines)
+        return lines
 
 
-# ============ TEI Compose Manager ============
+# ============================================================================
+# TEI Compose Manager
+# ============================================================================
 
 
 class TEIComposeManager:
@@ -317,19 +385,21 @@ class TEIComposeManager:
         if compose_dir:
             self.compose_dir = Path(compose_dir)
         else:
-            # Use ~/.tfmx/compose as default (user-writable)
             self.compose_dir = Path.home() / ".tfmx" / "compose"
 
         self.compose_file = self.compose_dir / f"{self.project_name}.yml"
 
-        # Detect GPUs
-        self.gpus = detect_gpus(gpu_ids)
+        # Components
+        self.gpus = GPUDetector.detect(gpu_ids)
+        self.config_manager = ConfigManager()
+        self.image_manager = DockerImageManager()
+        self.file_generator = ComposeFileGenerator()
 
-    def _ensure_compose_dir(self):
+    def _ensure_compose_dir(self) -> None:
         """Ensure compose directory exists."""
         self.compose_dir.mkdir(parents=True, exist_ok=True)
 
-    def _ensure_data_dir(self):
+    def _ensure_data_dir(self) -> Path:
         """Ensure docker_data directory exists."""
         data_dir = Path.home() / ".tfmx" / "docker_data"
         data_dir.mkdir(parents=True, exist_ok=True)
@@ -340,7 +410,7 @@ class TEIComposeManager:
         self._ensure_compose_dir()
         data_dir = self._ensure_data_dir()
 
-        content = generate_compose_content(
+        content = self.file_generator.generate(
             gpus=self.gpus,
             model_name=self.model_name,
             port=self.port,
@@ -353,11 +423,11 @@ class TEIComposeManager:
         logger.success(f"[tfmx] Generated: {self.compose_file}")
         return self.compose_file
 
-    def _run_compose_cmd(self, *args) -> subprocess.CompletedProcess:
+    def _run_compose_cmd(self, cmd: str) -> subprocess.CompletedProcess:
         """Run a docker compose command."""
-        cmd = ["docker", "compose", "-f", str(self.compose_file)] + list(args)
-        logger.mesg(f"[tfmx] Running: {' '.join(cmd)}")
-        return subprocess.run(cmd)
+        full_cmd = f"docker compose -f {self.compose_file} {cmd}"
+        logger.mesg(f"[tfmx] Running: {full_cmd}")
+        return subprocess.run(full_cmd, shell=True)
 
     def up(self) -> None:
         """Start all TEI containers."""
@@ -371,19 +441,19 @@ class TEIComposeManager:
         )
 
         # Patch config files
-        patch_config_files(self.model_name)
+        self.config_manager.patch_config_files(self.model_name)
 
         # Ensure images are available
         images = set(g.image for g in self.gpus)
         for image in images:
-            ensure_tei_image(image)
+            self.image_manager.ensure_image(image)
 
         # Ensure directories
         self._ensure_data_dir()
 
         # Generate and run
         self.generate_compose_file()
-        self._run_compose_cmd("up", "-d")
+        self._run_compose_cmd("up -d")
 
         # Show status
         self.ps()
@@ -419,7 +489,6 @@ class TEIComposeManager:
     def ps(self) -> None:
         """Show status of all TEI containers."""
         if not self.compose_file.exists():
-            # Show manual status
             self._show_manual_status()
             return
         self._run_compose_cmd("ps")
@@ -429,10 +498,8 @@ class TEIComposeManager:
         if not self.compose_file.exists():
             logger.warn(f"× Compose file not found: {self.compose_file}")
             return
-        args = ["logs", f"--tail={tail}"]
-        if follow:
-            args.append("-f")
-        self._run_compose_cmd(*args)
+        follow_flag = "-f" if follow else ""
+        self._run_compose_cmd(f"logs --tail={tail} {follow_flag}".strip())
 
     def _show_manual_status(self) -> None:
         """Show status by querying Docker directly."""
@@ -447,15 +514,8 @@ class TEIComposeManager:
 
             # Check container status
             result = subprocess.run(
-                [
-                    "docker",
-                    "ps",
-                    "-a",
-                    "--filter",
-                    f"name=^/{container_name}$",
-                    "--format",
-                    "{{.Status}}",
-                ],
+                f'docker ps -a --filter "name=^/{container_name}$" --format "{{{{.Status}}}}"',
+                shell=True,
                 capture_output=True,
                 text=True,
             )
@@ -472,16 +532,15 @@ class TEIComposeManager:
         print("=" * 70)
 
 
-# ============ CLI Interface ============
+# ============================================================================
+# Argument Parser
+# ============================================================================
 
 
-def main():
-    import argparse
+class TEIComposeArgParser:
+    """Argument parser for TEI Compose CLI."""
 
-    parser = argparse.ArgumentParser(
-        description="TEI Docker Compose Manager (Low-level operations)\n\nFor user-friendly operations, use 'tei_server' command instead.",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
+    EPILOG = """
 Examples:
   tei_compose -m "Alibaba-NLP/gte-multilingual-base" up         # Start on all GPUs
   tei_compose -m "Alibaba-NLP/gte-multilingual-base" -g "0,2" up  # Specific GPUs
@@ -489,61 +548,94 @@ Examples:
   tei_compose -m "Alibaba-NLP/gte-multilingual-base" logs -f    # View logs
   tei_compose -m "Alibaba-NLP/gte-multilingual-base" stop       # Stop containers
   tei_compose -m "Alibaba-NLP/gte-multilingual-base" down       # Remove containers
-        """,
-    )
+    """
 
-    parser.add_argument(
-        "-m",
-        "--model",
-        type=str,
-        default=MODEL_NAME,
-        help=f"Model name (default: {MODEL_NAME})",
-    )
-    parser.add_argument(
-        "-p",
-        "--port",
-        type=int,
-        default=SERVER_PORT,
-        help=f"Starting port (default: {SERVER_PORT})",
-    )
-    parser.add_argument(
-        "-n",
-        "--name",
-        type=str,
-        default=None,
-        help="Project name (default: tei--MODEL_NAME)",
-    )
-    parser.add_argument(
-        "-g",
-        "--gpus",
-        type=str,
-        default=None,
-        help="Comma-separated GPU IDs (default: all)",
-    )
-    parser.add_argument(
-        "-u",
-        "--hf-token",
-        type=str,
-        default=None,
-        help="HuggingFace token for private models",
-    )
+    def __init__(self):
+        import argparse
 
-    parser.add_argument(
-        "action",
-        choices=["up", "down", "stop", "start", "restart", "ps", "logs", "generate"],
-        help="Action to perform",
-    )
-    parser.add_argument(
-        "-f", "--follow", action="store_true", help="Follow logs (for 'logs' action)"
-    )
-    parser.add_argument(
-        "--tail",
-        type=int,
-        default=100,
-        help="Number of log lines to show (default: 100)",
-    )
+        self.parser = argparse.ArgumentParser(
+            description="TEI Docker Compose Manager (Low-level operations)\n\nFor user-friendly operations, use 'tei_server' command instead.",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
+            epilog=self.EPILOG,
+        )
+        self._setup_arguments()
+        self.args = self.parser.parse_args()
 
-    args = parser.parse_args()
+    def _setup_arguments(self):
+        """Setup all command-line arguments."""
+        # Model configuration
+        self.parser.add_argument(
+            "-m",
+            "--model",
+            type=str,
+            default=MODEL_NAME,
+            help=f"Model name (default: {MODEL_NAME})",
+        )
+        self.parser.add_argument(
+            "-p",
+            "--port",
+            type=int,
+            default=SERVER_PORT,
+            help=f"Starting port (default: {SERVER_PORT})",
+        )
+        self.parser.add_argument(
+            "-n",
+            "--name",
+            type=str,
+            default=None,
+            help="Project name (default: tei--MODEL_NAME)",
+        )
+        self.parser.add_argument(
+            "-g",
+            "--gpus",
+            type=str,
+            default=None,
+            help="Comma-separated GPU IDs (default: all)",
+        )
+        self.parser.add_argument(
+            "-u",
+            "--hf-token",
+            type=str,
+            default=None,
+            help="HuggingFace token for private models",
+        )
+
+        # Actions
+        self.parser.add_argument(
+            "action",
+            choices=[
+                "up",
+                "down",
+                "stop",
+                "start",
+                "restart",
+                "ps",
+                "logs",
+                "generate",
+            ],
+            help="Action to perform",
+        )
+        self.parser.add_argument(
+            "-f",
+            "--follow",
+            action="store_true",
+            help="Follow logs (for 'logs' action)",
+        )
+        self.parser.add_argument(
+            "--tail",
+            type=int,
+            default=100,
+            help="Number of log lines to show (default: 100)",
+        )
+
+
+# ============================================================================
+# CLI Interface
+# ============================================================================
+
+
+def main():
+    args = TEIComposeArgParser().args
 
     manager = TEIComposeManager(
         model_name=args.model,
