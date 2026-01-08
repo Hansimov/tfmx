@@ -23,7 +23,6 @@ Homepage = "https://github.com/Hansimov/tfmx"
 Issues = "https://github.com/Hansimov/tfmx/issues"
 
 [project.scripts]
-tei_server = "tfmx.tei_server:main"
 tei_compose = "tfmx.tei_compose:main"
 
 [tool.setuptools]

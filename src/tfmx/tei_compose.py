@@ -358,12 +358,12 @@ class ComposeFileGenerator:
 
 
 # ============================================================================
-# TEI Compose Manager
+# TEI Composer
 # ============================================================================
 
 
-class TEIComposeManager:
-    """Manager for TEI Docker Compose deployments."""
+class TEIComposer:
+    """Composer for TEI Docker Compose deployments."""
 
     def __init__(
         self,
@@ -383,11 +383,12 @@ class TEIComposeManager:
         model_dash = model_name.replace("/", "--").lower()
         self.project_name = project_name or f"tei--{model_dash}"
 
-        # Compose file location
+        # Compose file location (default to script directory)
         if compose_dir:
             self.compose_dir = Path(compose_dir)
         else:
-            self.compose_dir = Path.home() / ".tfmx" / "compose"
+            script_dir = Path(__file__).resolve().parent
+            self.compose_dir = script_dir / "compose"
 
         self.compose_file = self.compose_dir / f"{self.project_name}.yml"
 
@@ -403,7 +404,8 @@ class TEIComposeManager:
 
     def _ensure_data_dir(self) -> Path:
         """Ensure docker_data directory exists."""
-        data_dir = Path.home() / ".tfmx" / "docker_data"
+        script_dir = Path(__file__).resolve().parent
+        data_dir = script_dir / "docker_data"
         data_dir.mkdir(parents=True, exist_ok=True)
         return data_dir
 
@@ -548,19 +550,44 @@ Examples:
   # Set model as environment variable for convenience
   export MODEL="Alibaba-NLP/gte-multilingual-base"
   
-  tei_compose -m "$MODEL" up           # Start on all GPUs
-  tei_compose -m "$MODEL" -g "0,1" up  # Start on specific GPUs
-  tei_compose -m "$MODEL" ps           # Check status
-  tei_compose -m "$MODEL" logs -f      # View logs
-  tei_compose -m "$MODEL" stop         # Stop containers
-  tei_compose -m "$MODEL" down         # Remove containers
+  # Basic operations
+  tei_compose -m "$MODEL" up                    # Start on all GPUs
+  tei_compose -m "$MODEL" ps                    # Check container status
+  tei_compose -m "$MODEL" logs                  # View recent logs
+  tei_compose -m "$MODEL" stop                  # Stop containers (keep them)
+  tei_compose -m "$MODEL" start                 # Start stopped containers
+  tei_compose -m "$MODEL" restart               # Restart containers
+  tei_compose -m "$MODEL" down                  # Stop and remove containers
+  tei_compose -m "$MODEL" generate              # Generate compose file only
+  
+  # With specific GPUs
+  tei_compose -m "$MODEL" -g "0,1" up           # Start on GPU 0 and 1
+  tei_compose -m "$MODEL" -g "2" up             # Start on GPU 2 only
+  
+  # Custom port and project name
+  tei_compose -m "$MODEL" -p 28890 up           # Use port 28890 as base
+  tei_compose -m "$MODEL" -j my-tei up          # Custom project name
+  
+  # With HuggingFace token for private models
+  tei_compose -m "$MODEL" -t hf_**** up         # Use HF token
+  
+  # Advanced log viewing
+  tei_compose -m "$MODEL" logs -f               # Follow logs in real-time
+  tei_compose -m "$MODEL" logs --tail 200       # Show last 200 lines
+  tei_compose -m "$MODEL" logs -f --tail 50     # Follow with 50 lines buffer
+  
+  # Complete workflow example
+  tei_compose -m "$MODEL" -g "0,1" -p 29000 up  # Start with custom settings
+  tei_compose -m "$MODEL" ps                    # Verify running
+  tei_compose -m "$MODEL" logs -f               # Monitor logs
+  tei_compose -m "$MODEL" down                  # Clean up when done
     """
 
     def __init__(self):
         import argparse
 
         self.parser = argparse.ArgumentParser(
-            description="TEI Docker Compose Manager (Low-level operations)\n\nFor user-friendly operations, use 'tei_server' command instead.",
+            description="TEI Docker Compose Manager",
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog=self.EPILOG,
         )
@@ -572,7 +599,7 @@ Examples:
         # Model configuration
         self.parser.add_argument(
             "-m",
-            "--model",
+            "--model-name",
             type=str,
             default=MODEL_NAME,
             help=f"Model name (default: {MODEL_NAME})",
@@ -585,8 +612,8 @@ Examples:
             help=f"Starting port (default: {SERVER_PORT})",
         )
         self.parser.add_argument(
-            "-n",
-            "--name",
+            "-j",
+            "--project-name",
             type=str,
             default=None,
             help="Project name (default: tei--MODEL_NAME)",
@@ -599,7 +626,7 @@ Examples:
             help="Comma-separated GPU IDs (default: all)",
         )
         self.parser.add_argument(
-            "-u",
+            "-t",
             "--hf-token",
             type=str,
             default=None,
@@ -609,6 +636,7 @@ Examples:
         # Actions
         self.parser.add_argument(
             "action",
+            nargs="?",
             choices=[
                 "up",
                 "down",
@@ -641,32 +669,38 @@ Examples:
 
 
 def main():
-    args = TEIComposeArgParser().args
+    arg_parser = TEIComposeArgParser()
+    args = arg_parser.args
 
-    manager = TEIComposeManager(
-        model_name=args.model,
+    # Show help if no action specified
+    if not args.action:
+        arg_parser.parser.print_help()
+        return
+
+    composer = TEIComposer(
+        model_name=args.model_name,
         port=args.port,
-        project_name=args.name,
+        project_name=args.project_name,
         gpu_ids=args.gpus,
         hf_token=args.hf_token,
     )
 
     if args.action == "up":
-        manager.up()
+        composer.up()
     elif args.action == "down":
-        manager.down()
+        composer.down()
     elif args.action == "stop":
-        manager.stop()
+        composer.stop()
     elif args.action == "start":
-        manager.start()
+        composer.start()
     elif args.action == "restart":
-        manager.restart()
+        composer.restart()
     elif args.action == "ps":
-        manager.ps()
+        composer.ps()
     elif args.action == "logs":
-        manager.logs(follow=args.follow, tail=args.tail)
+        composer.logs(follow=args.follow, tail=args.tail)
     elif args.action == "generate":
-        manager.generate_compose_file()
+        composer.generate_compose_file()
 
 
 if __name__ == "__main__":

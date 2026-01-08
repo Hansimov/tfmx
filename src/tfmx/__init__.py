@@ -6,9 +6,7 @@ from .embed_client import EmbedClient, EmbedClientByConfig
 from .embed_server import TEIEmbedServerConfigsType
 from .embed_server import TEIEmbedServer, TEIEmbedServerByConfig
 from .embed_server import EmbedServerArgParser
-from .tei_server import TEIServerConfigsType
-from .tei_server import TEIServer, TEIServerByConfig
-from .tei_compose import TEIComposeManager, TEIComposeArgParser
+from .tei_compose import TEIComposer, TEIComposeArgParser
 from .tei_compose import GPUInfo, GPUDetector
 from .tei_compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
 from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser

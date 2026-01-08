@@ -1,5 +1,7 @@
 .vscode
 dist/
 src/*.egg-info/
+docker_data/
+compose/
 __pycache__
 *.log
