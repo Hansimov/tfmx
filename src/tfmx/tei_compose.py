@@ -96,7 +96,7 @@ class GPUDetector:
 # ============================================================================
 
 
-class ConfigManager:
+class ModelConfigManager:
     """Manages HuggingFace model configuration files."""
 
     def __init__(self, cache_hf_hub: str = CACHE_HF_HUB):
@@ -168,7 +168,7 @@ class ConfigManager:
             logger.mesg(f"[tfmx] Skip existed: '{target}'")
         elif source.exists():
             shutil.copy(source, target)
-            logger.success(f"[tfmx] Copied: '{target}'")
+            logger.okay(f"[tfmx] Copied: '{target}'")
 
     def _patch_main_config(self, snapshot_dir: Path, tfmx_src: Path) -> None:
         """Patch config.json, fixing corruption if needed."""
@@ -184,12 +184,12 @@ class ConfigManager:
                 target.unlink()
                 if source.exists():
                     shutil.copy(source, target)
-                    logger.success(f"[tfmx] Patched: '{target}'")
+                    logger.okay(f"[tfmx] Patched: '{target}'")
             else:
                 logger.mesg(f"[tfmx] Skip existed: '{target}'")
         elif source.exists():
             shutil.copy(source, target)
-            logger.success(f"[tfmx] Copied: '{target}'")
+            logger.okay(f"[tfmx] Copied: '{target}'")
 
 
 # ============================================================================
@@ -227,7 +227,7 @@ class DockerImageManager:
                 shell=True,
                 check=True,
             )
-            logger.success(f"[tfmx] Image tagged as: {image}")
+            logger.okay(f"[tfmx] Image tagged as: {image}")
             return True
         except subprocess.CalledProcessError as e:
             logger.warn(f"× Failed to pull image: {e}")
@@ -258,19 +258,21 @@ class ComposeFileGenerator:
         model_name: str,
         port: int,
         project_name: str,
+        data_dir: Path,
         hf_token: Optional[str] = None,
-        data_dir: Optional[Path] = None,
     ) -> str:
         """Generate docker-compose.yml content."""
-        if data_dir is None:
-            data_dir = Path.home() / ".tfmx" / "docker_data"
-
         lines = self._generate_header(model_name, project_name, gpus)
         lines.append("services:")
 
         for gpu in gpus:
             service_lines = self._generate_service(
-                gpu, model_name, port, project_name, hf_token, data_dir
+                gpu=gpu,
+                model_name=model_name,
+                port=port,
+                project_name=project_name,
+                data_dir=data_dir,
+                hf_token=hf_token,
             )
             lines.extend(service_lines)
 
@@ -295,8 +297,8 @@ class ComposeFileGenerator:
         model_name: str,
         port: int,
         project_name: str,
-        hf_token: Optional[str],
         data_dir: Path,
+        hf_token: Optional[str] = None,
     ) -> list[str]:
         """Generate service definition for a single GPU."""
         service_port = port + gpu.index
@@ -391,9 +393,9 @@ class TEIComposeManager:
 
         # Components
         self.gpus = GPUDetector.detect(gpu_ids)
-        self.config_manager = ConfigManager()
+        self.model_config_manager = ModelConfigManager()
         self.image_manager = DockerImageManager()
-        self.file_generator = ComposeFileGenerator()
+        self.compose_generator = ComposeFileGenerator()
 
     def _ensure_compose_dir(self) -> None:
         """Ensure compose directory exists."""
@@ -410,17 +412,17 @@ class TEIComposeManager:
         self._ensure_compose_dir()
         data_dir = self._ensure_data_dir()
 
-        content = self.file_generator.generate(
+        content = self.compose_generator.generate(
             gpus=self.gpus,
             model_name=self.model_name,
             port=self.port,
             project_name=self.project_name,
-            hf_token=self.hf_token,
             data_dir=data_dir,
+            hf_token=self.hf_token,
         )
 
         self.compose_file.write_text(content)
-        logger.success(f"[tfmx] Generated: {self.compose_file}")
+        logger.okay(f"[tfmx] Generated: {self.compose_file}")
         return self.compose_file
 
     def _run_compose_cmd(self, cmd: str) -> subprocess.CompletedProcess:
@@ -441,7 +443,7 @@ class TEIComposeManager:
         )
 
         # Patch config files
-        self.config_manager.patch_config_files(self.model_name)
+        self.model_config_manager.patch_config_files(self.model_name)
 
         # Ensure images are available
         images = set(g.image for g in self.gpus)
@@ -540,14 +542,18 @@ class TEIComposeManager:
 class TEIComposeArgParser:
     """Argument parser for TEI Compose CLI."""
 
+    # ANCHOR[id=clis]
     EPILOG = """
 Examples:
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" up         # Start on all GPUs
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" -g "0,2" up  # Specific GPUs
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" ps         # Check status
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" logs -f    # View logs
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" stop       # Stop containers
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" down       # Remove containers
+  # Set model as environment variable for convenience
+  export MODEL="Alibaba-NLP/gte-multilingual-base"
+  
+  tei_compose -m "$MODEL" up           # Start on all GPUs
+  tei_compose -m "$MODEL" -g "0,1" up  # Start on specific GPUs
+  tei_compose -m "$MODEL" ps           # Check status
+  tei_compose -m "$MODEL" logs -f      # View logs
+  tei_compose -m "$MODEL" stop         # Stop containers
+  tei_compose -m "$MODEL" down         # Remove containers
     """
 
     def __init__(self):
@@ -665,3 +671,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
+    # LINK: src/tfmx/tei_compose.py#clis

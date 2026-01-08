@@ -10,6 +10,6 @@ from .tei_server import TEIServerConfigsType
 from .tei_server import TEIServer, TEIServerByConfig
 from .tei_compose import TEIComposeManager, TEIComposeArgParser
 from .tei_compose import GPUInfo, GPUDetector
-from .tei_compose import ConfigManager, DockerImageManager, ComposeFileGenerator
+from .tei_compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
 from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
 from .gpu_fan import control_gpu_fan
