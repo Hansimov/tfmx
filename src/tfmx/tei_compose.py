@@ -17,10 +17,6 @@ from typing import Optional
 from tclogger import logger
 
 
-# ============================================================================
-# Constants
-# ============================================================================
-
 SERVER_PORT = 28880
 MODEL_NAME = "Alibaba-NLP/gte-multilingual-base"
 HF_ENDPOINT = "https://hf-mirror.com"
@@ -38,11 +34,6 @@ TEI_TAG = "86-1.8"  # Fallback
 
 TEI_IMAGE_BASE = "ghcr.io/huggingface/text-embeddings-inference"
 TEI_IMAGE_MIRROR = "m.daocloud.io"
-
-
-# ============================================================================
-# GPU Information
-# ============================================================================
 
 
 class GPUInfo:
@@ -89,11 +80,6 @@ class GPUDetector:
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
             logger.warn(f"× Failed to detect GPUs: {e}")
             return []
-
-
-# ============================================================================
-# Configuration Management
-# ============================================================================
 
 
 class ModelConfigManager:
@@ -192,11 +178,6 @@ class ModelConfigManager:
             logger.okay(f"[tfmx] Copied: '{target}'")
 
 
-# ============================================================================
-# Docker Image Management
-# ============================================================================
-
-
 class DockerImageManager:
     """Manages Docker image operations."""
 
@@ -232,11 +213,6 @@ class DockerImageManager:
         except subprocess.CalledProcessError as e:
             logger.warn(f"× Failed to pull image: {e}")
             return False
-
-
-# ============================================================================
-# Docker Compose File Generator
-# ============================================================================
 
 
 class ComposeFileGenerator:
@@ -355,11 +331,6 @@ class ComposeFileGenerator:
         )
 
         return lines
-
-
-# ============================================================================
-# TEI Composer
-# ============================================================================
 
 
 class TEIComposer:
@@ -536,15 +507,10 @@ class TEIComposer:
         print("=" * 70)
 
 
-# ============================================================================
-# Argument Parser
-# ============================================================================
-
-
 class TEIComposeArgParser:
     """Argument parser for TEI Compose CLI."""
 
-    # ANCHOR[id=clis]
+    # ANCHOR[id=epilog]
     EPILOG = """
 Examples:
   # Set model as environment variable for convenience
@@ -663,11 +629,6 @@ Examples:
         )
 
 
-# ============================================================================
-# CLI Interface
-# ============================================================================
-
-
 def main():
     arg_parser = TEIComposeArgParser()
     args = arg_parser.args
@@ -706,4 +667,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # LINK: src/tfmx/tei_compose.py#clis
+    # LINK: src/tfmx/tei_compose.py#epilog
