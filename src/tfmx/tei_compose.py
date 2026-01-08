@@ -1,14 +1,39 @@
-"""TEI (Text Embeddings Inference) Docker Compose Manager
+"""TEI (Text Embeddings Inference) Docker Compose Manager"""
 
-This module provides low-level Docker Compose operations for TEI containers.
-For user-friendly server management, use 'tei_server' command instead.
-
-This tool is designed for:
-- Advanced Docker Compose operations
-- Direct control over compose lifecycle
-- Custom deployment workflows
+# ANCHOR[id=clis]
+CLI_EPILOG = """
+Examples:
+  # Set model as environment variable for convenience
+  export MODEL="Alibaba-NLP/gte-multilingual-base"
+  
+  # Basic operations
+  tei_compose -m "$MODEL" up                    # Start on all GPUs
+  tei_compose -m "$MODEL" ps                    # Check container status
+  tei_compose -m "$MODEL" logs                  # View recent logs
+  tei_compose -m "$MODEL" stop                  # Stop containers (keep them)
+  tei_compose -m "$MODEL" start                 # Start stopped containers
+  tei_compose -m "$MODEL" restart               # Restart containers
+  tei_compose -m "$MODEL" down                  # Stop and remove containers
+  tei_compose -m "$MODEL" generate              # Generate compose file only
+  
+  # With specific GPUs
+  tei_compose -m "$MODEL" -g "0,1" up           # Start on GPU 0 and 1
+  tei_compose -m "$MODEL" -g "2" up             # Start on GPU 2 only
+  
+  # Custom port and project name
+  tei_compose -m "$MODEL" -p 28890 up           # Use port 28890 as base
+  tei_compose -m "$MODEL" -j my-tei up          # Custom project name
+  
+  # With HuggingFace token for private models
+  tei_compose -m "$MODEL" -t hf_**** up         # Use HF token
+  
+  # Advanced log viewing
+  tei_compose -m "$MODEL" logs -f               # Follow logs in real-time
+  tei_compose -m "$MODEL" logs --tail 200       # Show last 200 lines
+  tei_compose -m "$MODEL" logs -f --tail 50     # Follow with 50 lines buffer
 """
 
+import argparse
 import shutil
 import subprocess
 from pathlib import Path
@@ -510,52 +535,11 @@ class TEIComposer:
 class TEIComposeArgParser:
     """Argument parser for TEI Compose CLI."""
 
-    # ANCHOR[id=epilog]
-    EPILOG = """
-Examples:
-  # Set model as environment variable for convenience
-  export MODEL="Alibaba-NLP/gte-multilingual-base"
-  
-  # Basic operations
-  tei_compose -m "$MODEL" up                    # Start on all GPUs
-  tei_compose -m "$MODEL" ps                    # Check container status
-  tei_compose -m "$MODEL" logs                  # View recent logs
-  tei_compose -m "$MODEL" stop                  # Stop containers (keep them)
-  tei_compose -m "$MODEL" start                 # Start stopped containers
-  tei_compose -m "$MODEL" restart               # Restart containers
-  tei_compose -m "$MODEL" down                  # Stop and remove containers
-  tei_compose -m "$MODEL" generate              # Generate compose file only
-  
-  # With specific GPUs
-  tei_compose -m "$MODEL" -g "0,1" up           # Start on GPU 0 and 1
-  tei_compose -m "$MODEL" -g "2" up             # Start on GPU 2 only
-  
-  # Custom port and project name
-  tei_compose -m "$MODEL" -p 28890 up           # Use port 28890 as base
-  tei_compose -m "$MODEL" -j my-tei up          # Custom project name
-  
-  # With HuggingFace token for private models
-  tei_compose -m "$MODEL" -t hf_**** up         # Use HF token
-  
-  # Advanced log viewing
-  tei_compose -m "$MODEL" logs -f               # Follow logs in real-time
-  tei_compose -m "$MODEL" logs --tail 200       # Show last 200 lines
-  tei_compose -m "$MODEL" logs -f --tail 50     # Follow with 50 lines buffer
-  
-  # Complete workflow example
-  tei_compose -m "$MODEL" -g "0,1" -p 29000 up  # Start with custom settings
-  tei_compose -m "$MODEL" ps                    # Verify running
-  tei_compose -m "$MODEL" logs -f               # Monitor logs
-  tei_compose -m "$MODEL" down                  # Clean up when done
-    """
-
     def __init__(self):
-        import argparse
-
         self.parser = argparse.ArgumentParser(
             description="TEI Docker Compose Manager",
             formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=self.EPILOG,
+            epilog=CLI_EPILOG,
         )
         self._setup_arguments()
         self.args = self.parser.parse_args()
@@ -667,4 +651,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # LINK: src/tfmx/tei_compose.py#epilog
+    # LINK: src/tfmx/tei_compose.py#clis
