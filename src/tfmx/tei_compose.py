@@ -8,30 +8,35 @@ Examples:
   export MODEL="Qwen/Qwen3-Embedding-0.6B"
   
   # Basic operations
-  tei_compose -m "$MODEL" up                    # Start on all GPUs
-  tei_compose -m "$MODEL" ps                    # Check container status
-  tei_compose -m "$MODEL" logs                  # View recent logs
-  tei_compose -m "$MODEL" stop                  # Stop containers (keep them)
-  tei_compose -m "$MODEL" start                 # Start stopped containers
-  tei_compose -m "$MODEL" restart               # Restart containers
-  tei_compose -m "$MODEL" down                  # Stop and remove containers
-  tei_compose -m "$MODEL" generate              # Generate compose file only
+  tei_compose up                    # Start on all GPUs
+  tei_compose ps                    # Check container status
+  tei_compose logs                  # View recent logs
+  tei_compose stop                  # Stop containers (keep them)
+  tei_compose start                 # Start stopped containers
+  tei_compose restart               # Restart containers
+  tei_compose down                  # Stop and remove containers
+  tei_compose generate              # Generate compose file only
+  
+  # With specific model
+  tei_compose -m "$MODEL" generate  # Generate compose file only
+  tei_compose -m "$MODEL" up        # Start with specified model
+  tei_compose -m ""Alibaba-NLP/gte-multilingual-base" up  # Use model name directly
   
   # With specific GPUs
-  tei_compose -m "$MODEL" -g "0,1" up           # Start on GPU 0 and 1
-  tei_compose -m "$MODEL" -g "2" up             # Start on GPU 2 only
+  tei_compose -g "0,1" up           # Start on GPU 0 and 1
+  tei_compose -g "2" up             # Start on GPU 2 only
   
   # Custom port and project name
-  tei_compose -m "$MODEL" -p 28890 up           # Use port 28890 as base
-  tei_compose -m "$MODEL" -j my-tei up          # Custom project name
+  tei_compose -p 28890 up           # Use port 28890 as base
+  tei_compose -j my-tei up          # Custom project name
   
   # With HuggingFace token for private models
-  tei_compose -m "$MODEL" -t hf_**** up         # Use HF token
+  tei_compose -t hf_**** up         # Use HF token
   
   # Advanced log viewing
-  tei_compose -m "$MODEL" logs -f               # Follow logs in real-time
-  tei_compose -m "$MODEL" logs --tail 200       # Show last 200 lines
-  tei_compose -m "$MODEL" logs -f --tail 50     # Follow with 50 lines buffer
+  tei_compose logs -f               # Follow logs in real-time
+  tei_compose logs --tail 200       # Show last 200 lines
+  tei_compose logs -f --tail 50     # Follow with 50 lines buffer
 """
 
 import argparse
@@ -46,7 +51,7 @@ from tclogger import logger
 
 
 SERVER_PORT = 28880
-MODEL_NAME = "Alibaba-NLP/gte-multilingual-base"
+MODEL_NAME = "Qwen/Qwen3-Embedding-0.6B"
 HF_ENDPOINT = "https://hf-mirror.com"
 CACHE_HF = ".cache/huggingface"
 CACHE_HF_HUB = f"{CACHE_HF}/hub"
@@ -616,8 +621,13 @@ def main():
         arg_parser.parser.print_help()
         return
 
+    # Use default MODEL_NAME if model_name is empty or whitespace
+    model_name = args.model_name.strip() if args.model_name else MODEL_NAME
+    if not model_name:
+        model_name = MODEL_NAME
+
     composer = TEIComposer(
-        model_name=args.model_name,
+        model_name=model_name,
         port=args.port,
         project_name=args.project_name,
         gpu_ids=args.gpus,
