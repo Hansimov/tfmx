@@ -3,5 +3,7 @@ dist/
 src/*.egg-info/
 docker_data/
 compose/
+weights/
 __pycache__
 *.log
+*.npy

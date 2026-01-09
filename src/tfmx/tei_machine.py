@@ -33,6 +33,7 @@ import subprocess
 import re
 
 import httpx
+import numpy as np
 import uvicorn
 
 from contextlib import asynccontextmanager
@@ -43,6 +44,8 @@ from pydantic import BaseModel, Field
 from tclogger import logger, logstr
 from typing import Optional, Union
 from webu import setup_swagger_ui
+
+from .lsh import LSHConverter
 
 
 PORT = 28800
@@ -70,6 +73,17 @@ class EmbedRequest(BaseModel):
     truncate: bool = Field(
         default=True,
         description="Whether to truncate inputs that exceed max length",
+    )
+
+
+class LSHRequest(EmbedRequest):
+    """Request model for LSH endpoint."""
+
+    bitn: int = Field(
+        default=2048,
+        description="Number of LSH hash bits",
+        ge=64,
+        le=8192,
     )
 
 
@@ -355,6 +369,21 @@ class TEILoadBalancer:
 # ============================================================================
 
 
+class LSHConverterCache:
+    """Cache for LSHConverter instances to avoid repeated initialization."""
+
+    def __init__(self):
+        self._cache: dict[tuple[int, int], "LSHConverter"] = {}
+        self._lock = asyncio.Lock()
+
+    def get(self, dims: int, bitn: int) -> "LSHConverter":
+        """Get or create LSHConverter for given dimensions and bit count."""
+        key = (dims, bitn)
+        if key not in self._cache:
+            self._cache[key] = LSHConverter(dims=dims, bitn=bitn, verbose=False)
+        return self._cache[key]
+
+
 class TEIMachineServer:
     """FastAPI server that proxies requests to multiple TEI instances."""
 
@@ -373,6 +402,7 @@ class TEIMachineServer:
         self.stats = TEIMachineStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
+        self._lsh_cache = LSHConverterCache()
 
         # Create FastAPI app
         self.app = self._create_app()
@@ -392,13 +422,6 @@ class TEIMachineServer:
         setup_swagger_ui(app)
 
         # Register routes
-        app.post(
-            "/embed",
-            response_model=list[list[float]],
-            summary="Generate embeddings",
-            description="Generate embeddings for input texts using load-balanced TEI instances",
-        )(self.handle_embed)
-
         app.get(
             "/health",
             response_model=HealthResponse,
@@ -412,6 +435,20 @@ class TEIMachineServer:
             summary="Machine info",
             description="Get detailed information about the machine and statistics",
         )(self.handle_info)
+
+        app.post(
+            "/embed",
+            response_model=list[list[float]],
+            summary="Generate embeddings",
+            description="Generate embeddings for input texts using load-balanced TEI instances",
+        )(self.handle_embed)
+
+        app.post(
+            "/lsh",
+            response_model=list[str],
+            summary="Generate LSH hashes",
+            description="Generate LSH hash hex strings for input texts (embed + LSH)",
+        )(self.handle_lsh)
 
         return app
 
@@ -431,10 +468,9 @@ class TEIMachineServer:
         self._health_task = asyncio.create_task(self._periodic_health_check())
 
         logger.okay(f"[tei_machine] Started on port {self.port}")
-        logger.mesg(
-            f"[tei_machine] Healthy instances: "
-            f"{len(self.load_balancer.healthy_instances)}/{len(self.instances)}"
-        )
+        healthy_str = logstr.okay(len(self.load_balancer.healthy_instances))
+        total_str = logstr.mesg(len(self.instances))
+        logger.mesg(f"[tei_machine] Healthy instances: {healthy_str}/{total_str}")
 
         yield
 
@@ -609,6 +645,49 @@ class TEIMachineServer:
             instances=[inst.to_info() for inst in self.instances],
             stats=self.stats.to_model(),
         )
+
+    async def handle_lsh(self, request: LSHRequest) -> list[str]:
+        """Handle LSH requests: embed + LSH conversion to hex strings."""
+        # Normalize inputs to list
+        inputs = request.inputs
+        if isinstance(inputs, str):
+            inputs = [inputs]
+
+        if not inputs:
+            raise HTTPException(status_code=400, detail="No inputs provided")
+
+        self.stats.total_requests += 1
+        self.stats.total_inputs += len(inputs)
+
+        # Get healthy instances
+        healthy = self.load_balancer.get_all_healthy()
+        if not healthy:
+            self.stats.total_errors += 1
+            raise HTTPException(
+                status_code=503, detail="No healthy instances available"
+            )
+
+        try:
+            # Get embeddings from TEI instances
+            embeddings = await self._distribute_and_collect(
+                inputs, healthy, request.normalize, request.truncate
+            )
+
+            # Convert to numpy array for vectorized LSH
+            embs_array = np.array(embeddings, dtype=np.float32)
+            dims = embs_array.shape[1]
+
+            # Get cached LSH converter
+            lsh: LSHConverter = self._lsh_cache.get(dims=dims, bitn=request.bitn)
+
+            # Vectorized conversion to hex strings
+            lsh_hashes = lsh.embs_to_hex_batch(embs_array)
+            return lsh_hashes
+
+        except Exception as e:
+            self.stats.total_errors += 1
+            logger.warn(f"× LSH error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
 
     def run(self) -> None:
         """Run the server using uvicorn."""
