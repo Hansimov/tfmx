@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfmx"
-version = "0.5.2"
+version = "0.5.3"
 authors = [
     { name="Hansimov" },
 ]
 description = "Serve Transformers in one line"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 requires-python = ">=3.6"
 classifiers = [
     "Programming Language :: Python :: 3",
