@@ -1,30 +1,30 @@
-"""TEI (Text Embeddings Inference) Cluster Manager
+"""TEI (Text Embeddings Inference) Machine Manager
 
 This module provides a load-balanced proxy server that distributes embedding
 requests across multiple TEI Docker instances running on different GPUs.
 """
 
-# ANCHOR[id=cluster-clis]
+# ANCHOR[id=machine-clis]
 CLI_EPILOG = """
 Examples:
-  # Start cluster server (auto-discover TEI containers)
-  tei_cluster run                   # Start on default port 28800
-  tei_cluster run -p 28800          # Start on specific port
+  # Start machine server (auto-discover TEI containers)
+  tei_machine run                   # Start on default port 28800
+  tei_machine run -p 28800          # Start on specific port
   
   # Filter containers by name pattern
-  tei_cluster run -n "qwen3-embedding"  # Only match containers with this pattern
+  tei_machine run -n "qwen3-embedding"  # Only match containers with this pattern
   
   # Manual endpoint specification (skip auto-discovery)
-  tei_cluster run -e "http://localhost:28880,http://localhost:28881"
+  tei_machine run -e "http://localhost:28880,http://localhost:28881"
   
   # With custom batch size per instance
-  tei_cluster run -b 50             # Max 50 inputs per request to each instance
+  tei_machine run -b 50             # Max 50 inputs per request to each instance
   
   # Check discovered instances without starting server
-  tei_cluster discover              # List all discovered TEI instances
+  tei_machine discover              # List all discovered TEI instances
   
   # Health check all instances
-  tei_cluster health                # Check health of all instances
+  tei_machine health                # Check health of all instances
 """
 
 import argparse
@@ -90,8 +90,8 @@ class InstanceInfo(BaseModel):
     healthy: bool = Field(..., description="Whether instance is healthy")
 
 
-class ClusterStats(BaseModel):
-    """Statistics for the cluster."""
+class MachineStats(BaseModel):
+    """Statistics for the machine."""
 
     total_requests: int = Field(0, description="Total number of requests processed")
     total_inputs: int = Field(0, description="Total number of inputs embedded")
@@ -104,9 +104,9 @@ class ClusterStats(BaseModel):
 class InfoResponse(BaseModel):
     """Response model for info endpoint."""
 
-    port: int = Field(..., description="Cluster server port")
+    port: int = Field(..., description="Machine server port")
     instances: list[InstanceInfo] = Field(..., description="List of TEI instances")
-    stats: ClusterStats = Field(..., description="Cluster statistics")
+    stats: MachineStats = Field(..., description="Machine statistics")
 
 
 class ErrorResponse(BaseModel):
@@ -160,17 +160,17 @@ class TEIInstance:
 
 
 @dataclass
-class TEIClusterStatsData:
-    """Statistics for the cluster (internal dataclass)."""
+class TEIMachineStatsData:
+    """Statistics for the machine (internal dataclass)."""
 
     total_requests: int = 0
     total_inputs: int = 0
     total_errors: int = 0
     requests_per_instance: dict = field(default_factory=dict)
 
-    def to_model(self) -> ClusterStats:
+    def to_model(self) -> MachineStats:
         """Convert to Pydantic model."""
-        return ClusterStats(
+        return MachineStats(
             total_requests=self.total_requests,
             total_inputs=self.total_inputs,
             total_errors=self.total_errors,
@@ -213,7 +213,7 @@ class TEIInstanceDiscovery:
                 return []
 
             if not result.stdout.strip():
-                logger.note(f"[tei_cluster] No running containers found")
+                logger.note(f"[tei_machine] No running containers found")
                 return []
 
             instances = []
@@ -255,7 +255,7 @@ class TEIInstanceDiscovery:
             instances.sort(key=lambda x: (x.gpu_id if x.gpu_id is not None else 999))
 
             # if instances:
-            #     logger.okay(f"[tei_cluster] Found {len(instances)} TEI containers")
+            #     logger.okay(f"[tei_machine] Found {len(instances)} TEI containers")
             #     for inst in instances:
             #         logger.mesg(f"  - {inst.container_name} @ {inst.endpoint}")
 
@@ -351,11 +351,11 @@ class TEILoadBalancer:
 
 
 # ============================================================================
-# Cluster Server (FastAPI)
+# Machine Server (FastAPI)
 # ============================================================================
 
 
-class TEIClusterServer:
+class TEIMachineServer:
     """FastAPI server that proxies requests to multiple TEI instances."""
 
     def __init__(
@@ -370,7 +370,7 @@ class TEIClusterServer:
         self.batch_size = batch_size
         self.timeout = timeout
         self.load_balancer = TEILoadBalancer(instances)
-        self.stats = TEIClusterStatsData()
+        self.stats = TEIMachineStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
 
@@ -380,7 +380,7 @@ class TEIClusterServer:
     def _create_app(self) -> FastAPI:
         """Create and configure the FastAPI application."""
         app = FastAPI(
-            title="TEI Cluster",
+            title="TEI Machine",
             description="Load-balanced proxy for Text Embeddings Inference instances",
             version="1.0.0",
             lifespan=self._lifespan,
@@ -403,14 +403,14 @@ class TEIClusterServer:
             "/health",
             response_model=HealthResponse,
             summary="Health check",
-            description="Check health status of the cluster",
+            description="Check health status of the machine",
         )(self.handle_health)
 
         app.get(
             "/info",
             response_model=InfoResponse,
-            summary="Cluster info",
-            description="Get detailed information about the cluster and statistics",
+            summary="Machine info",
+            description="Get detailed information about the machine and statistics",
         )(self.handle_info)
 
         return app
@@ -430,9 +430,9 @@ class TEIClusterServer:
         # Start background health checker
         self._health_task = asyncio.create_task(self._periodic_health_check())
 
-        logger.okay(f"[tei_cluster] Started on port {self.port}")
+        logger.okay(f"[tei_machine] Started on port {self.port}")
         logger.mesg(
-            f"[tei_cluster] Healthy instances: "
+            f"[tei_machine] Healthy instances: "
             f"{len(self.load_balancer.healthy_instances)}/{len(self.instances)}"
         )
 
@@ -636,12 +636,12 @@ class TEIClusterServer:
 # ============================================================================
 
 
-class TEIClusterArgParser:
-    """Argument parser for TEI Cluster CLI."""
+class TEIMachineArgParser:
+    """Argument parser for TEI Machine CLI."""
 
     def __init__(self):
         self.parser = argparse.ArgumentParser(
-            description="TEI Cluster - Load-balanced proxy for TEI instances",
+            description="TEI Machine - Load-balanced proxy for TEI instances",
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog=CLI_EPILOG,
         )
@@ -655,7 +655,7 @@ class TEIClusterArgParser:
             "--port",
             type=int,
             default=PORT,
-            help=f"Cluster server port (default: {PORT})",
+            help=f"Machine server port (default: {PORT})",
         )
         self.parser.add_argument(
             "-n",
@@ -699,10 +699,10 @@ def discover_instances(args) -> list[TEIInstance]:
     if args.endpoints:
         endpoints = [e.strip() for e in args.endpoints.split(",")]
         instances = TEIInstanceDiscovery.from_endpoints(endpoints)
-        logger.okay(f"[tei_cluster] Using {len(instances)} manual endpoints")
+        logger.okay(f"[tei_machine] Using {len(instances)} manual endpoints")
     else:
         instances = TEIInstanceDiscovery.discover(args.name_pattern)
-        logger.okay(f"[tei_cluster] Discovered {len(instances)} TEI instances")
+        logger.okay(f"[tei_machine] Discovered {len(instances)} TEI instances")
 
     return instances
 
@@ -745,7 +745,7 @@ def log_instances(instances: list[TEIInstance], show_health: bool = False) -> No
 
     if show_health:
         healthy = sum(1 for i in instances if i.healthy)
-        logger.mesg(f"[tei_cluster] Healthy: {healthy}/{len(instances)}")
+        logger.mesg(f"[tei_machine] Healthy: {healthy}/{len(instances)}")
 
 
 async def check_health(instances: list[TEIInstance]) -> None:
@@ -763,7 +763,7 @@ async def check_health(instances: list[TEIInstance]) -> None:
 
 def main():
     """Main entry point."""
-    arg_parser = TEIClusterArgParser()
+    arg_parser = TEIMachineArgParser()
     args = arg_parser.args
 
     # Show help if no action specified
@@ -788,7 +788,7 @@ def main():
             )
             return
 
-        server = TEIClusterServer(
+        server = TEIMachineServer(
             instances=instances,
             port=args.port,
             batch_size=args.batch_size,
@@ -800,4 +800,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # LINK: src/tfmx/tei_cluster.py#cluster-clis
+    # LINK: src/tfmx/tei_machine.py#machine-clis
