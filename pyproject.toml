@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-dependencies = [ "tclogger", "numpy", "requests" ]
+dependencies = [ "tclogger", "numpy", "requests", "fastapi", "uvicorn", "httpx", "webu" ]
 
 [project.urls]
 Homepage = "https://github.com/Hansimov/tfmx"
@@ -24,6 +24,7 @@ Issues = "https://github.com/Hansimov/tfmx/issues"
 
 [project.scripts]
 tei_compose = "tfmx.tei_compose:main"
+tei_cluster = "tfmx.tei_cluster:main"
 
 [tool.setuptools]
 include-package-data = true
