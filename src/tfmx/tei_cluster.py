@@ -7,18 +7,18 @@ requests across multiple TEI Docker instances running on different GPUs.
 # ANCHOR[id=cluster-clis]
 CLI_EPILOG = """
 Examples:
-  # Auto-discover TEI containers and start cluster server
-  tei_cluster                       # Start on default port 28800
-  tei_cluster -p 28800              # Start on specific port
+  # Start cluster server (auto-discover TEI containers)
+  tei_cluster run                   # Start on default port 28800
+  tei_cluster run -p 28800          # Start on specific port
   
   # Filter containers by name pattern
-  tei_cluster -n "qwen3-embedding"  # Only match containers with this pattern
+  tei_cluster run -n "qwen3-embedding"  # Only match containers with this pattern
   
   # Manual endpoint specification (skip auto-discovery)
-  tei_cluster -e "http://localhost:28880,http://localhost:28881"
+  tei_cluster run -e "http://localhost:28880,http://localhost:28881"
   
   # With custom batch size per instance
-  tei_cluster -b 50                 # Max 50 inputs per request to each instance
+  tei_cluster run -b 50             # Max 50 inputs per request to each instance
   
   # Check discovered instances without starting server
   tei_cluster discover              # List all discovered TEI instances
@@ -395,11 +395,6 @@ class TEIClusterServer:
         app.post(
             "/embed",
             response_model=list[list[float]],
-            responses={
-                400: {"model": ErrorResponse, "description": "Bad request"},
-                503: {"model": ErrorResponse, "description": "No healthy instances"},
-                500: {"model": ErrorResponse, "description": "Internal server error"},
-            },
             summary="Generate embeddings",
             description="Generate embeddings for input texts using load-balanced TEI instances",
         )(self.handle_embed)
@@ -407,7 +402,6 @@ class TEIClusterServer:
         app.get(
             "/health",
             response_model=HealthResponse,
-            responses={503: {"model": HealthResponse, "description": "Unhealthy"}},
             summary="Health check",
             description="Check health status of the cluster",
         )(self.handle_health)
@@ -694,9 +688,9 @@ class TEIClusterArgParser:
         self.parser.add_argument(
             "action",
             nargs="?",
-            choices=["start", "discover", "health"],
-            default="start",
-            help="Action to perform (default: start)",
+            choices=["run", "discover", "health"],
+            default=None,
+            help="Action to perform: run (start server), discover (list instances), health (check health)",
         )
 
 
@@ -772,6 +766,11 @@ def main():
     arg_parser = TEIClusterArgParser()
     args = arg_parser.args
 
+    # Show help if no action specified
+    if args.action is None:
+        arg_parser.parser.print_help()
+        return
+
     instances = discover_instances(args)
 
     if args.action == "discover":
@@ -782,18 +781,20 @@ def main():
         asyncio.run(check_health(instances))
         return
 
-    # Default: start server
-    if not instances:
-        logger.warn("× No TEI instances found. Use -e to specify endpoints manually.")
-        return
+    if args.action == "run":
+        if not instances:
+            logger.warn(
+                "× No TEI instances found. Use -e to specify endpoints manually."
+            )
+            return
 
-    server = TEIClusterServer(
-        instances=instances,
-        port=args.port,
-        batch_size=args.batch_size,
-        timeout=args.timeout,
-    )
-    server.run()
+        server = TEIClusterServer(
+            instances=instances,
+            port=args.port,
+            batch_size=args.batch_size,
+            timeout=args.timeout,
+        )
+        server.run()
 
 
 if __name__ == "__main__":
