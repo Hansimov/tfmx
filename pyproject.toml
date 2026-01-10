@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfmx"
-version = "0.5.3"
+version = "0.5.4"
 authors = [
     { name="Hansimov" },
 ]
@@ -25,6 +25,7 @@ Issues = "https://github.com/Hansimov/tfmx/issues"
 [project.scripts]
 tei_compose = "tfmx.tei_compose:main"
 tei_machine = "tfmx.tei_machine:main"
+tei_client = "tfmx.tei_client:main"
 
 [tool.setuptools]
 include-package-data = true
