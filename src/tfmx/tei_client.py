@@ -445,19 +445,23 @@ class TEIClientCLI:
     def run_info(self) -> None:
         """Get and display server info."""
         info = self.client.info()
+        self._display_single_info(info)
+
+    def _display_single_info(self, info: InfoResponse) -> None:
+        """Display info for a single machine."""
         logger.mesg(f"Port: {info.port}")
         logger.mesg(f"Instances ({len(info.instances)}):")
 
         dash_len = 75
         logger.note("=" * dash_len)
-        logger.note(f"{'GPU':<6} {'NAME':<35} {'ENDPOINT':<22} {'STATUS':<8}")
+        logger.note(f"{'GPU':<6} {'NAME':<40} {'ENDPOINT':<25} {'STATUS':<8}")
         logger.note("-" * dash_len)
 
         for inst in info.instances:
             gpu_str = str(inst.gpu_id) if inst.gpu_id is not None else "?"
             status_str = "healthy" if inst.healthy else "unhealthy"
             logger.mesg(
-                f"{gpu_str:<6} {inst.name:<35} {inst.endpoint:<22} {status_str:<8}"
+                f"{gpu_str:<6} {inst.name:<35} {inst.endpoint:<25} {status_str:<8}"
             )
 
         logger.note("=" * dash_len)
