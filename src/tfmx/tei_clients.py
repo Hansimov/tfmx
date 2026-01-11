@@ -23,9 +23,15 @@ import json
 
 from dataclasses import dataclass
 from tclogger import logger
-from typing import Union
+from typing import Union, Optional
 
 from .tei_client import TEIClient, InfoResponse, TIMEOUT
+from .tei_scheduler import (
+    AdaptiveScheduler,
+    WorkerStats,
+    DistributionResult,
+    distribute_with_scheduler,
+)
 
 
 @dataclass
@@ -118,6 +124,12 @@ class TEIClients:
         # Round-robin index
         self._rr_index = 0
 
+        # Adaptive scheduler for EFT-based distribution
+        self.scheduler = AdaptiveScheduler(
+            workers=self.clients,
+            get_worker_id=lambda c: c.endpoint,
+        )
+
     def close(self) -> None:
         """Close all HTTP clients."""
         for client in self.clients:
@@ -175,58 +187,6 @@ class TEIClients:
             if self.machines[i].healthy
         ]
 
-    def _distribute_inputs(
-        self,
-        inputs: list[str],
-        healthy: list[tuple[int, TEIClient, MachineInfo]],
-    ) -> list[tuple[TEIClient, list[str], int, int]]:
-        """Distribute inputs across healthy machines based on their weights.
-
-        Args:
-            inputs: List of input texts
-            healthy: List of (index, client, machine_info) tuples
-
-        Returns:
-            List of (client, chunk, start_idx, end_idx) tuples
-        """
-        if not healthy:
-            return []
-
-        n_inputs = len(inputs)
-
-        # Calculate weights (number of healthy GPU instances per machine)
-        total_weight = sum(m.weight for _, _, m in healthy)
-        if total_weight == 0:
-            # Fallback to equal distribution
-            total_weight = len(healthy)
-            weights = [1] * len(healthy)
-        else:
-            weights = [m.weight for _, _, m in healthy]
-
-        # Distribute inputs proportionally to weights
-        distributions = []
-        start_idx = 0
-
-        for i, (_, client, machine) in enumerate(healthy):
-            if i == len(healthy) - 1:
-                # Last machine gets remaining inputs
-                chunk = inputs[start_idx:]
-                end_idx = n_inputs
-            else:
-                # Calculate chunk size based on weight
-                chunk_size = max(1, int(n_inputs * weights[i] / total_weight))
-                end_idx = min(start_idx + chunk_size, n_inputs)
-                chunk = inputs[start_idx:end_idx]
-
-            if chunk:
-                distributions.append((client, chunk, start_idx, end_idx))
-                start_idx = end_idx
-
-            if start_idx >= n_inputs:
-                break
-
-        return distributions
-
     def embed(
         self,
         inputs: Union[str, list[str]],
@@ -235,8 +195,7 @@ class TEIClients:
     ) -> list[list[float]]:
         """Generate embeddings for input texts using multiple machines.
 
-        Distributes inputs across healthy machines proportionally to their
-        number of healthy GPU instances.
+        Distributes inputs across healthy machines using adaptive scheduling (EFT-based).
 
         Args:
             inputs: Single text or list of texts to embed.
@@ -271,40 +230,63 @@ class TEIClients:
             self._rr_index += 1
             return client.embed(inputs, normalize=normalize, truncate=truncate)
 
-        # Distribute inputs across machines
-        distributions = self._distribute_inputs(inputs, healthy)
+        # Use adaptive scheduler for distribution
+        return self._embed_with_scheduler(inputs, healthy, normalize, truncate)
 
-        # Execute requests (synchronously for now, could be parallelized with threads)
-        results: list[tuple[int, list[list[float]]]] = []
-        errors = []
+    def _embed_with_scheduler(
+        self,
+        inputs: list[str],
+        healthy: list[tuple[int, TEIClient, MachineInfo]],
+        normalize: bool,
+        truncate: bool,
+    ) -> list[list[float]]:
+        """Distribute embed requests using adaptive scheduler."""
+        # Update scheduler with healthy clients
+        healthy_clients = [client for _, client, _ in healthy]
+        self.scheduler.update_workers(healthy_clients)
 
-        for client, chunk, start_idx, end_idx in distributions:
-            try:
-                embs = client.embed(chunk, normalize=normalize, truncate=truncate)
-                results.append((start_idx, embs))
-            except Exception as e:
-                errors.append((client.endpoint, e))
-                # Mark machine as unhealthy
+        # Update capacity hints based on healthy instances
+        for _, client, machine in healthy:
+            self.scheduler.set_capacity_hint(client.endpoint, machine.healthy_instances)
+
+        # Define async process function
+        async def process_on_client(
+            client: TEIClient, chunk: list[str]
+        ) -> list[list[float]]:
+            return client.embed(chunk, normalize=normalize, truncate=truncate)
+
+        # Use scheduler distribution with asyncio
+        import asyncio
+
+        embeddings, details = asyncio.run(
+            distribute_with_scheduler(
+                scheduler=self.scheduler,
+                inputs=inputs,
+                process_func=process_on_client,
+                use_chars=True,
+            )
+        )
+
+        # Update machine health on errors
+        for d in details:
+            if not d.success:
                 for m in self.machines:
-                    if m.endpoint == client.endpoint:
+                    if m.endpoint == d.worker_id:
                         m.healthy = False
                         break
 
-        if not results:
+        # Check for complete failure
+        successful = [d for d in details if d.success]
+        if not successful:
+            errors = [(d.worker_id, d.error) for d in details if not d.success]
             raise ValueError(f"All requests failed: {errors}")
-
-        # Sort by start index and combine results
-        results.sort(key=lambda x: x[0])
-        all_embeddings = []
-        for _, embs in results:
-            all_embeddings.extend(embs)
 
         self._log_okay(
             "embed",
-            f"n={len(all_embeddings)}, machines={len(distributions)}",
+            f"n={len(embeddings)}, machines={len(set(d.worker_id for d in successful))}",
         )
 
-        return all_embeddings
+        return embeddings
 
     def lsh(
         self,
@@ -315,8 +297,7 @@ class TEIClients:
     ) -> list[str]:
         """Generate LSH hash hex strings for input texts using multiple machines.
 
-        Distributes inputs across healthy machines proportionally to their
-        number of healthy GPU instances.
+        Distributes inputs across healthy machines using adaptive scheduling (EFT-based).
 
         Args:
             inputs: Single text or list of texts.
@@ -351,40 +332,66 @@ class TEIClients:
             self._rr_index += 1
             return client.lsh(inputs, bitn=bitn, normalize=normalize, truncate=truncate)
 
-        # Distribute inputs across machines
-        distributions = self._distribute_inputs(inputs, healthy)
+        # Use adaptive scheduler for distribution
+        return self._lsh_with_scheduler(inputs, healthy, bitn, normalize, truncate)
 
-        # Execute requests
-        results: list[tuple[int, list[str]]] = []
-        errors = []
+    def _lsh_with_scheduler(
+        self,
+        inputs: list[str],
+        healthy: list[tuple[int, TEIClient, MachineInfo]],
+        bitn: int,
+        normalize: bool,
+        truncate: bool,
+    ) -> list[str]:
+        """Distribute LSH requests using adaptive scheduler."""
+        # Update scheduler with healthy clients
+        healthy_clients = [client for _, client, _ in healthy]
+        self.scheduler.update_workers(healthy_clients)
 
-        for client, chunk, start_idx, end_idx in distributions:
-            try:
-                hashes = client.lsh(
-                    chunk, bitn=bitn, normalize=normalize, truncate=truncate
-                )
-                results.append((start_idx, hashes))
-            except Exception as e:
-                errors.append((client.endpoint, e))
+        # Update capacity hints
+        for _, client, machine in healthy:
+            self.scheduler.set_capacity_hint(client.endpoint, machine.healthy_instances)
+
+        # Define async process function
+        async def process_on_client(client: TEIClient, chunk: list[str]) -> list[str]:
+            return client.lsh(chunk, bitn=bitn, normalize=normalize, truncate=truncate)
+
+        # Use scheduler distribution with asyncio
+        import asyncio
+
+        hashes, details = asyncio.run(
+            distribute_with_scheduler(
+                scheduler=self.scheduler,
+                inputs=inputs,
+                process_func=process_on_client,
+                use_chars=True,
+            )
+        )
+
+        # Update machine health on errors
+        for d in details:
+            if not d.success:
                 for m in self.machines:
-                    if m.endpoint == client.endpoint:
+                    if m.endpoint == d.worker_id:
                         m.healthy = False
                         break
 
-        if not results:
+        # Check for complete failure
+        successful = [d for d in details if d.success]
+        if not successful:
+            errors = [(d.worker_id, d.error) for d in details if not d.success]
             raise ValueError(f"All requests failed: {errors}")
 
-        # Sort and combine
-        results.sort(key=lambda x: x[0])
-        all_hashes = []
-        for _, hashes in results:
-            all_hashes.extend(hashes)
-
         self._log_okay(
-            "lsh", f"n={len(all_hashes)}, bitn={bitn}, machines={len(distributions)}"
+            "lsh",
+            f"n={len(hashes)}, bitn={bitn}, machines={len(set(d.worker_id for d in successful))}",
         )
 
-        return all_hashes
+        return hashes
+
+    def get_scheduler_stats(self) -> dict:
+        """Get scheduler statistics."""
+        return self.scheduler.get_stats_summary()
 
     def info(self) -> list[InfoResponse]:
         """Get info from all machines.

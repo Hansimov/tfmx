@@ -31,6 +31,7 @@ import argparse
 import asyncio
 import subprocess
 import re
+import time
 
 import httpx
 import numpy as np
@@ -39,23 +40,23 @@ import uvicorn
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from fastapi import FastAPI, HTTPException
-from itertools import cycle
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
 from typing import Optional, Union
 from webu import setup_swagger_ui
 
 from .lsh import LSHConverter
+from .tei_scheduler import (
+    AdaptiveScheduler,
+    WorkerStats,
+    DistributionResult,
+    distribute_with_scheduler,
+)
 
 
 PORT = 28800
 BATCH_SIZE = 100
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
-
-
-# ============================================================================
-# Pydantic Models for API
-# ============================================================================
 
 
 class EmbedRequest(BaseModel):
@@ -121,17 +122,13 @@ class InfoResponse(BaseModel):
     port: int = Field(..., description="Machine server port")
     instances: list[InstanceInfo] = Field(..., description="List of TEI instances")
     stats: MachineStats = Field(..., description="Machine statistics")
+    scheduler_stats: dict = Field(..., description="Adaptive scheduler statistics")
 
 
 class ErrorResponse(BaseModel):
     """Response model for errors."""
 
     error: str = Field(..., description="Error message")
-
-
-# ============================================================================
-# Data Classes
-# ============================================================================
 
 
 @dataclass
@@ -190,11 +187,6 @@ class TEIMachineStatsData:
             total_errors=self.total_errors,
             requests_per_instance=self.requests_per_instance,
         )
-
-
-# ============================================================================
-# Instance Discovery
-# ============================================================================
 
 
 class TEIInstanceDiscovery:
@@ -330,45 +322,6 @@ class TEIInstanceDiscovery:
         return instances
 
 
-# ============================================================================
-# Load Balancer
-# ============================================================================
-
-
-class TEILoadBalancer:
-    """Load balancer for distributing requests across TEI instances."""
-
-    def __init__(self, instances: list[TEIInstance]):
-        self.instances = instances
-        self.healthy_instances: list[TEIInstance] = []
-        self._instance_cycle = None
-        self._lock = asyncio.Lock()
-
-    def update_healthy_instances(self) -> None:
-        """Update the list of healthy instances and reset the cycle."""
-        self.healthy_instances = [i for i in self.instances if i.healthy]
-        if self.healthy_instances:
-            self._instance_cycle = cycle(self.healthy_instances)
-        else:
-            self._instance_cycle = None
-
-    async def get_next_instance(self) -> Optional[TEIInstance]:
-        """Get the next healthy instance using round-robin."""
-        async with self._lock:
-            if not self._instance_cycle:
-                return None
-            return next(self._instance_cycle)
-
-    def get_all_healthy(self) -> list[TEIInstance]:
-        """Get all healthy instances for parallel distribution."""
-        return self.healthy_instances.copy()
-
-
-# ============================================================================
-# Machine Server (FastAPI)
-# ============================================================================
-
-
 class LSHConverterCache:
     """Cache for LSHConverter instances to avoid repeated initialization."""
 
@@ -398,14 +351,23 @@ class TEIMachineServer:
         self.port = port
         self.batch_size = batch_size
         self.timeout = timeout
-        self.load_balancer = TEILoadBalancer(instances)
         self.stats = TEIMachineStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
         self._lsh_cache = LSHConverterCache()
 
+        # Adaptive scheduler for EFT-based distribution
+        self.scheduler = AdaptiveScheduler(
+            workers=instances,
+            get_worker_id=lambda inst: inst.container_name,
+        )
+
         # Create FastAPI app
         self.app = self._create_app()
+
+    def get_healthy_instances(self) -> list[TEIInstance]:
+        """Get all healthy instances."""
+        return [i for i in self.instances if i.healthy]
 
     def _create_app(self) -> FastAPI:
         """Create and configure the FastAPI application."""
@@ -427,28 +389,28 @@ class TEIMachineServer:
             response_model=HealthResponse,
             summary="Health check",
             description="Check health status of the machine",
-        )(self.handle_health)
+        )(self.health)
 
         app.get(
             "/info",
             response_model=InfoResponse,
             summary="Machine info",
             description="Get detailed information about the machine and statistics",
-        )(self.handle_info)
+        )(self.info)
 
         app.post(
             "/embed",
             response_model=list[list[float]],
             summary="Generate embeddings",
             description="Generate embeddings for input texts using load-balanced TEI instances",
-        )(self.handle_embed)
+        )(self.embed)
 
         app.post(
             "/lsh",
             response_model=list[str],
             summary="Generate LSH hashes",
             description="Generate LSH hash hex strings for input texts (embed + LSH)",
-        )(self.handle_lsh)
+        )(self.lsh)
 
         return app
 
@@ -461,14 +423,15 @@ class TEIMachineServer:
         # Initial health check
         await self.health_check_all()
 
-        if not self.load_balancer.healthy_instances:
+        healthy_instances = self.get_healthy_instances()
+        if not healthy_instances:
             logger.warn("× No healthy TEI instances available at startup")
 
         # Start background health checker
         self._health_task = asyncio.create_task(self._periodic_health_check())
 
         logger.okay(f"[tei_machine] Started on port {self.port}")
-        healthy_str = logstr.okay(len(self.load_balancer.healthy_instances))
+        healthy_str = logstr.okay(len(healthy_instances))
         total_str = logstr.mesg(len(self.instances))
         logger.mesg(f"[tei_machine] Healthy instances: {healthy_str}/{total_str}")
 
@@ -498,7 +461,6 @@ class TEIMachineServer:
 
         tasks = [self._check_instance_health(inst) for inst in self.instances]
         await asyncio.gather(*tasks, return_exceptions=True)
-        self.load_balancer.update_healthy_instances()
 
     async def _check_instance_health(self, instance: TEIInstance) -> bool:
         """Check health of a single instance."""
@@ -510,7 +472,7 @@ class TEIMachineServer:
             instance.healthy = False
             return False
 
-    async def handle_embed(self, request: EmbedRequest) -> list[list[float]]:
+    async def embed(self, request: EmbedRequest) -> list[list[float]]:
         """Handle embedding requests with load balancing and batching."""
         # Normalize inputs to list
         inputs = request.inputs
@@ -524,7 +486,7 @@ class TEIMachineServer:
         self.stats.total_inputs += len(inputs)
 
         # Get healthy instances
-        healthy = self.load_balancer.get_all_healthy()
+        healthy = self.get_healthy_instances()
         if not healthy:
             self.stats.total_errors += 1
             raise HTTPException(
@@ -532,8 +494,8 @@ class TEIMachineServer:
             )
 
         try:
-            # Distribute inputs across instances
-            embeddings = await self._distribute_and_collect(
+            # Use adaptive scheduler for distribution
+            embeddings = await self._distribute_with_scheduler(
                 inputs, healthy, request.normalize, request.truncate
             )
             return embeddings
@@ -542,63 +504,6 @@ class TEIMachineServer:
             self.stats.total_errors += 1
             logger.warn(f"× Embed error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
-
-    async def _distribute_and_collect(
-        self,
-        inputs: list[str],
-        instances: list[TEIInstance],
-        normalize: bool,
-        truncate: bool,
-    ) -> list[list[float]]:
-        """
-        Distribute inputs across instances and collect results.
-
-        Strategy: Split inputs evenly across all healthy instances for maximum parallelism.
-        """
-        n_instances = len(instances)
-        n_inputs = len(inputs)
-
-        # Calculate chunk size per instance
-        chunk_size = max(1, (n_inputs + n_instances - 1) // n_instances)
-
-        # Create tasks for each chunk
-        tasks = []
-        chunk_indices = []  # Track original indices for ordering
-
-        for i, instance in enumerate(instances):
-            start_idx = i * chunk_size
-            if start_idx >= n_inputs:
-                break
-            end_idx = min(start_idx + chunk_size, n_inputs)
-            chunk = inputs[start_idx:end_idx]
-
-            if chunk:
-                chunk_indices.append((start_idx, end_idx))
-                tasks.append(
-                    self._send_embed_request(instance, chunk, normalize, truncate)
-                )
-
-                # Update stats
-                instance_name = instance.container_name
-                self.stats.requests_per_instance[instance_name] = (
-                    self.stats.requests_per_instance.get(instance_name, 0) + 1
-                )
-
-        # Execute all requests in parallel
-        results = await asyncio.gather(*tasks, return_exceptions=True)
-
-        # Combine results in order
-        all_embeddings = []
-        for i, result in enumerate(results):
-            if isinstance(result, Exception):
-                logger.warn(f"× Instance error: {result}")
-                # Return empty embeddings for failed chunks
-                chunk_len = chunk_indices[i][1] - chunk_indices[i][0]
-                all_embeddings.extend([[]] * chunk_len)
-            else:
-                all_embeddings.extend(result)
-
-        return all_embeddings
 
     async def _send_embed_request(
         self,
@@ -619,9 +524,49 @@ class TEIMachineServer:
             raise ValueError(f"Instance {instance.port} error: {resp.text}")
         return resp.json()
 
-    async def handle_health(self) -> HealthResponse:
+    async def _distribute_with_scheduler(
+        self,
+        inputs: list[str],
+        instances: list[TEIInstance],
+        normalize: bool,
+        truncate: bool,
+    ) -> list[list[float]]:
+        """
+        Distribute inputs using adaptive scheduler with EFT-based load balancing.
+
+        Uses micro-batching and online metrics for optimal distribution.
+        """
+        # Update scheduler with current healthy instances
+        self.scheduler.update_workers(instances)
+
+        # Define the async process function for scheduler
+        async def process_on_instance(
+            instance: TEIInstance, chunk: list[str]
+        ) -> list[list[float]]:
+            result = await self._send_embed_request(
+                instance, chunk, normalize, truncate
+            )
+            # Update stats
+            instance_name = instance.container_name
+            self.stats.requests_per_instance[instance_name] = (
+                self.stats.requests_per_instance.get(instance_name, 0) + 1
+            )
+            return result
+
+        # Use the scheduler's distribution function
+        embeddings, details = await distribute_with_scheduler(
+            scheduler=self.scheduler,
+            inputs=inputs,
+            process_func=process_on_instance,
+            use_chars=True,
+        )
+
+        return embeddings
+
+    async def health(self) -> HealthResponse:
         """Handle health check requests."""
-        healthy_count = len(self.load_balancer.healthy_instances)
+        healthy_instances = self.get_healthy_instances()
+        healthy_count = len(healthy_instances)
         total_count = len(self.instances)
 
         response = HealthResponse(
@@ -638,15 +583,16 @@ class TEIMachineServer:
 
         return response
 
-    async def handle_info(self) -> InfoResponse:
+    async def info(self) -> InfoResponse:
         """Handle info requests."""
         return InfoResponse(
             port=self.port,
             instances=[inst.to_info() for inst in self.instances],
             stats=self.stats.to_model(),
+            scheduler_stats=self.scheduler.get_stats_summary(),
         )
 
-    async def handle_lsh(self, request: LSHRequest) -> list[str]:
+    async def lsh(self, request: LSHRequest) -> list[str]:
         """Handle LSH requests: embed + LSH conversion to hex strings."""
         # Normalize inputs to list
         inputs = request.inputs
@@ -660,7 +606,7 @@ class TEIMachineServer:
         self.stats.total_inputs += len(inputs)
 
         # Get healthy instances
-        healthy = self.load_balancer.get_all_healthy()
+        healthy = self.get_healthy_instances()
         if not healthy:
             self.stats.total_errors += 1
             raise HTTPException(
@@ -669,7 +615,7 @@ class TEIMachineServer:
 
         try:
             # Get embeddings from TEI instances
-            embeddings = await self._distribute_and_collect(
+            embeddings = await self._distribute_with_scheduler(
                 inputs, healthy, request.normalize, request.truncate
             )
 
@@ -708,11 +654,6 @@ class TEIMachineServer:
         )
         server = uvicorn.Server(config)
         await server.serve()
-
-
-# ============================================================================
-# CLI
-# ============================================================================
 
 
 class TEIMachineArgParser:

@@ -111,9 +111,6 @@ class InfoResponse:
         )
 
 
-# Synchronous Client
-
-
 class TEIClient:
     """Synchronous client for TEI services.
 

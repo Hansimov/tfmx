@@ -13,5 +13,12 @@ from .tei_client import TEIClient, TEIClientArgParser
 from .tei_client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
 from .tei_clients import TEIClients, TEIClientsArgParser
 from .tei_clients import MachineInfo, ClientsHealthResponse
+from .tei_scheduler import (
+    EWMA,
+    WorkerStats,
+    AdaptiveScheduler,
+    DistributionResult,
+    distribute_with_scheduler,
+)
 from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
 from .gpu_fan import control_gpu_fan
