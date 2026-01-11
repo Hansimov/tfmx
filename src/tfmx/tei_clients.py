@@ -9,14 +9,12 @@ CLI_EPILOG = """
 Examples:
   export TEI_EPS="http://localhost:28800,http://ai122:28800"
   
-  tei_clients health -E $TEI_EPS
-  tei_clients info -E $TEI_EPS
-  tei_clients embed -E $TEI_EPS "Hello" "World"
-  tei_clients lsh -E $TEI_EPS "Hello"
-  tei_clients lsh -E $TEI_EPS -b 2048 "Hello, world"
-  
-  # -E/--endpoints can be placed either before or after subcommand
+  # Note: -E/--endpoints must be placed BEFORE the subcommand
+  tei_clients -E $TEI_EPS health
   tei_clients -E $TEI_EPS info
+  tei_clients -E $TEI_EPS embed "Hello" "World"
+  tei_clients -E $TEI_EPS lsh "Hello"
+  tei_clients -E $TEI_EPS lsh -b 2048 "Hello, world"
 """
 
 import argparse
@@ -28,11 +26,6 @@ from tclogger import logger
 from typing import Union
 
 from .tei_client import TEIClient, InfoResponse, TIMEOUT
-
-
-# ============================================================================
-# Data Classes
-# ============================================================================
 
 
 @dataclass
@@ -72,11 +65,6 @@ class ClientsHealthResponse:
             healthy_instances=healthy_instances,
             total_instances=total_instances,
         )
-
-
-# ============================================================================
-# Multi-Machine Client
-# ============================================================================
 
 
 class TEIClients:
@@ -413,32 +401,11 @@ class TEIClients:
         return responses
 
 
-# ============================================================================
-# CLI
-# ============================================================================
-
-
 class TEIClientsArgParser:
     """Argument parser for TEI Clients CLI."""
 
     def __init__(self):
-        # Create parent parser for common arguments
-        parent_parser = argparse.ArgumentParser(add_help=False)
-        parent_parser.add_argument(
-            "-E",
-            "--endpoints",
-            type=str,
-            required=True,
-            help="Comma-separated list of tei_machine endpoints (required)",
-        )
-        parent_parser.add_argument(
-            "-v",
-            "--verbose",
-            action="store_true",
-            help="Enable verbose output",
-        )
-
-        # Create main parser
+        # Create main parser with common arguments at root level
         self.parser = argparse.ArgumentParser(
             description="TEI Clients - Connect to multiple TEI machines",
             formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -446,47 +413,53 @@ class TEIClientsArgParser:
         )
 
         # Add common arguments to main parser
-        self.parser.add_argument(
+        self._add_common_arguments(self.parser)
+
+        # Setup subcommands (they won't have these common arguments repeated)
+        self._setup_subcommands()
+        self.args = self.parser.parse_args()
+
+    def _add_common_arguments(self, parser):
+        """Add common arguments to a parser.
+
+        This method centralizes the definition of arguments that can appear
+        either before or after the subcommand.
+        """
+        parser.add_argument(
             "-E",
             "--endpoints",
             type=str,
-            required=False,  # Optional at root level
+            required=False,
             help="Comma-separated list of tei_machine endpoints",
         )
-        self.parser.add_argument(
+        parser.add_argument(
             "-v",
             "--verbose",
             action="store_true",
             help="Enable verbose output",
         )
 
-        self._setup_subcommands(parent_parser)
-        self.args = self.parser.parse_args()
-
-    def _setup_subcommands(self, parent_parser):
-        """Setup subcommands with parent parser."""
-        # Action subcommands (all inherit from parent_parser)
+    def _setup_subcommands(self):
+        """Setup subcommands."""
+        # Action subcommands
         subparsers = self.parser.add_subparsers(dest="action", help="Action to perform")
 
         # health
         subparsers.add_parser(
             "health",
             help="Check health of all machines",
-            parents=[parent_parser],
         )
 
         # info
         subparsers.add_parser(
             "info",
             help="Get info from all machines",
-            parents=[parent_parser],
         )
 
         # embed
         embed_parser = subparsers.add_parser(
             "embed",
             help="Generate embeddings",
-            parents=[parent_parser],
         )
         embed_parser.add_argument(
             "texts",
@@ -498,7 +471,6 @@ class TEIClientsArgParser:
         lsh_parser = subparsers.add_parser(
             "lsh",
             help="Generate LSH hashes",
-            parents=[parent_parser],
         )
         lsh_parser.add_argument(
             "texts",
