@@ -326,13 +326,13 @@ class TEIClients:
         if not healthy:
             raise ValueError("No healthy machines available")
 
-        # For small inputs or single machine, use simple path
-        if len(inputs) <= 10 or len(healthy) == 1:
+        # For very small inputs, use simple path
+        if len(inputs) <= 10:
             _, client, _ = healthy[self._rr_index % len(healthy)]
             self._rr_index += 1
             return client.lsh(inputs, bitn=bitn, normalize=normalize, truncate=truncate)
 
-        # Use adaptive scheduler for distribution
+        # Use adaptive scheduler for distribution (handles micro-batching)
         return self._lsh_with_scheduler(inputs, healthy, bitn, normalize, truncate)
 
     def _lsh_with_scheduler(

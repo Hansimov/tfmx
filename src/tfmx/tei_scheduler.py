@@ -25,7 +25,7 @@ EWMA_ALPHA = 0.3
 
 # Micro-batch sizing
 MICRO_BATCH_MIN = 4
-MICRO_BATCH_MAX = 64
+MICRO_BATCH_MAX = 100  # Match TEI container's --max-client-batch-size limit
 TARGET_BATCH_TIME = 0.5  # seconds
 
 # Circuit breaker
@@ -219,8 +219,10 @@ class WorkerStats:
         rtt = self.rtt_ewma.get()
 
         # Queuing delay: approximate as inflight * average_service_time
+        # Adjust by capacity_hint: workers with more capacity can handle more inflight
+        effective_inflight = self.inflight / max(1, self.capacity_hint)
         avg_service = self.per_item_ewma.get() * max(n_items, 1)
-        queuing_delay = self.inflight * avg_service
+        queuing_delay = effective_inflight * avg_service
 
         # Error penalty: add extra time for unreliable workers
         error_penalty = self.error_ewma.get() * 2.0  # 2 seconds per unit error rate
@@ -567,8 +569,8 @@ async def distribute_with_scheduler(
         n_items = len(chunk)
         n_chars = sum(len(s) for s in chunk)
 
-        # Mark request start
-        stats.begin_request(n_items, n_chars)
+        # Note: inflight is already incremented during task allocation
+        # We only need to mark the start time here
         start_time = time.time()
 
         try:
@@ -577,6 +579,7 @@ async def distribute_with_scheduler(
 
             # Record success
             stats.record_success(latency, n_items, n_chars)
+            # Decrement inflight counter
             stats.end_request(n_chars)
 
             return DistributionResult(
@@ -592,6 +595,7 @@ async def distribute_with_scheduler(
 
             # Record error
             stats.record_error()
+            # Decrement inflight counter
             stats.end_request(n_chars)
 
             return DistributionResult(
@@ -631,6 +635,12 @@ async def distribute_with_scheduler(
 
         worker, stats = selection
         used_workers.add(stats.worker_id)
+
+        # IMPORTANT: Pre-increment inflight counter for correct load estimation
+        # This must happen BEFORE creating tasks to ensure subsequent worker
+        # selections see the correct load distribution
+        stats.inflight += 1
+        stats.inflight_chars += n_chars
 
         task = process_batch(worker, stats, chunk, start_idx, end_idx)
         tasks.append(task)
