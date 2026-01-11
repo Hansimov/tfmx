@@ -31,7 +31,7 @@ import httpx
 import json
 
 from dataclasses import dataclass
-from tclogger import logger
+from tclogger import logger, logstr, rows_to_table_str, dict_to_lines
 from typing import Optional, Union
 
 PORT = 28800  # default port for tei_machine
@@ -225,6 +225,10 @@ class TEIClient:
         except Exception:
             return False
 
+    def log_machine_health(self) -> None:
+        health = self.health()
+        logger.mesg(f"* Healthy: {logstr.okay(health.healthy)}/{health.total}")
+
     def info(self) -> InfoResponse:
         """Get detailed information about tei_machine.
 
@@ -249,6 +253,48 @@ class TEIClient:
         except Exception as e:
             self._log_fail("info", e)
             raise
+
+    def log_machine_info(self) -> None:
+        """Log info for a single machine."""
+        info = self.info()
+        machine_dict = {
+            "port": info.port,
+            "instances": len(info.instances),
+        }
+        machine_str = dict_to_lines(machine_dict, key_prefix="* ")
+        logger.note(f"Machine Info:")
+        print(machine_str)
+
+        rows: list[list] = []
+        for inst in info.instances:
+            row = [
+                str(inst.gpu_id) if inst.gpu_id is not None else "?",
+                inst.name,
+                inst.endpoint,
+                logstr.okay("healthy") if inst.healthy else logstr.fail("sick"),
+            ]
+            rows.append(row)
+        table_str = rows_to_table_str(
+            rows=rows, headers=["gpu", "name", "endpoint", "status"]
+        )
+        print(table_str)
+
+        logger.note(f"Stats:")
+        stats_dict = {
+            "total_requests": info.stats.total_requests,
+            "total_inputs": info.stats.total_inputs,
+            "total_errors": info.stats.total_errors,
+        }
+        stats_tr = dict_to_lines(stats_dict, key_prefix="* ")
+        print(stats_tr)
+
+        if info.stats.requests_per_instance:
+            logger.note(f"Requests per instance:")
+            reqs_dict = {}
+            for name, count in info.stats.requests_per_instance.items():
+                reqs_dict[name] = count
+            reqs_tr = dict_to_lines(reqs_dict, key_prefix="* ")
+            print(reqs_tr)
 
     def embed(
         self,
@@ -437,44 +483,11 @@ class TEIClientCLI:
 
     def run_health(self) -> None:
         """Run health check and display results."""
-        health = self.client.health()
-        status_color = "okay" if health.status == "healthy" else "warn"
-        getattr(logger, status_color)(f"Status: {health.status}")
-        logger.mesg(f"Healthy: {health.healthy}/{health.total}")
+        self.client.log_machine_health()
 
     def run_info(self) -> None:
         """Get and display server info."""
-        info = self.client.info()
-        self._display_single_info(info)
-
-    def _display_single_info(self, info: InfoResponse) -> None:
-        """Display info for a single machine."""
-        logger.mesg(f"Port: {info.port}")
-        logger.mesg(f"Instances ({len(info.instances)}):")
-
-        dash_len = 75
-        logger.note("=" * dash_len)
-        logger.note(f"{'GPU':<6} {'NAME':<40} {'ENDPOINT':<25} {'STATUS':<8}")
-        logger.note("-" * dash_len)
-
-        for inst in info.instances:
-            gpu_str = str(inst.gpu_id) if inst.gpu_id is not None else "?"
-            status_str = "healthy" if inst.healthy else "unhealthy"
-            logger.mesg(
-                f"{gpu_str:<6} {inst.name:<35} {inst.endpoint:<25} {status_str:<8}"
-            )
-
-        logger.note("=" * dash_len)
-
-        logger.mesg(f"\nStats:")
-        logger.mesg(f"  Total requests : {info.stats.total_requests}")
-        logger.mesg(f"  Total inputs   : {info.stats.total_inputs}")
-        logger.mesg(f"  Total errors   : {info.stats.total_errors}")
-
-        if info.stats.requests_per_instance:
-            logger.mesg(f"  Requests per instance:")
-            for name, count in info.stats.requests_per_instance.items():
-                logger.mesg(f"    {name}: {count}")
+        self.client.log_machine_info()
 
     def run_embed(self, texts: list[str]) -> None:
         """Generate and display embeddings.

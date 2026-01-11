@@ -527,52 +527,26 @@ class TEIClientsCLI:
 
     def run_health(self) -> None:
         """Run health check and display results."""
-        health = self.clients.health()
-        status_color = "okay" if health.status == "healthy" else "warn"
-        getattr(logger, status_color)(f"Status: {health.status}")
-        logger.mesg(f"Machines: {health.healthy_machines}/{health.total_machines}")
-        logger.mesg(f"Instances: {health.healthy_instances}/{health.total_instances}")
-
-    def run_info(self) -> None:
-        """Get and display info from all machines."""
-        infos = self.clients.info()
-        if not infos:
+        clients = self.clients.clients
+        if not clients:
             logger.warn("× No machine info available")
             return
 
-        for i, info in enumerate(infos):
+        for i, client in enumerate(clients):
+            logger.note(f"[Machine {i+1}] {self.clients.endpoints[i]}")
+            client.log_machine_health()
+
+    def run_info(self) -> None:
+        """Get and display info from all machines."""
+        clients = self.clients.clients
+        if not clients:
+            logger.warn("× No machine info available")
+            return
+
+        for i, client in enumerate(clients):
             logger.okay(f"[Machine {i+1}] {self.clients.endpoints[i]}")
-            self._display_single_info(info)
+            client.log_machine_info()
             print()
-
-    def _display_single_info(self, info: InfoResponse) -> None:
-        """Display info for a single machine."""
-        logger.mesg(f"Port: {info.port}")
-        logger.mesg(f"Instances ({len(info.instances)}):")
-
-        dash_len = 85
-        logger.note("=" * dash_len)
-        logger.note(f"{'GPU':<6} {'NAME':<40} {'ENDPOINT':<25} {'STATUS':<8}")
-        logger.note("-" * dash_len)
-
-        for inst in info.instances:
-            gpu_str = str(inst.gpu_id) if inst.gpu_id is not None else "?"
-            status_str = "healthy" if inst.healthy else "unhealthy"
-            logger.mesg(
-                f"{gpu_str:<6} {inst.name:<40} {inst.endpoint:<25} {status_str:<8}"
-            )
-
-        logger.note("=" * dash_len)
-
-        logger.mesg(f"\nStats:")
-        logger.mesg(f"  Total requests : {info.stats.total_requests}")
-        logger.mesg(f"  Total inputs   : {info.stats.total_inputs}")
-        logger.mesg(f"  Total errors   : {info.stats.total_errors}")
-
-        if info.stats.requests_per_instance:
-            logger.mesg(f"  Requests per instance:")
-            for name, count in info.stats.requests_per_instance.items():
-                logger.mesg(f"    {name}: {count}")
 
     def run_embed(self, texts: list[str]) -> None:
         """Generate and display embeddings.
@@ -629,7 +603,6 @@ def main():
 
     try:
         cli = TEIClientsCLI(clients)
-
         if args.action == "health":
             cli.run_health()
         elif args.action == "info":
@@ -638,7 +611,6 @@ def main():
             cli.run_embed(args.texts)
         elif args.action == "lsh":
             cli.run_lsh(args.texts, args.bitn)
-
     except httpx.ConnectError as e:
         logger.warn(f"× Connection failed: {e}")
         logger.hint(f"  Check if all TEI machines are running")
