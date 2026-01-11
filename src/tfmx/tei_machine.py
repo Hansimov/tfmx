@@ -8,7 +8,7 @@ requests across multiple TEI Docker instances running on different GPUs.
 CLI_EPILOG = """
 Examples:
   # Start machine server (auto-discover TEI containers)
-  tei_machine run                   # Start on default port 28800
+  tei_machine run                   # Start on default port 28800 with GPU LSH
   tei_machine run -p 28800          # Start on specific port
   
   # Filter containers by name pattern
@@ -19,6 +19,10 @@ Examples:
   
   # With custom batch size per instance
   tei_machine run -b 50             # Max 50 inputs per request to each instance
+  
+  # LSH computation options
+  tei_machine run                   # Default: GPU acceleration enabled
+  tei_machine run --no-gpu-lsh      # Force CPU computation for LSH
   
   # Check discovered instances without starting server
   tei_machine discover              # List all discovered TEI instances
@@ -323,17 +327,29 @@ class TEIInstanceDiscovery:
 
 
 class LSHConverterCache:
-    """Cache for LSHConverter instances to avoid repeated initialization."""
+    """Cache for LSHConverter instances to avoid repeated initialization.
 
-    def __init__(self):
+    Automatically uses GPU acceleration if available.
+    """
+
+    def __init__(self, use_gpu: bool = True):
         self._cache: dict[tuple[int, int], "LSHConverter"] = {}
         self._lock = asyncio.Lock()
+        self.use_gpu = use_gpu
 
     def get(self, dims: int, bitn: int) -> "LSHConverter":
-        """Get or create LSHConverter for given dimensions and bit count."""
+        """Get or create LSHConverter for given dimensions and bit count.
+
+        Uses GPU acceleration by default if available.
+        """
         key = (dims, bitn)
         if key not in self._cache:
-            self._cache[key] = LSHConverter(dims=dims, bitn=bitn, verbose=False)
+            self._cache[key] = LSHConverter(
+                dims=dims,
+                bitn=bitn,
+                verbose=False,
+                use_gpu=self.use_gpu,
+            )
         return self._cache[key]
 
 
@@ -346,6 +362,7 @@ class TEIMachineServer:
         port: int = PORT,
         batch_size: int = BATCH_SIZE,
         timeout: float = 60.0,
+        use_gpu_lsh: bool = True,
     ):
         self.instances = instances
         self.port = port
@@ -354,7 +371,7 @@ class TEIMachineServer:
         self.stats = TEIMachineStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
-        self._lsh_cache = LSHConverterCache()
+        self._lsh_cache = LSHConverterCache(use_gpu=use_gpu_lsh)
 
         # Adaptive scheduler for EFT-based distribution
         self.scheduler = AdaptiveScheduler(
@@ -706,6 +723,11 @@ class TEIMachineArgParser:
             help="Request timeout in seconds (default: 60)",
         )
         self.parser.add_argument(
+            "--no-gpu-lsh",
+            action="store_true",
+            help="Disable GPU acceleration for LSH computation (use CPU instead)",
+        )
+        self.parser.add_argument(
             "action",
             nargs="?",
             choices=["run", "discover", "health"],
@@ -813,6 +835,7 @@ def main():
             port=args.port,
             batch_size=args.batch_size,
             timeout=args.timeout,
+            use_gpu_lsh=not args.no_gpu_lsh,
         )
         server.run()
 
