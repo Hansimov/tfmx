@@ -2,8 +2,22 @@ import numpy as np
 
 from pathlib import Path
 from tclogger import logger
+from typing import Optional, TYPE_CHECKING
 
 WEIGHTS_DIR = Path(__file__).parent / "weights"
+
+# Try to import torch for GPU acceleration
+try:
+    import torch
+
+    TORCH_AVAILABLE = True
+except ImportError:
+    TORCH_AVAILABLE = False
+    torch = None
+
+if TYPE_CHECKING:
+    if TORCH_AVAILABLE:
+        import torch
 
 
 class LSHConverter:
@@ -11,6 +25,7 @@ class LSHConverter:
     - dims: input embedding floats dimension (1024)
     - bitn: output hash bits num (2048)
     - seed: random seed for reproducibility (42)
+    - use_gpu: whether to use GPU acceleration (default: auto-detect)
     """
 
     def __init__(
@@ -19,11 +34,30 @@ class LSHConverter:
         bitn: int = 2048,
         seed: int = 1,
         verbose: bool = False,
+        use_gpu: Optional[bool] = None,
     ):
         self.dims = dims
         self.bitn = bitn
         self.seed = seed
         self.verbose = verbose
+
+        # GPU setup
+        if use_gpu is None:
+            # Auto-detect: use GPU if available
+            self.use_gpu = TORCH_AVAILABLE and torch.cuda.is_available()
+        else:
+            self.use_gpu = use_gpu and TORCH_AVAILABLE and torch.cuda.is_available()
+
+        if self.use_gpu:
+            self.device = torch.device("cuda")
+            if self.verbose:
+                logger.okay(f"  Using GPU acceleration (CUDA)")
+        else:
+            self.device = None
+            if self.verbose and TORCH_AVAILABLE and not torch.cuda.is_available():
+                logger.warn(f"  GPU requested but not available, falling back to CPU")
+
+        self.hps_gpu = None  # Will be set to torch.Tensor if GPU is used
         self.init_hyperplanes()
 
     def init_hyperplanes(self):
@@ -38,6 +72,10 @@ class LSHConverter:
         else:
             self.generate_hyperplanes()
             self.save_hyperplanes()
+
+        # Transfer to GPU if enabled
+        if self.use_gpu:
+            self.hps_gpu = torch.from_numpy(self.hps).to(self.device)
 
     def generate_hyperplanes(self):
         np.random.seed(self.seed)
@@ -94,6 +132,8 @@ class LSHConverter:
     def embs_to_hex_batch(self, embs: np.ndarray) -> list[str]:
         """Convert embeddings to hex strings in batch (vectorized).
 
+        Uses GPU acceleration if available for faster computation.
+
         Input:
         - embs: with shape (n, dims), n samples of embeddings
 
@@ -106,10 +146,23 @@ class LSHConverter:
 
         n_samples = embs.shape[0]
 
-        # Vectorized projection: (n, dims) @ (dims, bitn) -> (n, bitn)
-        projs = np.dot(embs, self.hps.T)
-        # >0 maps to 1, <=0 maps to 0: (n, bitn)
-        bits_matrix = (projs > 0).astype(np.uint8)
+        if self.use_gpu and self.hps_gpu is not None:
+            # GPU path using PyTorch
+            with torch.no_grad():
+                # Convert to torch tensor and move to GPU
+                embs_gpu = torch.from_numpy(embs).to(self.device)
+
+                # Vectorized projection: (n, dims) @ (dims, bitn) -> (n, bitn)
+                projs = torch.matmul(embs_gpu, self.hps_gpu.T)
+
+                # >0 maps to 1, <=0 maps to 0: (n, bitn)
+                bits_matrix = (projs > 0).to(torch.uint8).cpu().numpy()
+        else:
+            # CPU path using NumPy
+            # Vectorized projection: (n, dims) @ (dims, bitn) -> (n, bitn)
+            projs = np.dot(embs, self.hps.T)
+            # >0 maps to 1, <=0 maps to 0: (n, bitn)
+            bits_matrix = (projs > 0).astype(np.uint8)
 
         # Pad bitn to multiple of 8 for packbits
         n_bytes = (self.bitn + 7) // 8
