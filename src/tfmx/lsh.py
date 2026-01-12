@@ -26,6 +26,7 @@ class LSHConverter:
     - bitn: output hash bits num (2048)
     - seed: random seed for reproducibility (42)
     - use_gpu: whether to use GPU acceleration (default: auto-detect)
+    - gpu_threshold: minimum batch size to use GPU (default: 1000)
     """
 
     def __init__(
@@ -35,11 +36,13 @@ class LSHConverter:
         seed: int = 1,
         verbose: bool = False,
         use_gpu: Optional[bool] = None,
+        gpu_threshold: int = 500,
     ):
         self.dims = dims
         self.bitn = bitn
         self.seed = seed
         self.verbose = verbose
+        self.gpu_threshold = gpu_threshold
 
         # GPU setup
         if use_gpu is None:
@@ -51,7 +54,9 @@ class LSHConverter:
         if self.use_gpu:
             self.device = torch.device("cuda")
             if self.verbose:
-                logger.okay(f"  Using GPU acceleration (CUDA)")
+                logger.okay(
+                    f"  Using GPU acceleration (CUDA) for batches >= {self.gpu_threshold}"
+                )
         else:
             self.device = None
             if self.verbose and TORCH_AVAILABLE and not torch.cuda.is_available():
@@ -132,7 +137,8 @@ class LSHConverter:
     def embs_to_hex_batch(self, embs: np.ndarray) -> list[str]:
         """Convert embeddings to hex strings in batch (vectorized).
 
-        Uses GPU acceleration if available for faster computation.
+        Uses GPU acceleration if available AND batch size is large enough.
+        Small batches use CPU to avoid GPU transfer overhead.
 
         Input:
         - embs: with shape (n, dims), n samples of embeddings
@@ -146,8 +152,15 @@ class LSHConverter:
 
         n_samples = embs.shape[0]
 
-        if self.use_gpu and self.hps_gpu is not None:
-            # GPU path using PyTorch
+        # Use GPU only if batch is large enough to amortize transfer cost
+        use_gpu_for_batch = (
+            self.use_gpu
+            and self.hps_gpu is not None
+            and n_samples >= self.gpu_threshold
+        )
+
+        if use_gpu_for_batch:
+            # GPU path using PyTorch (for large batches)
             with torch.no_grad():
                 # Convert to torch tensor and move to GPU
                 embs_gpu = torch.from_numpy(embs).to(self.device)
@@ -158,7 +171,7 @@ class LSHConverter:
                 # >0 maps to 1, <=0 maps to 0: (n, bitn)
                 bits_matrix = (projs > 0).to(torch.uint8).cpu().numpy()
         else:
-            # CPU path using NumPy
+            # CPU path using NumPy (for small batches or when GPU disabled)
             # Vectorized projection: (n, dims) @ (dims, bitn) -> (n, bitn)
             projs = np.dot(embs, self.hps.T)
             # >0 maps to 1, <=0 maps to 0: (n, bitn)
