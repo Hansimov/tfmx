@@ -13,6 +13,7 @@ from .tei_client import TEIClient, TEIClientArgParser
 from .tei_client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
 from .tei_clients import TEIClients, TEIClientsArgParser
 from .tei_clients import MachineState, MachineScheduler, ClientsHealthResponse
+from .tei_clients import ExplorationConfig
 from .tei_scheduler import (
     WorkerState,
     IdleFillingScheduler,

@@ -598,8 +598,8 @@ class BenchmarkMetrics:
         # Configuration
         logger.mesg(f"\n[Configuration]")
         logger.mesg(f"  Samples:    {self.n_samples:,}")
-        logger.mesg(f"  Batches:    {self.n_batches:,}")
-        logger.mesg(f"  Batch size: {self.batch_size:,}")
+        # logger.mesg(f"  Batches:    {self.n_batches:,}")
+        # logger.mesg(f"  Batch size: {self.batch_size:,}")
         logger.mesg(f"  LSH bits:   {self.bitn}")
         logger.mesg(f"  Endpoints:  {len(self.endpoints)}")
         for ep in self.endpoints:
@@ -644,6 +644,7 @@ class TEIBenchmark:
         bitn: int = 2048,
         timeout: float = 120.0,
         verbose: bool = False,
+        skip_exploration: bool = False,
     ):
         """Initialize the benchmark runner.
 
@@ -653,18 +654,21 @@ class TEIBenchmark:
             bitn: Number of LSH bits
             timeout: Request timeout in seconds
             verbose: Enable verbose logging
+            skip_exploration: If True, use saved optimal batch sizes instead of re-exploring
         """
         self.endpoints = endpoints
         self.batch_size = batch_size
         self.bitn = bitn
         self.timeout = timeout
         self.verbose = verbose
+        self.skip_exploration = skip_exploration
 
         # Initialize client
         self.clients = TEIClients(
             endpoints=endpoints,
             timeout=timeout,
             verbose=verbose,
+            skip_exploration=skip_exploration,
         )
 
     def close(self) -> None:
@@ -873,6 +877,12 @@ class TEIBenchmarkArgParser:
             type=str,
             default=None,
             help="Output file for results (JSON format)",
+        )
+        self.parser.add_argument(
+            "--explore",
+            action="store_true",
+            default=False,
+            help="Force re-exploration of optimal batch sizes (ignore saved config)",
         )
 
         # Action subcommands
@@ -1089,12 +1099,17 @@ def main():
         )
 
         # Run benchmark
+        # Default: use saved config (skip_exploration=True)
+        # With --explore: force re-exploration (skip_exploration=False)
+        skip_exploration = not args.explore
+
         with TEIBenchmark(
             endpoints=endpoints,
             batch_size=args.batch_size,
             bitn=args.bitn,
             timeout=args.timeout,
             verbose=args.verbose,
+            skip_exploration=skip_exploration,
         ) as benchmark:
             # Check health first
             if not benchmark.check_health():

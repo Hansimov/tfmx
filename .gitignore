@@ -8,3 +8,4 @@ __pycache__
 *.log
 *.npy
 sync_codes.sh
+*.config.json
