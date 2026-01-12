@@ -85,11 +85,12 @@ def distribute_to_workers(
 
 @dataclass
 class WorkerState:
-    """Simple state tracking for a worker.
+    """State tracking for a worker with adaptive performance metrics.
 
     Tracks:
     - busy/idle status
     - basic statistics (requests, items, errors)
+    - throughput estimation for adaptive scheduling
     """
 
     worker_id: str
@@ -103,10 +104,22 @@ class WorkerState:
     total_errors: int = 0
     total_latency: float = 0.0
 
+    # Adaptive scheduling: throughput tracking (items per second)
+    # Using EMA (Exponential Moving Average) for smooth estimation
+    _throughput_ema: float = 0.0  # items/second
+    _ema_alpha: float = 0.3  # EMA smoothing factor (higher = more responsive)
+    _last_batch_size: int = 0
+    _last_latency: float = 0.0
+
     @property
     def is_idle(self) -> bool:
         """Check if worker is idle."""
         return not self.busy
+
+    @property
+    def throughput(self) -> float:
+        """Get estimated throughput in items/second."""
+        return self._throughput_ema
 
     def mark_busy(self) -> None:
         """Mark worker as busy."""
@@ -117,10 +130,26 @@ class WorkerState:
         self.busy = False
 
     def record_success(self, latency: float, n_items: int) -> None:
-        """Record a successful request."""
+        """Record a successful request and update throughput estimate."""
         self.total_requests += 1
         self.total_items += n_items
         self.total_latency += latency
+        self._last_batch_size = n_items
+        self._last_latency = latency
+
+        # Update throughput EMA
+        if latency > 0:
+            current_throughput = n_items / latency  # items/second
+            if self._throughput_ema == 0:
+                # First measurement
+                self._throughput_ema = current_throughput
+            else:
+                # EMA update
+                self._throughput_ema = (
+                    self._ema_alpha * current_throughput
+                    + (1 - self._ema_alpha) * self._throughput_ema
+                )
+
         self.mark_idle()
 
     def record_error(self) -> None:
@@ -141,6 +170,7 @@ class WorkerState:
             "total_items": self.total_items,
             "total_errors": self.total_errors,
             "avg_latency_ms": avg_latency * 1000,
+            "throughput": self._throughput_ema,
         }
 
 
@@ -776,6 +806,326 @@ async def distribute_with_pipeline(
         )
 
     # Combine results in order
+    combined = []
+    for r in all_results:
+        if r.success and r.result is not None:
+            if isinstance(r.result, list):
+                combined.extend(r.result)
+            else:
+                combined.append(r.result)
+
+    return combined, all_results
+
+
+async def distribute_with_adaptive_pipeline(
+    scheduler: IdleFillingScheduler[W],
+    inputs: list[str],
+    process_func: Callable[[W, list[str]], Any],
+    enable_perf_tracking: bool = False,
+    perf_tracker: Optional[PerfTracker] = None,
+    min_batch_size: int = 50,
+    max_batch_size: int = 500,
+    probe_batch_size: int = 100,
+) -> tuple[list[Any], list[DistributionResult]]:
+    """Distribute inputs using adaptive pipeline scheduling.
+
+    This scheduler dynamically adjusts batch sizes based on worker performance:
+    1. Uses small probe batches to quickly measure worker throughput
+    2. Allocates remaining work proportionally to throughput
+    3. Fast workers get larger batches, slow workers get smaller batches
+
+    Key Strategy:
+    - Phase 1 (Probe): Give each worker a small batch to measure throughput
+    - Phase 2 (Adaptive): Distribute remaining work based on throughput ratios
+    - Uses historical throughput data across requests for better initial estimates
+
+    Args:
+        scheduler: The idle-filling scheduler instance
+        inputs: List of input texts to process
+        process_func: Async function that processes inputs on a worker
+        enable_perf_tracking: Enable detailed performance tracking
+        perf_tracker: Custom PerfTracker instance
+        min_batch_size: Minimum batch size (default: 50)
+        max_batch_size: Maximum batch size (default: 500)
+        probe_batch_size: Batch size for initial probing (default: 100)
+
+    Returns:
+        Tuple of (combined_results, distribution_details)
+    """
+    if not inputs:
+        return [], []
+
+    n_workers = len(scheduler.workers)
+    if n_workers == 0:
+        return [], []
+
+    # Setup performance tracking
+    tracker = None
+    if enable_perf_tracking:
+        tracker = perf_tracker or get_global_tracker()
+        tracker.start_session(n_inputs=len(inputs), n_workers=n_workers)
+
+    # Results storage
+    results_map: dict[int, DistributionResult] = {}
+    pending_tasks: set[asyncio.Task] = set()
+    session_start = time.time()
+
+    # Check if we have historical throughput data
+    has_history = all(
+        scheduler.states.get(scheduler.get_worker_id(w), WorkerState("")).throughput > 0
+        for w in scheduler.workers
+    )
+
+    # Input queue tracking
+    remaining_start = 0
+    batch_counter = 0
+
+    def get_throughput_ratios() -> dict[str, float]:
+        """Get throughput ratio for each worker (sums to 1.0)."""
+        throughputs = {}
+        for w in scheduler.workers:
+            wid = scheduler.get_worker_id(w)
+            state = scheduler.states.get(wid)
+            if state and state.throughput > 0:
+                throughputs[wid] = state.throughput
+            else:
+                throughputs[wid] = 0
+
+        total = sum(throughputs.values())
+        if total > 0:
+            return {wid: t / total for wid, t in throughputs.items()}
+        else:
+            # Equal distribution if no data
+            return {wid: 1.0 / n_workers for wid in throughputs}
+
+    def calculate_batch_size(state: WorkerState, remaining: int, n_pending: int) -> int:
+        """Calculate optimal batch size for a worker."""
+        ratios = get_throughput_ratios()
+        worker_ratio = ratios.get(state.worker_id, 1.0 / n_workers)
+
+        # How many workers are still working (including this one)?
+        active_workers = n_pending + 1
+
+        # This worker's share of remaining work
+        # Adjust for how many workers are active
+        if active_workers >= n_workers:
+            # All workers active: use full ratio
+            target = int(remaining * worker_ratio)
+        else:
+            # Some workers done: this worker takes proportionally more
+            target = int(
+                remaining * worker_ratio / (active_workers * worker_ratio + 0.001)
+            )
+
+        # Clamp to bounds
+        batch_size = max(min_batch_size, min(target, max_batch_size, remaining))
+        return batch_size
+
+    async def process_batch(
+        worker: W,
+        state: WorkerState,
+        chunk: list[str],
+        start_idx: int,
+        end_idx: int,
+        batch_id: int,
+    ) -> DistributionResult:
+        """Process a batch on a worker."""
+        task_start = time.time()
+
+        try:
+            result = await process_func(worker, chunk)
+            latency = time.time() - task_start
+
+            # Record success (updates throughput EMA)
+            state.record_success(latency, len(chunk))
+            scheduler._signal_worker_idle()
+
+            if tracker:
+                tracker.record_task(
+                    worker_id=state.worker_id,
+                    round_id=batch_id,
+                    batch_size=len(chunk),
+                    start_time=task_start,
+                    end_time=time.time(),
+                    queue_wait_time=0,
+                    success=True,
+                )
+
+            return DistributionResult(
+                worker_id=state.worker_id,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                result=result,
+                latency=latency,
+            )
+
+        except Exception as e:
+            latency = time.time() - task_start
+            state.record_error()
+            scheduler._signal_worker_idle()
+
+            if tracker:
+                tracker.record_task(
+                    worker_id=state.worker_id,
+                    round_id=batch_id,
+                    batch_size=len(chunk),
+                    start_time=task_start,
+                    end_time=time.time(),
+                    queue_wait_time=0,
+                    success=False,
+                    error=str(e),
+                )
+
+            return DistributionResult(
+                worker_id=state.worker_id,
+                start_idx=start_idx,
+                end_idx=end_idx,
+                error=e,
+                latency=latency,
+            )
+
+    # ===== Phase 1: Probe or use history =====
+    if not has_history:
+        # No historical data: send probe batches to all workers
+        idle_workers = scheduler.get_idle_workers()
+        probe_size = min(probe_batch_size, len(inputs) // max(n_workers, 1))
+        probe_size = max(min_batch_size, probe_size)
+
+        for worker, state in idle_workers:
+            if remaining_start >= len(inputs):
+                break
+
+            start_idx = remaining_start
+            end_idx = min(start_idx + probe_size, len(inputs))
+            chunk = inputs[start_idx:end_idx]
+            remaining_start = end_idx
+            batch_counter += 1
+
+            state.mark_busy()
+            task = asyncio.create_task(
+                process_batch(worker, state, chunk, start_idx, end_idx, batch_counter)
+            )
+            task._batch_start_idx = start_idx  # type: ignore
+            pending_tasks.add(task)
+
+        # Wait for all probe batches to complete
+        if pending_tasks:
+            done, pending_tasks = await asyncio.wait(pending_tasks)
+            for task in done:
+                try:
+                    result = task.result()
+                    results_map[result.start_idx] = result
+                except Exception as e:
+                    start_idx = getattr(task, "_batch_start_idx", 0)
+                    results_map[start_idx] = DistributionResult(
+                        worker_id="unknown",
+                        start_idx=start_idx,
+                        end_idx=start_idx,
+                        error=e,
+                        latency=0,
+                    )
+
+    # ===== Phase 2: Adaptive distribution =====
+    while remaining_start < len(inputs) or pending_tasks:
+        # Assign work to idle workers
+        while remaining_start < len(inputs):
+            idle_workers = scheduler.get_idle_workers()
+            if not idle_workers:
+                break
+
+            worker, state = idle_workers[0]
+            remaining = len(inputs) - remaining_start
+            n_pending = len(pending_tasks)
+
+            # Calculate adaptive batch size
+            batch_size = calculate_batch_size(state, remaining, n_pending)
+
+            start_idx = remaining_start
+            end_idx = min(start_idx + batch_size, len(inputs))
+            chunk = inputs[start_idx:end_idx]
+            remaining_start = end_idx
+            batch_counter += 1
+
+            state.mark_busy()
+            task = asyncio.create_task(
+                process_batch(worker, state, chunk, start_idx, end_idx, batch_counter)
+            )
+            task._batch_start_idx = start_idx  # type: ignore
+            pending_tasks.add(task)
+
+        if not pending_tasks:
+            break
+
+        # Wait for at least one task to complete
+        done, pending_tasks = await asyncio.wait(
+            pending_tasks, return_when=asyncio.FIRST_COMPLETED
+        )
+
+        for task in done:
+            try:
+                result = task.result()
+                results_map[result.start_idx] = result
+            except Exception as e:
+                start_idx = getattr(task, "_batch_start_idx", 0)
+                results_map[start_idx] = DistributionResult(
+                    worker_id="unknown",
+                    start_idx=start_idx,
+                    end_idx=start_idx,
+                    error=e,
+                    latency=0,
+                )
+
+    session_duration = time.time() - session_start
+
+    if tracker:
+        tracker.end_session()
+
+    # Log stats
+    if enable_perf_tracking:
+        worker_stats = {}
+        for result in results_map.values():
+            wid = result.worker_id
+            if wid not in worker_stats:
+                worker_stats[wid] = {
+                    "batches": 0,
+                    "items": 0,
+                    "total_time": 0,
+                    "batch_sizes": [],
+                }
+            worker_stats[wid]["batches"] += 1
+            worker_stats[wid]["items"] += result.end_idx - result.start_idx
+            worker_stats[wid]["total_time"] += result.latency
+            worker_stats[wid]["batch_sizes"].append(result.end_idx - result.start_idx)
+
+        logger.mesg(f"[AdaptivePipeline] Completed in {session_duration*1000:.1f}ms")
+        for wid, stats in worker_stats.items():
+            avg_batch = (
+                sum(stats["batch_sizes"]) / len(stats["batch_sizes"])
+                if stats["batch_sizes"]
+                else 0
+            )
+            state = scheduler.states.get(wid)
+            throughput = state.throughput if state else 0
+            ratio = get_throughput_ratios().get(wid, 0)
+            logger.mesg(
+                f"  {wid}: batches={stats['batches']}, "
+                f"items={stats['items']} ({stats['items']*100//len(inputs)}%), "
+                f"avg_batch={avg_batch:.0f}, "
+                f"throughput={throughput:.0f}/s, "
+                f"ratio={ratio:.1%}"
+            )
+
+    # Combine results
+    all_results = [results_map[k] for k in sorted(results_map.keys())]
+
+    failed = [r for r in all_results if not r.success]
+    if failed:
+        error_msgs = [f"{r.worker_id}: {r.error}" for r in failed[:3]]
+        raise RuntimeError(
+            f"AdaptivePipeline failed: {len(failed)}/{len(all_results)} batches. "
+            f"Errors: {error_msgs}"
+        )
+
     combined = []
     for r in all_results:
         if r.success and r.result is not None:

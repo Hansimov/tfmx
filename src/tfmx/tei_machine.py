@@ -57,12 +57,15 @@ from .tei_scheduler import (
     IdleFillingScheduler,
     distribute_with_scheduler,
     distribute_with_pipeline,
+    distribute_with_adaptive_pipeline,
 )
 
 
 PORT = 28800
 BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Use value from tei_compose
-MICRO_BATCH_SIZE = 50  # Size of micro-batches for pipeline scheduling
+MICRO_BATCH_SIZE = 100  # Probe batch size for adaptive scheduling (small for quick measurement)
+MIN_BATCH_SIZE = 50  # Minimum batch size
+MAX_BATCH_SIZE = 500  # Maximum batch size
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
 
 
@@ -569,8 +572,8 @@ class TEIMachineServer:
         """
         Distribute inputs using scheduler.
 
-        Uses pipeline mode by default to eliminate round barrier,
-        or falls back to round-based scheduling if pipeline is disabled.
+        Uses adaptive pipeline by default for optimal heterogeneous GPU utilization,
+        or falls back to fixed pipeline/round-based scheduling if disabled.
         """
         # Update scheduler with current healthy instances
         self.scheduler.update_workers(instances)
@@ -589,15 +592,18 @@ class TEIMachineServer:
             )
             return result
 
-        # Use pipeline or round-based scheduling
+        # Use adaptive pipeline, fixed pipeline, or round-based scheduling
         if self.use_pipeline:
-            embeddings, details = await distribute_with_pipeline(
+            # Adaptive pipeline: dynamically adjusts batch size per worker
+            embeddings, details = await distribute_with_adaptive_pipeline(
                 scheduler=self.scheduler,
                 inputs=inputs,
                 process_func=process_on_instance,
                 enable_perf_tracking=self.enable_perf_tracking,
                 perf_tracker=self.perf_tracker,
-                micro_batch_size=self.micro_batch_size,
+                min_batch_size=MIN_BATCH_SIZE,
+                max_batch_size=MAX_BATCH_SIZE,
+                probe_batch_size=self.micro_batch_size,
             )
         else:
             embeddings, details = await distribute_with_scheduler(
