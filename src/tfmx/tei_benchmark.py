@@ -603,7 +603,7 @@ class BenchmarkMetrics:
         logger.mesg(f"  LSH bits:   {self.bitn}")
         logger.mesg(f"  Endpoints:  {len(self.endpoints)}")
         for ep in self.endpoints:
-            logger.mesg(f"    - {ep}")
+            logger.mesg(f"  - {ep}")
 
         # Timing
         logger.mesg(f"\n[Timing]")
@@ -611,24 +611,24 @@ class BenchmarkMetrics:
 
         # Throughput
         logger.mesg(f"\n[Throughput]")
-        logger.mesg(f"  Samples/sec: {logstr.mesg(f'{self.samples_per_second:,.1f}')}")
-        logger.mesg(f"  Chars/sec:   {logstr.mesg(f'{self.chars_per_second:,.1f}')}")
+        logger.mesg(f"  Samples/sec: {logstr.mesg(f'{self.samples_per_second:,.0f}')}")
+        # logger.mesg(f"  Chars/sec:   {logstr.mesg(f'{self.chars_per_second:,.0f}')}")
 
-        # Latency
-        logger.mesg(f"\n[Latency (per batch)]")
-        logger.mesg(f"  Min:  {self.latency_min * 1000:.1f} ms")
-        logger.mesg(f"  Max:  {self.latency_max * 1000:.1f} ms")
-        logger.mesg(f"  Avg:  {self.latency_avg * 1000:.1f} ms")
-        logger.mesg(f"  P50:  {self.latency_p50 * 1000:.1f} ms")
-        logger.mesg(f"  P95:  {self.latency_p95 * 1000:.1f} ms")
-        logger.mesg(f"  P99:  {self.latency_p99 * 1000:.1f} ms")
+        # # Latency
+        # logger.mesg(f"\n[Latency (per batch)]")
+        # logger.mesg(f"  Min:  {self.latency_min * 1000:.1f} ms")
+        # logger.mesg(f"  Max:  {self.latency_max * 1000:.1f} ms")
+        # logger.mesg(f"  Avg:  {self.latency_avg * 1000:.1f} ms")
+        # logger.mesg(f"  P50:  {self.latency_p50 * 1000:.1f} ms")
+        # logger.mesg(f"  P95:  {self.latency_p95 * 1000:.1f} ms")
+        # logger.mesg(f"  P99:  {self.latency_p99 * 1000:.1f} ms")
 
-        # Character stats
-        logger.mesg(f"\n[Character Stats]")
-        logger.mesg(f"  Total chars:        {self.total_chars:,}")
-        logger.mesg(f"  Avg chars/sample:   {self.avg_chars_per_sample:.1f}")
+        # # Character stats
+        # logger.mesg(f"\n[Character Stats]")
+        # logger.mesg(f"  Total chars:        {self.total_chars:,}")
+        # logger.mesg(f"  Avg chars/sample:   {self.avg_chars_per_sample:.1f}")
 
-        logger.note("=" * 60)
+        # logger.note("=" * 60)
 
 
 class TEIBenchmark:
@@ -773,8 +773,8 @@ class TEIBenchmark:
                     rate = total_processed / elapsed if elapsed > 0 else 0
                     pct = (i + 1) / len(batches) * 100
                     logger.mesg(
-                        f"  [{pct:5.1f}%] Batch {i + 1:,}/{len(batches):,} | "
-                        f"{total_processed:,} samples | {rate:,.0f} samples/sec"
+                        f"  [{pct:5.1f}%] Batch {i + 1:>2}/{len(batches):,} | "
+                        f"{total_processed:>6,} samples | {rate:,.0f} samples/sec"
                     )
 
             except Exception as e:
@@ -1131,14 +1131,14 @@ def main():
             # Print results
             metrics.print_summary()
 
-            # Get scheduler stats
-            logger.note("\n[Scheduler Stats]")
-            stats = benchmark.clients.get_scheduler_stats()
-            for worker_id, worker_stats in stats.get("workers", {}).items():
-                logger.mesg(f"  {worker_id}:")
-                logger.mesg(f"    Requests: {worker_stats.get('total_requests', 0):,}")
-                logger.mesg(f"    Items:    {worker_stats.get('total_items', 0):,}")
-                logger.mesg(f"    Errors:   {worker_stats.get('total_errors', 0)}")
+            # # Get scheduler stats
+            # logger.note("\n[Scheduler Stats]")
+            # stats = benchmark.clients.get_scheduler_stats()
+            # for worker_id, worker_stats in stats.get("workers", {}).items():
+            #     logger.mesg(f"  {worker_id}:")
+            #     logger.mesg(f"    Requests: {worker_stats.get('total_requests', 0):,}")
+            #     logger.mesg(f"    Items:    {worker_stats.get('total_items', 0):,}")
+            #     logger.mesg(f"    Errors:   {worker_stats.get('total_errors', 0)}")
 
             # Save results if output specified
             if args.output:

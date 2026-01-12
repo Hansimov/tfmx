@@ -243,6 +243,18 @@ class IdleFillingScheduler(Generic[W]):
                 idle.append((w, state))
         return idle
 
+    def get_idle_workers_by_throughput(self) -> list[tuple[W, WorkerState]]:
+        """Get list of idle workers sorted by throughput (highest first).
+
+        This prioritizes high-throughput workers for task assignment,
+        ensuring they get more work opportunities.
+        """
+        idle = self.get_idle_workers()
+        # Sort by throughput descending (highest first)
+        # Workers with no throughput data (0) go to the end
+        idle.sort(key=lambda x: x[1].throughput, reverse=True)
+        return idle
+
     def get_worker_by_id(self, worker_id: str) -> Optional[W]:
         """Get worker object by ID."""
         return self._worker_map.get(worker_id)
@@ -973,19 +985,38 @@ async def distribute_with_adaptive_pipeline(
     def calculate_adaptive_batch_size(
         state: WorkerState, remaining: int, n_idle: int
     ) -> int:
-        """Calculate batch size based on worker's throughput."""
-        # Get throughput ratios
+        """Calculate batch size based on worker's throughput.
+
+        Strategy:
+        - High-throughput workers get larger batches (proportional to their throughput ratio)
+        - Use throughput-weighted fair share instead of simple equal division
+        - This ensures fast GPUs process more data per batch, not just more batches
+        """
+        # Get throughput ratios (sums to 1.0)
         ratios = get_throughput_ratios()
         worker_ratio = ratios.get(state.worker_id, 1.0 / n_workers)
 
-        # Base: this worker's share of remaining work
-        # Adjusted by throughput ratio (faster workers get more)
+        # Calculate this worker's share based on throughput ratio
+        # Higher throughput = larger share of remaining work
         target = int(remaining * worker_ratio)
 
-        # But also ensure we don't starve other workers
-        # Limit to fair share among currently idle workers
-        fair_share = remaining // max(n_idle, 1)
-        target = min(target, fair_share)
+        # For high-throughput workers, allow them to take more than simple fair share
+        # But still leave some work for other idle workers
+        # Use throughput-weighted fair share: if this worker has 20% throughput ratio
+        # among 3 idle workers, it should get ~20%/(sum of idle ratios) of remaining
+        idle_workers = scheduler.get_idle_workers()
+        if idle_workers:
+            # Sum of throughput ratios for currently idle workers
+            idle_ratios_sum = sum(
+                ratios.get(scheduler.get_worker_id(w), 1.0 / n_workers)
+                for w, _ in idle_workers
+            )
+            if idle_ratios_sum > 0:
+                # This worker's proportion among idle workers
+                proportion_among_idle = worker_ratio / idle_ratios_sum
+                # Allow up to this proportion of remaining work
+                max_for_this_worker = int(remaining * proportion_among_idle)
+                target = min(target, max_for_this_worker)
 
         # Clamp to bounds
         return max(min_batch_size, min(target, max_batch_size, remaining))
@@ -993,7 +1024,9 @@ async def distribute_with_adaptive_pipeline(
     while remaining_start < len(inputs) or pending_tasks:
         # Assign work to idle workers
         while remaining_start < len(inputs):
-            idle_workers = scheduler.get_idle_workers()
+            # Use throughput-sorted selection for adaptive scheduling
+            # High-throughput workers get priority and larger batches
+            idle_workers = scheduler.get_idle_workers_by_throughput()
             if not idle_workers:
                 break
 
