@@ -487,7 +487,7 @@ class TextGenerator:
             List of unique text samples
         """
         samples = []
-        progress_interval = max(1, count // 20)  # 5% intervals
+        progress_interval = max(1, count // 10)  # 10% intervals
 
         logger.note(
             f"> Generating {count:,} text samples ({min_len}-{max_len} chars)..."
@@ -836,8 +836,8 @@ class TEIBenchmarkArgParser:
             "-n",
             "--num-samples",
             type=int,
-            default=200000,
-            help="Number of text samples to generate (default: 200000)",
+            default=100000,
+            help="Number of text samples to generate (default: 100000)",
         )
         self.parser.add_argument(
             "-b",

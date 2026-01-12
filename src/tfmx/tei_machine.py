@@ -23,6 +23,9 @@ Examples:
   # LSH computation options
   tei_machine run --no-gpu-lsh      # Force CPU for LSH computation
   
+  # Performance tracking
+  tei_machine run --perf-track      # Enable detailed performance tracking
+  
   # Check discovered instances without starting server
   tei_machine discover              # List all discovered TEI instances
   
@@ -48,12 +51,18 @@ from typing import Optional, Union
 from webu import setup_swagger_ui
 
 from .lsh import LSHConverter
+from .perf_tracker import PerfTracker
 from .tei_compose import MAX_CLIENT_BATCH_SIZE
-from .tei_scheduler import IdleFillingScheduler, distribute_with_scheduler
+from .tei_scheduler import (
+    IdleFillingScheduler,
+    distribute_with_scheduler,
+    distribute_with_pipeline,
+)
 
 
 PORT = 28800
 BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Use value from tei_compose
+MICRO_BATCH_SIZE = 50  # Size of micro-batches for pipeline scheduling
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
 
 
@@ -355,17 +364,31 @@ class TEIMachineServer:
         instances: list[TEIInstance],
         port: int = PORT,
         batch_size: int = BATCH_SIZE,
+        micro_batch_size: int = MICRO_BATCH_SIZE,
         timeout: float = 60.0,
         use_gpu_lsh: bool = True,
+        enable_perf_tracking: bool = False,
+        use_pipeline: bool = True,  # Use pipeline scheduling by default
     ):
         self.instances = instances
         self.port = port
         self.batch_size = batch_size
+        self.micro_batch_size = micro_batch_size
         self.timeout = timeout
         self.stats = TEIMachineStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
         self._lsh_cache = LSHConverterCache(use_gpu=use_gpu_lsh)
+
+        # Performance tracking
+        self.enable_perf_tracking = enable_perf_tracking
+        self.perf_tracker = PerfTracker(
+            name="tei_machine", verbose=enable_perf_tracking
+        )
+        self._request_counter = 0
+
+        # Pipeline mode (eliminates round barrier)
+        self.use_pipeline = use_pipeline
 
         # Idle-filling scheduler for simple load balancing
         self.scheduler = IdleFillingScheduler(
@@ -544,9 +567,10 @@ class TEIMachineServer:
         truncate: bool,
     ) -> list[list[float]]:
         """
-        Distribute inputs using idle-filling scheduler.
+        Distribute inputs using scheduler.
 
-        Simple approach: assign batches to idle workers, wait if all busy.
+        Uses pipeline mode by default to eliminate round barrier,
+        or falls back to round-based scheduling if pipeline is disabled.
         """
         # Update scheduler with current healthy instances
         self.scheduler.update_workers(instances)
@@ -565,12 +589,30 @@ class TEIMachineServer:
             )
             return result
 
-        # Use the scheduler's distribution function
-        embeddings, details = await distribute_with_scheduler(
-            scheduler=self.scheduler,
-            inputs=inputs,
-            process_func=process_on_instance,
-        )
+        # Use pipeline or round-based scheduling
+        if self.use_pipeline:
+            embeddings, details = await distribute_with_pipeline(
+                scheduler=self.scheduler,
+                inputs=inputs,
+                process_func=process_on_instance,
+                enable_perf_tracking=self.enable_perf_tracking,
+                perf_tracker=self.perf_tracker,
+                micro_batch_size=self.micro_batch_size,
+            )
+        else:
+            embeddings, details = await distribute_with_scheduler(
+                scheduler=self.scheduler,
+                inputs=inputs,
+                process_func=process_on_instance,
+                enable_perf_tracking=self.enable_perf_tracking,
+                perf_tracker=self.perf_tracker,
+            )
+
+        # Print performance analysis periodically
+        if self.enable_perf_tracking:
+            self._request_counter += 1
+            if self._request_counter % 10 == 0:  # Every 10 requests
+                self.perf_tracker.print_analysis()
 
         return embeddings
 
@@ -605,6 +647,10 @@ class TEIMachineServer:
 
     async def lsh(self, request: LSHRequest) -> list[str]:
         """Handle LSH requests: embed + LSH conversion to hex strings."""
+        import time as _time
+
+        t0 = _time.perf_counter()
+
         # Normalize inputs to list
         inputs = request.inputs
         if isinstance(inputs, str):
@@ -625,20 +671,42 @@ class TEIMachineServer:
             )
 
         try:
+            t1 = _time.perf_counter()
+
             # Get embeddings from TEI instances
             embeddings = await self._distribute_with_scheduler(
                 inputs, healthy, request.normalize, request.truncate
             )
 
+            t2 = _time.perf_counter()
+
             # Convert to numpy array for vectorized LSH
             embs_array = np.array(embeddings, dtype=np.float32)
             dims = embs_array.shape[1]
+
+            t3 = _time.perf_counter()
 
             # Get cached LSH converter
             lsh: LSHConverter = self._lsh_cache.get(dims=dims, bitn=request.bitn)
 
             # Vectorized conversion to hex strings
             lsh_hashes = lsh.embs_to_hex_batch(embs_array)
+
+            t4 = _time.perf_counter()
+
+            # Log detailed timing if perf tracking enabled
+            if self.enable_perf_tracking:
+                total = (t4 - t0) * 1000
+                embed_time = (t2 - t1) * 1000
+                array_conv = (t3 - t2) * 1000
+                lsh_time = (t4 - t3) * 1000
+                overhead = (t1 - t0) * 1000
+                logger.mesg(
+                    f"[LSH timing] n={len(inputs)}, total={total:.1f}ms | "
+                    f"embed={embed_time:.1f}ms, np.array={array_conv:.1f}ms, "
+                    f"lsh={lsh_time:.1f}ms, overhead={overhead:.1f}ms"
+                )
+
             return lsh_hashes
 
         except Exception as e:
@@ -710,6 +778,13 @@ class TEIMachineArgParser:
             help=f"Max batch size per instance (default: {BATCH_SIZE})",
         )
         self.parser.add_argument(
+            "-m",
+            "--micro-batch-size",
+            type=int,
+            default=MICRO_BATCH_SIZE,
+            help=f"Micro-batch size for pipeline scheduling (default: {MICRO_BATCH_SIZE})",
+        )
+        self.parser.add_argument(
             "-t",
             "--timeout",
             type=float,
@@ -720,6 +795,16 @@ class TEIMachineArgParser:
             "--no-gpu-lsh",
             action="store_true",
             help="Disable GPU acceleration for LSH computation (use CPU instead)",
+        )
+        self.parser.add_argument(
+            "--perf-track",
+            action="store_true",
+            help="Enable detailed performance tracking to identify bottlenecks",
+        )
+        self.parser.add_argument(
+            "--no-pipeline",
+            action="store_true",
+            help="Disable pipeline scheduling (use round-based scheduling instead)",
         )
         self.parser.add_argument(
             "action",
@@ -824,12 +909,30 @@ def main():
             )
             return
 
+        use_pipeline = not args.no_pipeline
+
+        if args.perf_track:
+            logger.note("[tei_machine] Performance tracking ENABLED")
+            logger.note(
+                "[tei_machine] Detailed metrics will be logged for each request"
+            )
+
+        if use_pipeline:
+            logger.note(
+                f"[tei_machine] Pipeline mode ENABLED (micro_batch_size={args.micro_batch_size})"
+            )
+        else:
+            logger.note("[tei_machine] Round-based scheduling (pipeline disabled)")
+
         server = TEIMachineServer(
             instances=instances,
             port=args.port,
             batch_size=args.batch_size,
+            micro_batch_size=args.micro_batch_size,
             timeout=args.timeout,
             use_gpu_lsh=not args.no_gpu_lsh,
+            enable_perf_tracking=args.perf_track,
+            use_pipeline=use_pipeline,
         )
         server.run()
 

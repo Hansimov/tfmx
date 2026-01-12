@@ -324,7 +324,13 @@ class TEIClients:
             self._rr_index += 1
             return client.lsh(inputs, bitn=bitn, normalize=normalize, truncate=truncate)
 
-        # Use idle-filling scheduler for distribution
+        # Single machine optimization: send directly without scheduler splitting
+        # This lets the TEIMachine's internal pipeline handle distribution
+        if len(healthy) == 1:
+            _, client, _ = healthy[0]
+            return client.lsh(inputs, bitn=bitn, normalize=normalize, truncate=truncate)
+
+        # Multiple machines: use scheduler for distribution
         return self._lsh_with_scheduler(inputs, healthy, bitn, normalize, truncate)
 
     def _lsh_with_scheduler(

@@ -18,8 +18,20 @@ from .tei_scheduler import (
     IdleFillingScheduler,
     DistributionResult,
     distribute_with_scheduler,
+    distribute_with_pipeline,
     distribute_to_workers,
     MAX_CLIENT_BATCH_SIZE,
+)
+from .perf_tracker import (
+    PerfTracker,
+    WorkerEvent,
+    TaskRecord,
+    RoundRecord,
+    WorkerStats,
+    RoundContext,
+    TaskContext,
+    get_global_tracker,
+    reset_global_tracker,
 )
 from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
 from .gpu_fan import control_gpu_fan
