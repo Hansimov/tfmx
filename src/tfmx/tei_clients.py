@@ -243,10 +243,16 @@ class TEIClients:
         self.scheduler.update_workers(healthy_clients)
 
         # Define async process function
+        # CRITICAL: Use asyncio.to_thread to run sync client.embed() in thread pool
+        # Without this, sync calls would block the event loop and run sequentially!
         async def process_on_client(
             client: TEIClient, chunk: list[str]
         ) -> list[list[float]]:
-            return client.embed(chunk, normalize=normalize, truncate=truncate)
+            import asyncio
+
+            return await asyncio.to_thread(
+                client.embed, chunk, normalize=normalize, truncate=truncate
+            )
 
         # Use scheduler distribution with asyncio
         import asyncio
@@ -347,8 +353,14 @@ class TEIClients:
         self.scheduler.update_workers(healthy_clients)
 
         # Define async process function
+        # CRITICAL: Use asyncio.to_thread to run sync client.lsh() in thread pool
+        # Without this, sync calls would block the event loop and run sequentially!
         async def process_on_client(client: TEIClient, chunk: list[str]) -> list[str]:
-            return client.lsh(chunk, bitn=bitn, normalize=normalize, truncate=truncate)
+            import asyncio
+
+            return await asyncio.to_thread(
+                client.lsh, chunk, bitn=bitn, normalize=normalize, truncate=truncate
+            )
 
         # Use scheduler distribution with asyncio
         import asyncio
