@@ -53,9 +53,6 @@ from tclogger import logger, logstr, Runtimer, dict_to_lines
 
 from .tei_clients import TEIClients
 
-# ============================================================================
-# Text Generation Constants
-# ============================================================================
 
 # Chinese text templates - meaningful sentence patterns
 CN_TEMPLATES = [
@@ -278,169 +275,9 @@ CN_ACTIVITIES = [
     "园艺",
 ]
 
-# English text templates
-EN_TEMPLATES = [
-    "The {noun} is {adj}, making it {evaluation} for {purpose}.",
-    "In the {field}, {method} has proven to be {adj} for {application}.",
-    "According to {source}, {topic} is becoming increasingly {adj}.",
-    "When {action}, it's important to consider {factor} and {factor}.",
-    "{person} mentioned that {quote}, which highlights the importance of {topic}.",
-    "The latest {product} features {feature}, designed for {target}.",
-    "Research shows that {finding} can significantly improve {outcome}.",
-    "If you want to {goal}, you should focus on {advice}.",
-    "The {adj} {noun} in {place} attracts many {visitor} every year.",
-    "Despite {challenge}, {solution} offers a promising approach.",
-    "This {work} explores the concept of {concept} through {method}.",
-    "Understanding {topic} requires knowledge of {prerequisite}.",
-    "The {system} was designed to {function} with {quality}.",
-    "Many experts believe that {opinion} will shape the future of {field}.",
-    "The {event} demonstrated the power of {concept} in {application}.",
-]
-
-EN_NOUNS = [
-    "technology",
-    "system",
-    "approach",
-    "solution",
-    "framework",
-    "method",
-    "concept",
-    "application",
-    "service",
-    "product",
-    "platform",
-    "tool",
-    "model",
-    "algorithm",
-    "interface",
-    "design",
-    "architecture",
-    "infrastructure",
-    "environment",
-    "process",
-    "strategy",
-    "innovation",
-    "experience",
-    "development",
-    "research",
-    "analysis",
-]
-
-EN_ADJS = [
-    "innovative",
-    "efficient",
-    "powerful",
-    "flexible",
-    "reliable",
-    "scalable",
-    "intelligent",
-    "advanced",
-    "comprehensive",
-    "practical",
-    "effective",
-    "robust",
-    "versatile",
-    "intuitive",
-    "sophisticated",
-    "streamlined",
-    "cutting-edge",
-    "modern",
-]
-
-EN_FIELDS = [
-    "machine learning",
-    "artificial intelligence",
-    "data science",
-    "software engineering",
-    "cloud computing",
-    "cybersecurity",
-    "web development",
-    "mobile development",
-    "natural language processing",
-    "computer vision",
-    "robotics",
-    "IoT",
-    "blockchain",
-    "quantum computing",
-    "bioinformatics",
-    "digital marketing",
-]
-
-EN_TOPICS = [
-    "deep learning",
-    "neural networks",
-    "data analysis",
-    "automation",
-    "optimization",
-    "user experience",
-    "system design",
-    "performance tuning",
-    "code quality",
-    "team collaboration",
-    "project management",
-    "continuous integration",
-    "microservices",
-    "containerization",
-    "serverless architecture",
-]
-
-EN_PERSONS = [
-    "The researcher",
-    "The engineer",
-    "The scientist",
-    "The developer",
-    "The analyst",
-    "The expert",
-    "The professor",
-    "The consultant",
-    "The architect",
-    "The designer",
-]
-
-EN_ACTIONS = [
-    "developing software",
-    "analyzing data",
-    "training models",
-    "deploying systems",
-    "designing interfaces",
-    "testing applications",
-    "optimizing performance",
-    "building pipelines",
-    "managing projects",
-    "conducting research",
-]
-
-EN_FACTORS = [
-    "scalability",
-    "security",
-    "performance",
-    "usability",
-    "maintainability",
-    "reliability",
-    "efficiency",
-    "compatibility",
-    "flexibility",
-    "accessibility",
-]
-
-EN_PLACES = [
-    "Silicon Valley",
-    "research labs",
-    "tech hubs",
-    "innovation centers",
-    "startup ecosystems",
-    "academic institutions",
-    "corporate environments",
-]
-
-
-# ============================================================================
-# Text Generator
-# ============================================================================
-
 
 class TextGenerator:
-    """Generate meaningful, non-repeating Chinese and English texts.
+    """Generate meaningful, non-repeating Chinese texts.
 
     Uses template-based generation with random word substitution to create
     diverse, meaningful text samples.
@@ -497,48 +334,6 @@ class TextGenerator:
             "{plot}": self._gen_cn_plot(),
             "{goal}": self._gen_cn_goal(),
             "{advice}": self._gen_cn_advice(),
-        }
-        for key, value in replacements.items():
-            if key in result:
-                result = result.replace(key, value, 1)
-        return result
-
-    def _fill_en_template(self, template: str) -> str:
-        """Fill an English template with random words."""
-        result = template
-        replacements = {
-            "{noun}": self.rng.choice(EN_NOUNS),
-            "{adj}": self.rng.choice(EN_ADJS),
-            "{field}": self.rng.choice(EN_FIELDS),
-            "{topic}": self.rng.choice(EN_TOPICS),
-            "{person}": self.rng.choice(EN_PERSONS),
-            "{method}": self._gen_en_method(),
-            "{application}": self._gen_en_application(),
-            "{source}": self._gen_en_source(),
-            "{action}": self.rng.choice(EN_ACTIONS),
-            "{factor}": self.rng.choice(EN_FACTORS),
-            "{quote}": self._gen_en_quote(),
-            "{product}": self.rng.choice(EN_NOUNS),
-            "{feature}": self._gen_en_feature(),
-            "{target}": self._gen_en_target(),
-            "{finding}": self._gen_en_finding(),
-            "{outcome}": self._gen_en_outcome(),
-            "{goal}": self._gen_en_goal(),
-            "{advice}": self._gen_en_advice(),
-            "{place}": self.rng.choice(EN_PLACES),
-            "{visitor}": self._gen_en_visitor(),
-            "{challenge}": self._gen_en_challenge(),
-            "{solution}": self._gen_en_solution(),
-            "{work}": self._gen_en_work(),
-            "{concept}": self.rng.choice(EN_TOPICS),
-            "{prerequisite}": self._gen_en_prerequisite(),
-            "{system}": self.rng.choice(EN_NOUNS),
-            "{function}": self._gen_en_function(),
-            "{quality}": self.rng.choice(EN_ADJS) + " " + self.rng.choice(EN_FACTORS),
-            "{opinion}": self._gen_en_opinion(),
-            "{event}": self._gen_en_event(),
-            "{evaluation}": self.rng.choice(EN_ADJS),
-            "{purpose}": self._gen_en_purpose(),
         }
         for key, value in replacements.items():
             if key in result:
@@ -630,150 +425,6 @@ class TextGenerator:
         ]
         return self.rng.choice(advices)
 
-    # English helper generators
-    def _gen_en_method(self) -> str:
-        methods = [
-            "deep learning techniques",
-            "statistical analysis",
-            "iterative refinement",
-            "systematic evaluation",
-            "data-driven approaches",
-        ]
-        return self.rng.choice(methods)
-
-    def _gen_en_application(self) -> str:
-        apps = [
-            "real-world scenarios",
-            "enterprise solutions",
-            "research purposes",
-            "production systems",
-            "educational contexts",
-        ]
-        return self.rng.choice(apps)
-
-    def _gen_en_source(self) -> str:
-        sources = [
-            "recent studies",
-            "industry reports",
-            "expert analysis",
-            "research papers",
-            "market surveys",
-        ]
-        return self.rng.choice(sources)
-
-    def _gen_en_quote(self) -> str:
-        quotes = [
-            "innovation drives progress",
-            "data is the new oil",
-            "simplicity is key",
-            "iteration leads to perfection",
-            "collaboration enables success",
-        ]
-        return self.rng.choice(quotes)
-
-    def _gen_en_feature(self) -> str:
-        return f"{self.rng.choice(EN_ADJS)} {self.rng.choice(EN_FACTORS)}"
-
-    def _gen_en_target(self) -> str:
-        targets = [
-            "developers",
-            "enterprises",
-            "researchers",
-            "startups",
-            "professionals",
-            "teams",
-        ]
-        return self.rng.choice(targets)
-
-    def _gen_en_finding(self) -> str:
-        return f"{self.rng.choice(EN_ADJS)} {self.rng.choice(EN_NOUNS)}"
-
-    def _gen_en_outcome(self) -> str:
-        outcomes = [
-            "productivity",
-            "efficiency",
-            "accuracy",
-            "performance",
-            "user satisfaction",
-        ]
-        return self.rng.choice(outcomes)
-
-    def _gen_en_goal(self) -> str:
-        goals = [
-            "improve performance",
-            "increase efficiency",
-            "reduce costs",
-            "enhance quality",
-            "scale operations",
-        ]
-        return self.rng.choice(goals)
-
-    def _gen_en_advice(self) -> str:
-        advices = [
-            "continuous learning",
-            "best practices",
-            "proven methodologies",
-            "expert guidance",
-            "systematic approaches",
-        ]
-        return self.rng.choice(advices)
-
-    def _gen_en_visitor(self) -> str:
-        visitors = [
-            "visitors",
-            "professionals",
-            "enthusiasts",
-            "researchers",
-            "tourists",
-        ]
-        return self.rng.choice(visitors)
-
-    def _gen_en_challenge(self) -> str:
-        return f"{self.rng.choice(EN_ADJS)} {self.rng.choice(EN_FACTORS)} requirements"
-
-    def _gen_en_solution(self) -> str:
-        return f"a {self.rng.choice(EN_ADJS)} {self.rng.choice(EN_NOUNS)}"
-
-    def _gen_en_work(self) -> str:
-        works = ["paper", "study", "book", "article", "framework", "project"]
-        return self.rng.choice(works)
-
-    def _gen_en_prerequisite(self) -> str:
-        return f"{self.rng.choice(EN_FIELDS)} and {self.rng.choice(EN_FIELDS)}"
-
-    def _gen_en_function(self) -> str:
-        functions = [
-            "process data efficiently",
-            "handle requests",
-            "manage resources",
-            "coordinate tasks",
-            "optimize workflows",
-        ]
-        return self.rng.choice(functions)
-
-    def _gen_en_opinion(self) -> str:
-        return f"{self.rng.choice(EN_ADJS)} {self.rng.choice(EN_NOUNS)}"
-
-    def _gen_en_event(self) -> str:
-        events = [
-            "conference",
-            "workshop",
-            "demonstration",
-            "launch",
-            "presentation",
-        ]
-        return self.rng.choice(events)
-
-    def _gen_en_purpose(self) -> str:
-        purposes = [
-            "production use",
-            "development",
-            "testing",
-            "research",
-            "deployment",
-        ]
-        return self.rng.choice(purposes)
-
     def _generate_one(self, min_len: int, max_len: int) -> str:
         """Generate a single text sample.
 
@@ -786,15 +437,9 @@ class TextGenerator:
         """
         max_attempts = 100
         for _ in range(max_attempts):
-            # Randomly choose Chinese or English
-            if self.rng.random() < 0.5:
-                # Chinese
-                template = self.rng.choice(CN_TEMPLATES)
-                text = self._fill_cn_template(template)
-            else:
-                # English
-                template = self.rng.choice(EN_TEMPLATES)
-                text = self._fill_en_template(template)
+            # Use Chinese template
+            template = self.rng.choice(CN_TEMPLATES)
+            text = self._fill_cn_template(template)
 
             # Add unique suffix using counter to ensure uniqueness
             self._counter += 1
@@ -804,16 +449,10 @@ class TextGenerator:
             # Adjust length if needed
             current_len = len(text)
             if current_len < min_len:
-                # Extend by repeating pattern
+                # Extend by adding complete new templates
                 while len(text) < min_len:
-                    if self.rng.random() < 0.5:
-                        extra = (
-                            f" {self.rng.choice(CN_ADJS)}{self.rng.choice(CN_NOUNS)}"
-                        )
-                    else:
-                        extra = (
-                            f" {self.rng.choice(EN_ADJS)} {self.rng.choice(EN_NOUNS)}"
-                        )
+                    new_template = self.rng.choice(CN_TEMPLATES)
+                    extra = " " + self._fill_cn_template(new_template)
                     text += extra
             elif current_len > max_len:
                 # Truncate
@@ -827,13 +466,13 @@ class TextGenerator:
 
         # Fallback: use counter to ensure uniqueness
         self._counter += 1
-        return f"Sample text #{self._counter} for benchmark testing."
+        return f"示例文本 #{self._counter} 用于基准测试。"
 
     def generate(
         self,
         count: int,
-        min_len: int = 50,
-        max_len: int = 200,
+        min_len: int = 100,
+        max_len: int = 300,
         show_progress: bool = True,
     ) -> list[str]:
         """Generate multiple unique text samples.
@@ -870,11 +509,6 @@ class TextGenerator:
         logger.mesg(f"  Total chars: {total_chars:,}, avg length: {avg_len:.1f}")
 
         return samples
-
-
-# ============================================================================
-# Benchmark Metrics
-# ============================================================================
 
 
 @dataclass
@@ -995,11 +629,6 @@ class BenchmarkMetrics:
         logger.mesg(f"  Avg chars/sample:   {self.avg_chars_per_sample:.1f}")
 
         logger.note("=" * 60)
-
-
-# ============================================================================
-# Benchmark Runner
-# ============================================================================
 
 
 class TEIBenchmark:
@@ -1179,11 +808,6 @@ class TEIBenchmark:
         logger.okay(f"  Benchmark completed in {metrics.total_time:.2f} sec")
 
         return metrics
-
-
-# ============================================================================
-# CLI
-# ============================================================================
 
 
 class TEIBenchmarkArgParser:

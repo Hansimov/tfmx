@@ -68,7 +68,7 @@ TEI_TAG = "86-1.8"  # Fallback
 TEI_IMAGE_BASE = "ghcr.io/huggingface/text-embeddings-inference"
 TEI_IMAGE_MIRROR = "m.daocloud.io"
 
-MAX_CLIENT_BATCH_SIZE = 200
+MAX_CLIENT_BATCH_SIZE = 500
 
 
 class GPUInfo:
