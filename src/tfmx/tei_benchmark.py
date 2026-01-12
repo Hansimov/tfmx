@@ -705,7 +705,10 @@ class TEIBenchmark:
         samples: list[str],
         warmup_samples: int = 100,
     ) -> BenchmarkMetrics:
-        """Run the benchmark.
+        """Run the benchmark using pipeline mode.
+
+        Pipeline mode: All samples are processed together, with the scheduler
+        distributing work across machines. Each machine uses its optimal batch size.
 
         Args:
             samples: List of text samples to process
@@ -717,7 +720,7 @@ class TEIBenchmark:
         # Initialize metrics
         metrics = BenchmarkMetrics(
             n_samples=len(samples),
-            batch_size=self.batch_size,
+            batch_size=self.batch_size,  # Note: this is informational only in pipeline mode
             bitn=self.bitn,
             endpoints=self.endpoints.copy(),
         )
@@ -738,72 +741,47 @@ class TEIBenchmark:
             except Exception as e:
                 logger.warn(f"  Warmup failed: {e}")
 
-        # Split into batches
-        batches = []
-        for i in range(0, len(samples), self.batch_size):
-            batch = samples[i : i + self.batch_size]
-            batches.append(batch)
-        metrics.n_batches = len(batches)
-
-        logger.note(f"> Running benchmark...")
+        logger.note(f"> Running benchmark (pipeline mode)...")
         logger.mesg(f"  Samples: {len(samples):,}")
-        logger.mesg(f"  Batches: {len(batches):,} × {self.batch_size:,}")
         logger.mesg(f"  Endpoints: {len(self.endpoints)}")
 
-        # Run benchmark
-        batch_times = []
-        total_processed = 0
+        # Create a generator that yields samples one by one
+        def sample_generator():
+            for sample in samples:
+                yield sample
+
+        # Run benchmark - use lsh_iter with generator, provide total_hint for progress
         start_time = time.perf_counter()
 
-        for i, batch in enumerate(batches):
-            batch_start = time.perf_counter()
-
-            try:
-                results = self.clients.lsh(batch, bitn=self.bitn)
-                batch_end = time.perf_counter()
-                batch_time = batch_end - batch_start
-                batch_times.append(batch_time)
-
-                total_processed += len(results)
-
-                # Progress update every 10% or at least every 10 batches
-                progress_interval = max(1, len(batches) // 10)
-                if (i + 1) % progress_interval == 0 or i == len(batches) - 1:
-                    elapsed = batch_end - start_time
-                    rate = total_processed / elapsed if elapsed > 0 else 0
-                    pct = (i + 1) / len(batches) * 100
-                    logger.mesg(
-                        f"  [{pct:5.1f}%] Batch {i + 1:>2}/{len(batches):,} | "
-                        f"{total_processed:>6,} samples | {rate:,.0f} samples/sec"
-                    )
-
-            except Exception as e:
-                error_msg = str(e)
-                if (
-                    "maximum allowed batch size" in error_msg
-                    or "Validation" in error_msg
-                ):
-                    logger.error(
-                        f"  Batch {i + 1} failed: {e}\n"
-                        f"  Hint: Your TEI container has a batch size limit (--max-client-batch-size).\n"
-                        f"  Try using a smaller batch size with -b option (e.g., -b 50) or\n"
-                        f"  increase the container's --max-client-batch-size in your compose file."
-                    )
-                else:
-                    logger.warn(f"  Batch {i + 1} failed: {e}")
-                batch_times.append(float("inf"))
-
-        end_time = time.perf_counter()
+        try:
+            results = self.clients.lsh_iter(
+                sample_generator(),
+                total_hint=len(samples),
+                bitn=self.bitn,
+            )
+            end_time = time.perf_counter()
+            total_processed = len(results)
+        except Exception as e:
+            logger.error(f"  Benchmark failed: {e}")
+            end_time = time.perf_counter()
+            total_processed = 0
 
         # Calculate metrics
         metrics.total_time = end_time - start_time
-        metrics.batch_times = [t for t in batch_times if t != float("inf")]
+        metrics.n_batches = 1  # Pipeline mode = 1 logical batch
 
         if metrics.total_time > 0:
             metrics.samples_per_second = total_processed / metrics.total_time
             metrics.chars_per_second = metrics.total_chars / metrics.total_time
 
-        metrics.calculate_latency_percentiles()
+        # Get per-machine stats
+        machine_stats = self.clients.get_machine_stats()
+        for ms in machine_stats:
+            logger.mesg(
+                f"  {ms['endpoint']}: {ms['total_items']:,} items, "
+                f"{ms['total_requests']} batches, "
+                f"throughput={ms['throughput_ema']:.0f}/s"
+            )
 
         logger.okay(f"  Benchmark completed in {metrics.total_time:.2f} sec")
 

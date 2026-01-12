@@ -12,7 +12,7 @@ from .tei_compose import ModelConfigManager, DockerImageManager, ComposeFileGene
 from .tei_client import TEIClient, TEIClientArgParser
 from .tei_client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
 from .tei_clients import TEIClients, TEIClientsArgParser
-from .tei_clients import MachineInfo, ClientsHealthResponse
+from .tei_clients import MachineState, MachineScheduler, ClientsHealthResponse
 from .tei_scheduler import (
     WorkerState,
     IdleFillingScheduler,
