@@ -26,12 +26,8 @@ from tclogger import logger
 from typing import Union, Optional
 
 from .tei_client import TEIClient, InfoResponse, TIMEOUT
-from .tei_scheduler import (
-    AdaptiveScheduler,
-    WorkerStats,
-    DistributionResult,
-    distribute_with_scheduler,
-)
+from .tei_compose import MAX_CLIENT_BATCH_SIZE
+from .tei_scheduler import IdleFillingScheduler, distribute_with_scheduler
 
 
 @dataclass
@@ -124,10 +120,11 @@ class TEIClients:
         # Round-robin index
         self._rr_index = 0
 
-        # Adaptive scheduler for EFT-based distribution
-        self.scheduler = AdaptiveScheduler(
+        # Idle-filling scheduler for simple load balancing
+        self.scheduler = IdleFillingScheduler(
             workers=self.clients,
             get_worker_id=lambda c: c.endpoint,
+            max_batch_size=MAX_CLIENT_BATCH_SIZE,
         )
 
     def close(self) -> None:
@@ -240,14 +237,10 @@ class TEIClients:
         normalize: bool,
         truncate: bool,
     ) -> list[list[float]]:
-        """Distribute embed requests using adaptive scheduler."""
+        """Distribute embed requests using idle-filling scheduler."""
         # Update scheduler with healthy clients
         healthy_clients = [client for _, client, _ in healthy]
         self.scheduler.update_workers(healthy_clients)
-
-        # Update capacity hints based on healthy instances
-        for _, client, machine in healthy:
-            self.scheduler.set_capacity_hint(client.endpoint, machine.healthy_instances)
 
         # Define async process function
         async def process_on_client(
@@ -263,7 +256,6 @@ class TEIClients:
                 scheduler=self.scheduler,
                 inputs=inputs,
                 process_func=process_on_client,
-                use_chars=True,
             )
         )
 
@@ -297,7 +289,7 @@ class TEIClients:
     ) -> list[str]:
         """Generate LSH hash hex strings for input texts using multiple machines.
 
-        Distributes inputs across healthy machines using adaptive scheduling (EFT-based).
+        Distributes inputs across healthy machines using idle-filling scheduling.
 
         Args:
             inputs: Single text or list of texts.
@@ -332,7 +324,7 @@ class TEIClients:
             self._rr_index += 1
             return client.lsh(inputs, bitn=bitn, normalize=normalize, truncate=truncate)
 
-        # Use adaptive scheduler for distribution (handles micro-batching)
+        # Use idle-filling scheduler for distribution
         return self._lsh_with_scheduler(inputs, healthy, bitn, normalize, truncate)
 
     def _lsh_with_scheduler(
@@ -343,14 +335,10 @@ class TEIClients:
         normalize: bool,
         truncate: bool,
     ) -> list[str]:
-        """Distribute LSH requests using adaptive scheduler."""
+        """Distribute LSH requests using idle-filling scheduler."""
         # Update scheduler with healthy clients
         healthy_clients = [client for _, client, _ in healthy]
         self.scheduler.update_workers(healthy_clients)
-
-        # Update capacity hints
-        for _, client, machine in healthy:
-            self.scheduler.set_capacity_hint(client.endpoint, machine.healthy_instances)
 
         # Define async process function
         async def process_on_client(client: TEIClient, chunk: list[str]) -> list[str]:
@@ -364,7 +352,6 @@ class TEIClients:
                 scheduler=self.scheduler,
                 inputs=inputs,
                 process_func=process_on_client,
-                use_chars=True,
             )
         )
 

@@ -8,7 +8,7 @@ requests across multiple TEI Docker instances running on different GPUs.
 CLI_EPILOG = """
 Examples:
   # Start machine server (auto-discover TEI containers)
-  tei_machine run                   # Start on default port 28800 with GPU LSH
+  tei_machine run                   # Start on default port 28800 with smart GPU LSH
   tei_machine run -p 28800          # Start on specific port
   
   # Filter containers by name pattern
@@ -21,8 +21,7 @@ Examples:
   tei_machine run -b 50             # Max 50 inputs per request to each instance
   
   # LSH computation options
-  tei_machine run                   # Default: GPU acceleration enabled
-  tei_machine run --no-gpu-lsh      # Force CPU computation for LSH
+  tei_machine run --no-gpu-lsh      # Force CPU for LSH computation
   
   # Check discovered instances without starting server
   tei_machine discover              # List all discovered TEI instances
@@ -35,7 +34,6 @@ import argparse
 import asyncio
 import subprocess
 import re
-import time
 
 import httpx
 import numpy as np
@@ -50,16 +48,12 @@ from typing import Optional, Union
 from webu import setup_swagger_ui
 
 from .lsh import LSHConverter
-from .tei_scheduler import (
-    AdaptiveScheduler,
-    WorkerStats,
-    DistributionResult,
-    distribute_with_scheduler,
-)
+from .tei_compose import MAX_CLIENT_BATCH_SIZE
+from .tei_scheduler import IdleFillingScheduler, distribute_with_scheduler
 
 
 PORT = 28800
-BATCH_SIZE = 100
+BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Use value from tei_compose
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
 
 
@@ -373,10 +367,11 @@ class TEIMachineServer:
         self._health_task: Optional[asyncio.Task] = None
         self._lsh_cache = LSHConverterCache(use_gpu=use_gpu_lsh)
 
-        # Adaptive scheduler for EFT-based distribution
-        self.scheduler = AdaptiveScheduler(
+        # Idle-filling scheduler for simple load balancing
+        self.scheduler = IdleFillingScheduler(
             workers=instances,
             get_worker_id=lambda inst: inst.container_name,
+            max_batch_size=batch_size,
         )
 
         # Create FastAPI app
@@ -549,9 +544,9 @@ class TEIMachineServer:
         truncate: bool,
     ) -> list[list[float]]:
         """
-        Distribute inputs using adaptive scheduler with EFT-based load balancing.
+        Distribute inputs using idle-filling scheduler.
 
-        Uses micro-batching and online metrics for optimal distribution.
+        Simple approach: assign batches to idle workers, wait if all busy.
         """
         # Update scheduler with current healthy instances
         self.scheduler.update_workers(instances)
@@ -575,7 +570,6 @@ class TEIMachineServer:
             scheduler=self.scheduler,
             inputs=inputs,
             process_func=process_on_instance,
-            use_chars=True,
         )
 
         return embeddings
