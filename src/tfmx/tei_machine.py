@@ -63,7 +63,8 @@ from .tei_scheduler import (
 
 PORT = 28800
 BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Use value from tei_compose
-MICRO_BATCH_SIZE = 100  # Probe batch size for adaptive scheduling (small for quick measurement)
+# Probe batch size for adaptive scheduling (small for quick measurement)
+MICRO_BATCH_SIZE = 100
 MIN_BATCH_SIZE = 50  # Minimum batch size
 MAX_BATCH_SIZE = 500  # Maximum batch size
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
@@ -617,8 +618,8 @@ class TEIMachineServer:
         # Print performance analysis periodically
         if self.enable_perf_tracking:
             self._request_counter += 1
-            if self._request_counter % 10 == 0:  # Every 10 requests
-                self.perf_tracker.print_analysis()
+            # if self._request_counter % 10 == 0:
+            #     self.perf_tracker.print_analysis()
 
         return embeddings
 

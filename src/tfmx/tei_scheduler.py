@@ -870,12 +870,6 @@ async def distribute_with_adaptive_pipeline(
     pending_tasks: set[asyncio.Task] = set()
     session_start = time.time()
 
-    # Check if we have historical throughput data
-    has_history = all(
-        scheduler.states.get(scheduler.get_worker_id(w), WorkerState("")).throughput > 0
-        for w in scheduler.workers
-    )
-
     # Input queue tracking
     remaining_start = 0
     batch_counter = 0
@@ -897,29 +891,6 @@ async def distribute_with_adaptive_pipeline(
         else:
             # Equal distribution if no data
             return {wid: 1.0 / n_workers for wid in throughputs}
-
-    def calculate_batch_size(state: WorkerState, remaining: int, n_pending: int) -> int:
-        """Calculate optimal batch size for a worker."""
-        ratios = get_throughput_ratios()
-        worker_ratio = ratios.get(state.worker_id, 1.0 / n_workers)
-
-        # How many workers are still working (including this one)?
-        active_workers = n_pending + 1
-
-        # This worker's share of remaining work
-        # Adjust for how many workers are active
-        if active_workers >= n_workers:
-            # All workers active: use full ratio
-            target = int(remaining * worker_ratio)
-        else:
-            # Some workers done: this worker takes proportionally more
-            target = int(
-                remaining * worker_ratio / (active_workers * worker_ratio + 0.001)
-            )
-
-        # Clamp to bounds
-        batch_size = max(min_batch_size, min(target, max_batch_size, remaining))
-        return batch_size
 
     async def process_batch(
         worker: W,
@@ -984,48 +955,41 @@ async def distribute_with_adaptive_pipeline(
                 latency=latency,
             )
 
-    # ===== Phase 1: Probe or use history =====
-    if not has_history:
-        # No historical data: send probe batches to all workers
-        idle_workers = scheduler.get_idle_workers()
-        probe_size = min(probe_batch_size, len(inputs) // max(n_workers, 1))
-        probe_size = max(min_batch_size, probe_size)
+    # ===== Adaptive Pipeline (No Barrier, Dynamic Batch Size) =====
+    # Key insight: Don't use fixed probe_batch_size. Instead:
+    # 1. Start with fair share based on total items and workers
+    # 2. Adjust dynamically based on measured throughput
+    # 3. Never wait for all workers - true pipeline
 
-        for worker, state in idle_workers:
-            if remaining_start >= len(inputs):
-                break
+    def calculate_initial_batch_size(remaining: int, n_idle: int) -> int:
+        """Calculate initial batch size when no throughput data available."""
+        # Fair share among idle workers
+        fair_share = remaining // max(n_idle, 1)
+        # Use a reasonable portion (1/2) of fair share for initial probe
+        # This leaves room for other workers while still being substantial
+        initial = max(fair_share // 2, min_batch_size)
+        return min(initial, max_batch_size, remaining)
 
-            start_idx = remaining_start
-            end_idx = min(start_idx + probe_size, len(inputs))
-            chunk = inputs[start_idx:end_idx]
-            remaining_start = end_idx
-            batch_counter += 1
+    def calculate_adaptive_batch_size(
+        state: WorkerState, remaining: int, n_idle: int
+    ) -> int:
+        """Calculate batch size based on worker's throughput."""
+        # Get throughput ratios
+        ratios = get_throughput_ratios()
+        worker_ratio = ratios.get(state.worker_id, 1.0 / n_workers)
 
-            state.mark_busy()
-            task = asyncio.create_task(
-                process_batch(worker, state, chunk, start_idx, end_idx, batch_counter)
-            )
-            task._batch_start_idx = start_idx  # type: ignore
-            pending_tasks.add(task)
+        # Base: this worker's share of remaining work
+        # Adjusted by throughput ratio (faster workers get more)
+        target = int(remaining * worker_ratio)
 
-        # Wait for all probe batches to complete
-        if pending_tasks:
-            done, pending_tasks = await asyncio.wait(pending_tasks)
-            for task in done:
-                try:
-                    result = task.result()
-                    results_map[result.start_idx] = result
-                except Exception as e:
-                    start_idx = getattr(task, "_batch_start_idx", 0)
-                    results_map[start_idx] = DistributionResult(
-                        worker_id="unknown",
-                        start_idx=start_idx,
-                        end_idx=start_idx,
-                        error=e,
-                        latency=0,
-                    )
+        # But also ensure we don't starve other workers
+        # Limit to fair share among currently idle workers
+        fair_share = remaining // max(n_idle, 1)
+        target = min(target, fair_share)
 
-    # ===== Phase 2: Adaptive distribution =====
+        # Clamp to bounds
+        return max(min_batch_size, min(target, max_batch_size, remaining))
+
     while remaining_start < len(inputs) or pending_tasks:
         # Assign work to idle workers
         while remaining_start < len(inputs):
@@ -1035,10 +999,15 @@ async def distribute_with_adaptive_pipeline(
 
             worker, state = idle_workers[0]
             remaining = len(inputs) - remaining_start
-            n_pending = len(pending_tasks)
+            n_idle = len(idle_workers)
 
-            # Calculate adaptive batch size
-            batch_size = calculate_batch_size(state, remaining, n_pending)
+            # Calculate batch size based on whether we have throughput data
+            if state.throughput == 0:
+                # No throughput data: use initial sizing
+                batch_size = calculate_initial_batch_size(remaining, n_idle)
+            else:
+                # Have throughput data: use adaptive sizing
+                batch_size = calculate_adaptive_batch_size(state, remaining, n_idle)
 
             start_idx = remaining_start
             end_idx = min(start_idx + batch_size, len(inputs))

@@ -7,3 +7,4 @@ weights/
 __pycache__
 *.log
 *.npy
+sync_codes.sh
