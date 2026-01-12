@@ -39,10 +39,39 @@ class MachineInfo:
     healthy_instances: int = 0
     total_instances: int = 0
 
+    # Throughput tracking (items per second) using EMA
+    _throughput_ema: float = 0.0
+    _ema_alpha: float = 0.3  # EMA smoothing factor
+    _total_items: int = 0
+    _total_latency: float = 0.0
+    _total_requests: int = 0
+
     @property
     def weight(self) -> int:
         """Weight for load balancing based on healthy instances."""
         return self.healthy_instances if self.healthy else 0
+
+    @property
+    def throughput(self) -> float:
+        """Get estimated throughput in items/second."""
+        return self._throughput_ema
+
+    def record_success(self, latency: float, n_items: int) -> None:
+        """Record a successful request and update throughput estimate."""
+        self._total_requests += 1
+        self._total_items += n_items
+        self._total_latency += latency
+
+        # Update throughput EMA
+        if latency > 0:
+            current_throughput = n_items / latency
+            if self._throughput_ema == 0:
+                self._throughput_ema = current_throughput
+            else:
+                self._throughput_ema = (
+                    self._ema_alpha * current_throughput
+                    + (1 - self._ema_alpha) * self._throughput_ema
+                )
 
 
 @dataclass
@@ -148,6 +177,61 @@ class TEIClients:
         if self.verbose:
             logger.okay(f"✓ TEIClients {action}: {message}")
 
+    def _get_throughput_ratios(
+        self, healthy: list[tuple[int, "TEIClient", MachineInfo]]
+    ) -> list[float]:
+        """Calculate throughput ratios for healthy machines.
+
+        Returns list of ratios (sums to 1.0) based on each machine's throughput.
+        If no throughput data available, returns equal ratios.
+        """
+        throughputs = [m.throughput for _, _, m in healthy]
+        total = sum(throughputs)
+
+        if total > 0:
+            return [t / total for t in throughputs]
+        else:
+            # No throughput data: equal distribution
+            n = len(healthy)
+            return [1.0 / n] * n
+
+    def _split_by_throughput(
+        self,
+        inputs: list[str],
+        healthy: list[tuple[int, "TEIClient", MachineInfo]],
+    ) -> list[tuple[int, "TEIClient", MachineInfo, list[str], int, int]]:
+        """Split inputs across machines proportionally to their throughput.
+
+        Returns list of (idx, client, machine_info, chunk, start_idx, end_idx) tuples.
+        """
+        ratios = self._get_throughput_ratios(healthy)
+        n_inputs = len(inputs)
+
+        # Calculate chunk sizes based on ratios
+        chunks_info = []
+        start = 0
+        remaining = n_inputs
+
+        for i, (idx, client, machine) in enumerate(healthy):
+            if i == len(healthy) - 1:
+                # Last machine gets all remaining
+                chunk_size = remaining
+            else:
+                # Proportional allocation
+                chunk_size = int(n_inputs * ratios[i])
+                chunk_size = min(chunk_size, remaining)  # Don't exceed remaining
+
+            end = start + chunk_size
+            chunk = inputs[start:end]
+
+            if chunk:  # Only include non-empty chunks
+                chunks_info.append((idx, client, machine, chunk, start, end))
+
+            start = end
+            remaining = n_inputs - start
+
+        return chunks_info
+
     def refresh_health(self) -> ClientsHealthResponse:
         """Refresh health status of all machines.
 
@@ -237,54 +321,75 @@ class TEIClients:
         normalize: bool,
         truncate: bool,
     ) -> list[list[float]]:
-        """Distribute embed requests using idle-filling scheduler."""
-        # Update scheduler with healthy clients
-        healthy_clients = [client for _, client, _ in healthy]
-        self.scheduler.update_workers(healthy_clients)
+        """Distribute embed requests across machines based on throughput ratios.
 
-        # Define async process function
-        # CRITICAL: Use asyncio.to_thread to run sync client.embed() in thread pool
-        # Without this, sync calls would block the event loop and run sequentially!
-        async def process_on_client(
-            client: TEIClient, chunk: list[str]
-        ) -> list[list[float]]:
-            import asyncio
-
-            return await asyncio.to_thread(
-                client.embed, chunk, normalize=normalize, truncate=truncate
-            )
-
-        # Use scheduler distribution with asyncio
+        Strategy:
+        1. Split inputs proportionally to each machine's throughput
+        2. Send requests to all machines in parallel
+        3. Update throughput estimates based on actual performance
+        4. Combine results in original order
+        """
         import asyncio
+        import time
 
-        embeddings, details = asyncio.run(
-            distribute_with_scheduler(
-                scheduler=self.scheduler,
-                inputs=inputs,
-                process_func=process_on_client,
-            )
-        )
+        # Split inputs based on throughput ratios
+        chunks_info = self._split_by_throughput(inputs, healthy)
 
-        # Update machine health on errors
-        for d in details:
-            if not d.success:
-                for m in self.machines:
-                    if m.endpoint == d.worker_id:
-                        m.healthy = False
-                        break
+        # Define async task for each machine
+        async def process_chunk(
+            client: TEIClient, machine: MachineInfo, chunk: list[str]
+        ) -> tuple[list[list[float]], float, int, MachineInfo, Exception | None]:
+            """Process a chunk on a machine."""
+            start_time = time.perf_counter()
+            try:
+                results = await asyncio.to_thread(
+                    client.embed, chunk, normalize=normalize, truncate=truncate
+                )
+                latency = time.perf_counter() - start_time
+                return (results, latency, len(chunk), machine, None)
+            except Exception as e:
+                latency = time.perf_counter() - start_time
+                return ([], latency, len(chunk), machine, e)
 
-        # Check for complete failure
-        successful = [d for d in details if d.success]
-        if not successful:
-            errors = [(d.worker_id, d.error) for d in details if not d.success]
+        # Run all requests in parallel
+        async def run_parallel():
+            tasks = [
+                process_chunk(client, machine, chunk)
+                for _, client, machine, chunk, _, _ in chunks_info
+            ]
+            return await asyncio.gather(*tasks)
+
+        results_list = asyncio.run(run_parallel())
+
+        # Process results: update throughput and collect outputs
+        all_results: list[tuple[int, int, list[list[float]]]] = []
+        errors = []
+
+        for i, (results, latency, n_items, machine, error) in enumerate(results_list):
+            _, _, _, _, start_idx, end_idx = chunks_info[i]
+
+            if error is None:
+                machine.record_success(latency, n_items)
+                all_results.append((start_idx, end_idx, results))
+            else:
+                machine.healthy = False
+                errors.append((machine.endpoint, error))
+
+        if not all_results:
             raise ValueError(f"All requests failed: {errors}")
+
+        # Sort by start_idx and combine results
+        all_results.sort(key=lambda x: x[0])
+        combined = []
+        for start_idx, end_idx, results in all_results:
+            combined.extend(results)
 
         self._log_okay(
             "embed",
-            f"n={len(embeddings)}, machines={len(set(d.worker_id for d in successful))}",
+            f"n={len(combined)}, machines={len(all_results)}",
         )
 
-        return embeddings
+        return combined
 
     def lsh(
         self,
@@ -347,56 +452,114 @@ class TEIClients:
         normalize: bool,
         truncate: bool,
     ) -> list[str]:
-        """Distribute LSH requests using idle-filling scheduler."""
-        # Update scheduler with healthy clients
-        healthy_clients = [client for _, client, _ in healthy]
-        self.scheduler.update_workers(healthy_clients)
+        """Distribute LSH requests across machines based on throughput ratios.
 
-        # Define async process function
-        # CRITICAL: Use asyncio.to_thread to run sync client.lsh() in thread pool
-        # Without this, sync calls would block the event loop and run sequentially!
-        async def process_on_client(client: TEIClient, chunk: list[str]) -> list[str]:
-            import asyncio
-
-            return await asyncio.to_thread(
-                client.lsh, chunk, bitn=bitn, normalize=normalize, truncate=truncate
-            )
-
-        # Use scheduler distribution with asyncio
+        Strategy:
+        1. Split inputs proportionally to each machine's throughput
+        2. Send requests to all machines in parallel
+        3. Update throughput estimates based on actual performance
+        4. Combine results in original order
+        """
         import asyncio
+        import time
 
-        hashes, details = asyncio.run(
-            distribute_with_scheduler(
-                scheduler=self.scheduler,
-                inputs=inputs,
-                process_func=process_on_client,
+        # Split inputs based on throughput ratios
+        chunks_info = self._split_by_throughput(inputs, healthy)
+
+        if self.verbose:
+            ratios = self._get_throughput_ratios(healthy)
+            logger.mesg(
+                f"[TEIClients] Distributing {len(inputs)} items across {len(healthy)} machines:"
             )
-        )
+            for i, (_, _, m, chunk, _, _) in enumerate(chunks_info):
+                logger.mesg(
+                    f"  {m.endpoint}: {len(chunk)} items "
+                    f"({ratios[i]*100:.1f}%, throughput={m.throughput:.0f}/s)"
+                )
 
-        # Update machine health on errors
-        for d in details:
-            if not d.success:
-                for m in self.machines:
-                    if m.endpoint == d.worker_id:
-                        m.healthy = False
-                        break
+        # Define async task for each machine
+        async def process_chunk(
+            client: TEIClient, machine: MachineInfo, chunk: list[str]
+        ) -> tuple[list[str], float, int, MachineInfo, Exception | None]:
+            """Process a chunk on a machine, return (results, latency, n_items, machine, error)."""
+            start_time = time.perf_counter()
+            try:
+                results = await asyncio.to_thread(
+                    client.lsh, chunk, bitn=bitn, normalize=normalize, truncate=truncate
+                )
+                latency = time.perf_counter() - start_time
+                return (results, latency, len(chunk), machine, None)
+            except Exception as e:
+                latency = time.perf_counter() - start_time
+                return ([], latency, len(chunk), machine, e)
+
+        # Run all requests in parallel
+        async def run_parallel():
+            tasks = [
+                process_chunk(client, machine, chunk)
+                for _, client, machine, chunk, _, _ in chunks_info
+            ]
+            return await asyncio.gather(*tasks)
+
+        results_list = asyncio.run(run_parallel())
+
+        # Process results: update throughput and collect outputs
+        all_results: list[tuple[int, int, list[str]]] = (
+            []
+        )  # (start_idx, end_idx, results)
+        errors = []
+
+        for i, (results, latency, n_items, machine, error) in enumerate(results_list):
+            _, _, _, _, start_idx, end_idx = chunks_info[i]
+
+            if error is None:
+                # Update throughput estimate
+                machine.record_success(latency, n_items)
+                all_results.append((start_idx, end_idx, results))
+
+                if self.verbose:
+                    throughput = n_items / latency if latency > 0 else 0
+                    logger.mesg(
+                        f"  {machine.endpoint}: {n_items} items in {latency*1000:.0f}ms "
+                        f"({throughput:.0f}/s, EMA={machine.throughput:.0f}/s)"
+                    )
+            else:
+                machine.healthy = False
+                errors.append((machine.endpoint, error))
 
         # Check for complete failure
-        successful = [d for d in details if d.success]
-        if not successful:
-            errors = [(d.worker_id, d.error) for d in details if not d.success]
+        if not all_results:
             raise ValueError(f"All requests failed: {errors}")
+
+        # Sort by start_idx and combine results
+        all_results.sort(key=lambda x: x[0])
+        combined = []
+        for start_idx, end_idx, results in all_results:
+            combined.extend(results)
 
         self._log_okay(
             "lsh",
-            f"n={len(hashes)}, bitn={bitn}, machines={len(set(d.worker_id for d in successful))}",
+            f"n={len(combined)}, bitn={bitn}, machines={len(all_results)}",
         )
 
-        return hashes
+        return combined
 
     def get_scheduler_stats(self) -> dict:
         """Get scheduler statistics."""
         return self.scheduler.get_stats_summary()
+
+    def get_machine_stats(self) -> list[dict]:
+        """Get throughput statistics for all machines."""
+        return [
+            {
+                "endpoint": m.endpoint,
+                "healthy": m.healthy,
+                "throughput": m.throughput,
+                "total_items": m._total_items,
+                "total_requests": m._total_requests,
+            }
+            for m in self.machines
+        ]
 
     def info(self) -> list[InfoResponse]:
         """Get info from all machines.
