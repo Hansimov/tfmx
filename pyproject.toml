@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfmx"
-version = "0.5.6"
+version = "0.6"
 authors = [
     { name="Hansimov" },
 ]
@@ -16,7 +16,7 @@ classifiers = [
     "Programming Language :: Python :: 3",
     "Operating System :: OS Independent",
 ]
-dependencies = [ "tclogger", "numpy", "requests", "fastapi", "uvicorn", "httpx", "webu" ]
+dependencies = [ "tclogger", "numpy", "requests", "fastapi", "uvicorn", "httpx", "webu", "orjson" ]
 
 [project.urls]
 Homepage = "https://github.com/Hansimov/tfmx"
