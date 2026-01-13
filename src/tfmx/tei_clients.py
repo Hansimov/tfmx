@@ -42,26 +42,35 @@ CONFIG_DIR = Path(__file__).parent
 
 
 class ExplorationConfig:
-    """Manages persistence of exploration results for batch size optimization.
+    """Manages persistence of exploration results for (batch_size, max_concurrent) optimization.
 
-    Stores optimal batch sizes per endpoint to avoid re-exploration on each run.
+    Stores optimal configurations per endpoint to avoid re-exploration on each run.
     Config file: <module_dir>/tei_clients.config.json
 
     Format:
+    ```
     {
-        "<config_hash>": {
-            "endpoints": ["http://localhost:28800", "http://ai122:28800"],
+        "b775a741a567": {
+            "endpoints": [ "http://localhost:28800", "http://ai122:28800" ],
             "machines": {
-                "localhost:28800": {
-                    "optimal_batch_size": 4750,
-                    "throughput": 1353.0,
-                    "instances": 2,
-                    "updated_at": "2026-01-13T12:00:00"
-                },
-                ...
+            "ai122:28800": {
+                "optimal_batch_size": 1750,
+                "optimal_max_concurrent": 10,
+                "throughput": 291.7,
+                "instances": 7,
+                "updated_at": "2026-01-14T07:40:23.804785"
+            },
+            "localhost:28800": {
+                "optimal_batch_size": 4750,
+                "optimal_max_concurrent": 2,
+                "throughput": 687.9,
+                "instances": 2,
+                "updated_at": "2026-01-14T07:42:50.538637"
+            }
             }
         }
     }
+    ```
     """
 
     CONFIG_FILE = "tei_clients.config.json"
@@ -129,6 +138,7 @@ class ExplorationConfig:
         endpoints: list[str],
         endpoint: str,
         optimal_batch_size: int,
+        optimal_max_concurrent: int,
         throughput: float,
         instances: int,
     ) -> None:
@@ -138,7 +148,8 @@ class ExplorationConfig:
             endpoints: Full list of endpoints
             endpoint: Specific endpoint
             optimal_batch_size: Discovered optimal batch size
-            throughput: Achieved throughput at optimal size
+            optimal_max_concurrent: Discovered optimal max concurrent requests
+            throughput: Achieved throughput at optimal configuration
             instances: Number of GPU instances
         """
         from datetime import datetime
@@ -154,6 +165,7 @@ class ExplorationConfig:
 
         self._config[config_key]["machines"][machine_key] = {
             "optimal_batch_size": optimal_batch_size,
+            "optimal_max_concurrent": optimal_max_concurrent,
             "throughput": round(throughput, 1),
             "instances": instances,
             "updated_at": datetime.now().isoformat(),
@@ -197,8 +209,12 @@ class MachineState:
     Similar to WorkerState in tei_scheduler.py but for machine-level scheduling.
     Tracks:
     - Busy/idle status for pipeline scheduling
-    - Optimal batch size discovery via exploration
+    - Optimal (batch_size, max_concurrent) discovery via two-phase exploration
     - Real-time throughput estimation (EMA)
+
+    Two-Phase Exploration:
+    - Phase 1: Explore batch_size with fixed max_concurrent=6
+    - Phase 2: Explore max_concurrent with the optimal batch_size from Phase 1
     """
 
     endpoint: str
@@ -219,13 +235,15 @@ class MachineState:
     # Concurrent request tracking for pipeline scheduling
     # Allow multiple concurrent requests to utilize all GPUs on the machine
     _active_requests: int = 0
-    _max_concurrent: int = 2  # Default, will be updated based on healthy_instances
+    _max_concurrent: int = 6  # Default, will be optimized during exploration
 
-    # Optimal batch size tracking
-    # Start with default, then adapt based on performance
+    # Optimal configuration (result of exploration)
     optimal_batch_size: int = MAX_CLIENT_BATCH_SIZE
+    optimal_max_concurrent: int = 6
     _batch_size_min: int = 500  # Minimum batch size to try
     _batch_size_max: int = 5000  # Maximum batch size to try
+    _max_concurrent_min: int = 2  # Minimum max_concurrent to try
+    _max_concurrent_max: int = 20  # Maximum max_concurrent to try
 
     # Throughput tracking (EMA for real-time estimation)
     _throughput_ema: float = 0.0  # items/second
@@ -237,78 +255,152 @@ class MachineState:
     _total_latency: float = 0.0
     _total_requests: int = 0
 
-    # Batch size exploration state
-    _exploring: bool = True  # Whether we're still exploring batch sizes
-    _explore_sizes: list[int] = field(default_factory=list)  # Sizes to try
-    _explore_index: int = 0  # Current index in explore_sizes
-    _explore_results: dict = field(default_factory=dict)  # size -> [throughputs]
-    _explore_samples_per_size: int = 3  # Samples to collect per size before moving on
-    _explore_step: int = 250  # Step size for exploration (MAX_CLIENT_BATCH_SIZE / 2)
+    # Two-phase exploration state
+    _exploring: bool = True  # Whether we're still exploring
+    _explore_phase: int = 1  # 1 = batch_size, 2 = max_concurrent
+    _explore_values: list[int] = field(default_factory=list)  # Values to try
+    _explore_index: int = 0  # Current index in explore_values
+    _explore_results: dict = field(default_factory=dict)  # value -> [throughputs]
+    _explore_samples_per_value: int = 3  # Samples to collect per value
+    _explore_step: int = 250  # Step size for batch_size exploration
     _explore_n_instances: int = 1  # Number of instances for this machine
-    _explore_min_size: int = 0  # Minimum size to explore before allowing early stop
+    _explore_min_value: int = 0  # Minimum value to explore before allowing early stop
     _explore_decline_count: int = 0  # Consecutive decline count
-    _explore_decline_max: int = (
-        3  # Max consecutive declines before stopping (after min_size)
-    )
+    _explore_decline_max: int = 3  # Max consecutive declines before stopping
     _best_throughput: float = 0.0  # Best throughput found during exploration
+    _phase1_best_batch: int = 0  # Best batch size from phase 1
+    _phase1_best_throughput: float = 0.0  # Best throughput from phase 1
 
     def initialize_exploration(self, n_instances: int) -> None:
-        """Initialize batch size exploration based on number of GPU instances.
+        """Initialize three-phase exploration based on number of GPU instances.
+
+        Phase 1: Explore batch_size with max_concurrent = n_instances
+        Phase 2: Explore max_concurrent with optimal batch_size from Phase 1
+        Phase 3: Refine batch_size with optimal max_concurrent from Phase 2
 
         Args:
             n_instances: Number of healthy GPU instances for this machine
         """
+        self._explore_n_instances = n_instances
+        self._explore_phase = 1
+        self._exploring = True
+
+        # Initialize Phase 1: batch_size exploration
+        self._init_phase1_batch_exploration()
+
+    def _init_phase1_batch_exploration(self) -> None:
+        """Initialize Phase 1: batch_size exploration with max_concurrent = n_instances.
+
+        Use exactly n_instances concurrent requests to ensure each GPU gets work,
+        which gives a more accurate baseline for batch_size exploration.
+        """
         # Use finer granularity: half of MAX_CLIENT_BATCH_SIZE
         step_size = MAX_CLIENT_BATCH_SIZE // 2  # 250
+        self._explore_step = step_size
 
         # Start exploration from step_size, no upper limit yet
-        # We'll dynamically add more sizes as exploration progresses
         # Initial range: from step_size up to 2x instances * MAX_CLIENT_BATCH_SIZE
-        initial_max = n_instances * MAX_CLIENT_BATCH_SIZE * 2
+        initial_max = self._explore_n_instances * MAX_CLIENT_BATCH_SIZE * 2
 
-        self._explore_sizes = []
+        self._explore_values = []
         for size in range(step_size, initial_max + 1, step_size):
             if size <= self._batch_size_max:
-                self._explore_sizes.append(size)
+                self._explore_values.append(size)
 
-        # Ensure we have at least one size
-        if not self._explore_sizes:
-            self._explore_sizes = [step_size]
+        # Ensure we have at least one value
+        if not self._explore_values:
+            self._explore_values = [step_size]
 
-        # Store step size for dynamic extension
-        self._explore_step = step_size
-        self._explore_n_instances = n_instances
-
-        # Minimum size to explore before allowing early stop
-        # Must explore up to n_instances * MAX_CLIENT_BATCH_SIZE before considering stopping
-        self._explore_min_size = n_instances * MAX_CLIENT_BATCH_SIZE
-
-        # Reset decline counter
-        self._explore_decline_count = 0
-
-        # Start with first size for exploration
-        self.optimal_batch_size = self._explore_sizes[0]
+        # Minimum value to explore before allowing early stop
+        self._explore_min_value = self._explore_n_instances * MAX_CLIENT_BATCH_SIZE
 
         # Reset exploration state
         self._explore_index = 0
-        self._explore_results = {size: [] for size in self._explore_sizes}
-        self._exploring = True
+        self._explore_results = {v: [] for v in self._explore_values}
+        self._explore_decline_count = 0
+
+        # Start with first value
+        # Use n_instances as max_concurrent to ensure each GPU gets exactly one request
+        self.optimal_batch_size = self._explore_values[0]
+        self._max_concurrent = self._explore_n_instances
+
+    def _init_phase2_concurrent_exploration(self) -> None:
+        """Initialize Phase 2: max_concurrent exploration with optimal batch_size from Phase 1."""
+        self._explore_phase = 2
+
+        # Use the optimal batch_size from Phase 1
+        # max_concurrent range: n_instances to 20, step of 2
+        # Start from n_instances since we need at least one concurrent request per GPU
+        start = max(self._max_concurrent_min, self._explore_n_instances)
+        # Ensure start is even for consistent step
+        if start % 2 != 0:
+            start += 1
+        self._explore_values = list(range(start, self._max_concurrent_max + 1, 2))
+
+        # Minimum value before allowing early stop
+        self._explore_min_value = start
+
+        # Reset exploration state
+        self._explore_index = 0
+        self._explore_results = {v: [] for v in self._explore_values}
+        self._explore_decline_count = 0
+
+        # Start with first value (n_instances)
+        self._max_concurrent = self._explore_values[0]
+
+    def _init_phase3_batch_refinement(self) -> None:
+        """Initialize Phase 3: batch_size refinement with optimal max_concurrent.
+
+        Use the optimal max_concurrent from Phase 2 to refine batch_size.
+        This explores around the Phase 1 best batch_size with finer granularity.
+        """
+        self._explore_phase = 3
+
+        # Get the Phase 1 best batch as center point
+        center = self._phase1_best_batch
+        step_size = MAX_CLIENT_BATCH_SIZE // 4  # 125 (finer granularity)
+
+        # Explore range: center - 2*step to center + 4*step
+        # Bias towards larger batches since more concurrent requests can handle them
+        min_val = max(self._batch_size_min, center - 2 * step_size)
+        max_val = min(self._batch_size_max, center + 4 * step_size)
+
+        self._explore_values = list(range(min_val, max_val + 1, step_size))
+
+        # Remove the center value if it exists (already tested in Phase 1)
+        # Actually keep it for comparison, but it will be quick since we have prior data
+
+        # Minimum value before allowing early stop: center point
+        self._explore_min_value = center
+
+        # Reset exploration state
+        self._explore_index = 0
+        self._explore_results = {v: [] for v in self._explore_values}
+        self._explore_decline_count = 0
+
+        # Start with first value, keep optimal_max_concurrent from Phase 2
+        self.optimal_batch_size = self._explore_values[0]
 
     def get_next_batch_size(self) -> int:
         """Get the batch size to use for next request.
 
-        During exploration, cycles through different sizes to test.
-        After exploration, returns the optimal batch size.
+        During Phase 1: cycles through different batch sizes
+        During Phase 2: returns the optimal batch size from Phase 1
+        During Phase 3: cycles through batch sizes for refinement
+        After exploration: returns the final optimal batch size
         """
         if not self._exploring:
             return self.optimal_batch_size
 
-        # If exploration not initialized, return default
-        if not self._explore_sizes:
+        if self._explore_phase == 2:
+            # Phase 2: fixed batch_size, exploring max_concurrent
             return self.optimal_batch_size
 
-        # Return current exploration size
-        return self._explore_sizes[self._explore_index]
+        # Phase 1 or 3: exploring batch sizes
+        if not self._explore_values:
+            return self.optimal_batch_size
+
+        return self._explore_values[self._explore_index]
 
     @property
     def is_idle(self) -> bool:
@@ -345,30 +437,20 @@ class MachineState:
         """Weight for load balancing based on healthy instances."""
         return self.healthy_instances if self.healthy else 0
 
-    def update_max_concurrent(self) -> None:
-        """Update max concurrent requests based on healthy instances.
+    def get_current_max_concurrent(self) -> int:
+        """Get the max_concurrent value to use for current request.
 
-        Strategy: Keep 6 requests in flight to ensure server queue is never empty:
-        - 1 being processed by the server (holding the lock)
-        - 4-5 waiting in server's lock queue (ready to start immediately)
-
-        Analysis:
-        - embed time ~340ms per 1000-item batch
-        - client-side overhead per request: ~200ms
-          - buffer.get_batch(): ~10-20ms (pulling 1000 strings from iterator)
-          - JSON serialization: ~30-50ms (for ~200KB payload)
-          - network round trip: ~40-60ms
-          - response parsing: ~20-40ms
-        - total request cycle: ~540ms (embed + overhead)
-
-        With 6 concurrent:
-        - Even when 4 requests complete nearly simultaneously (wave effect),
-        - Client can prepare and send 4 new requests (~200ms total)
-        - Meanwhile, 2 remaining requests keep server busy
-        - Server queue depth: typically 4-5 requests waiting
-        - This breaks the "wave" pattern and keeps GPU continuously fed
+        During Phase 2 exploration: cycles through different values
+        Otherwise: returns the current _max_concurrent
         """
-        self._max_concurrent = 6
+        if self._exploring and self._explore_phase == 2 and self._explore_values:
+            return self._explore_values[self._explore_index]
+        return self._max_concurrent
+
+    def update_max_concurrent_from_exploration(self) -> None:
+        """Update _max_concurrent during Phase 2 exploration."""
+        if self._exploring and self._explore_phase == 2 and self._explore_values:
+            self._max_concurrent = self._explore_values[self._explore_index]
 
     def mark_busy(self) -> None:
         """Increment active request count."""
@@ -400,29 +482,39 @@ class MachineState:
                     + (1 - self._ema_alpha) * self._latency_ema
                 )
 
-            # Record for batch size exploration
-            if self._exploring and self._explore_sizes:
-                current_size = self._explore_sizes[self._explore_index]
-                self._explore_results[current_size].append(current_throughput)
+            # Record for exploration (supports both phases)
+            if self._exploring and self._explore_values:
+                current_value = self._explore_values[self._explore_index]
+                self._explore_results[current_value].append(current_throughput)
 
-                # Check if we have enough samples for this size
+                # Check if we have enough samples for this value
                 if (
-                    len(self._explore_results[current_size])
-                    >= self._explore_samples_per_size
+                    len(self._explore_results[current_value])
+                    >= self._explore_samples_per_value
                 ):
                     # Check if we should stop exploration (performance dropped)
                     if self._should_stop_exploration():
                         self._finalize_exploration()
                     else:
-                        # Move to next size
+                        # Move to next value
                         self._explore_index += 1
 
-                        # If we've exhausted current sizes, try extending
-                        if self._explore_index >= len(self._explore_sizes):
+                        # If we've exhausted current values, try extending
+                        if self._explore_index >= len(self._explore_values):
                             if self._try_extend_exploration():
-                                pass  # Continue with new size
+                                pass  # Continue with new value
                             else:
                                 self._finalize_exploration()
+
+                        # Phase 2: Update _max_concurrent when exploring index changes
+                        if (
+                            self._exploring
+                            and self._explore_phase == 2
+                            and self._explore_index < len(self._explore_values)
+                        ):
+                            self._max_concurrent = self._explore_values[
+                                self._explore_index
+                            ]
 
         # NOTE: mark_idle() is NOT called here anymore.
         # The caller is responsible for calling mark_idle() after record_success().
@@ -432,34 +524,39 @@ class MachineState:
         """Check if exploration should stop due to performance drop.
 
         Logic:
-        1. Never stop before reaching _explore_min_size (n_instances * MAX_CLIENT_BATCH_SIZE)
-        2. After min_size, track consecutive declines from best throughput
-        3. If performance recovers (within 5% of best), reset decline counter
-        4. Stop after _explore_decline_max (3) consecutive declines
+        1. Phase 1 (batch_size): Never stop before reaching _explore_min_value
+        2. Phase 2 (max_concurrent): No minimum constraint (range is small)
+        3. Phase 3 (batch_size refinement): No minimum constraint (fixed range)
+        4. Track consecutive declines from best throughput
+        5. If performance recovers (within 5% of best), reset decline counter
+        6. Stop after _explore_decline_max (3) consecutive declines
         """
         if len(self._explore_results) < 2:
             return False
 
-        # Get average throughputs for tested sizes
-        size_throughputs = {}
-        for size, throughputs in self._explore_results.items():
+        # Get average throughputs for tested values
+        value_throughputs = {}
+        for value, throughputs in self._explore_results.items():
             if throughputs:
-                size_throughputs[size] = sum(throughputs) / len(throughputs)
+                value_throughputs[value] = sum(throughputs) / len(throughputs)
 
-        if len(size_throughputs) < 2:
+        if len(value_throughputs) < 2:
             return False
 
-        # Get current (last tested) size
-        tested_sizes = sorted([s for s in size_throughputs.keys()])
-        current_size = tested_sizes[-1]
+        # Get current (last tested) value
+        tested_values = sorted([v for v in value_throughputs.keys()])
+        current_value = tested_values[-1]
 
-        # Never stop before reaching minimum exploration size
-        if current_size < self._explore_min_size:
-            return False
+        # Phase-specific minimum checks
+        if self._explore_phase == 1:
+            # Phase 1: Never stop before reaching minimum batch size
+            if current_value < self._explore_min_value:
+                return False
+        # Phase 2 & 3: No minimum constraint
 
         # Find best throughput so far
-        best_throughput = max(size_throughputs.values())
-        current_throughput = size_throughputs[current_size]
+        best_throughput = max(value_throughputs.values())
+        current_throughput = value_throughputs[current_value]
 
         # Check if current is a decline (>5% worse than best)
         drop_threshold = 0.95
@@ -471,74 +568,125 @@ class MachineState:
             # Performance recovered, reset counter
             self._explore_decline_count = 0
 
-        # Stop after N consecutive declines (only after min_size)
+        # Stop after N consecutive declines
         if self._explore_decline_count >= self._explore_decline_max:
             return True
 
         return False
 
     def _try_extend_exploration(self) -> bool:
-        """Try to extend exploration with larger batch sizes.
+        """Try to extend exploration with more values.
 
-        Returns True if a new size was added, False if we've hit the limit.
+        Phase 1: Extend batch_size range
+        Phase 2: Extend max_concurrent range
+        Phase 3: No extension (fixed range around Phase 1 best)
+
+        Returns True if a new value was added, False if we've hit the limit.
         """
-        if not self._explore_sizes:
+        if not self._explore_values:
             return False
 
-        # Get the largest size we've tried
-        max_tried = max(self._explore_sizes)
-
-        # Calculate next size
-        next_size = max_tried + self._explore_step
-
-        # Check if we've hit the absolute max
-        if next_size > self._batch_size_max:
+        # Phase 3 has fixed range, no extension
+        if self._explore_phase == 3:
             return False
 
-        # Add the new size
-        self._explore_sizes.append(next_size)
-        self._explore_results[next_size] = []
+        # Get the largest value we've tried
+        max_tried = max(self._explore_values)
+
+        if self._explore_phase == 1:
+            # Phase 1: Extend batch_size
+            next_value = max_tried + self._explore_step
+            max_limit = self._batch_size_max
+        else:
+            # Phase 2: Extend max_concurrent (step=2)
+            next_value = max_tried + 2
+            max_limit = self._max_concurrent_max
+
+        # Check if we've hit the limit
+        if next_value > max_limit:
+            return False
+
+        # Add the new value
+        self._explore_values.append(next_value)
+        self._explore_results[next_value] = []
 
         return True
 
     def _finalize_exploration(self) -> None:
-        """Analyze exploration results and select optimal batch size."""
+        """Analyze exploration results and handle phase transitions.
+
+        Phase 1: Find best batch_size (with max_concurrent = n_instances), then start Phase 2
+        Phase 2: Find best max_concurrent (with Phase 1 batch_size), then start Phase 3
+        Phase 3: Refine batch_size (with Phase 2 max_concurrent), then finish
+        """
         if not self._explore_results:
             return
 
-        # Find batch size with best average throughput
-        best_batch = self.optimal_batch_size
+        endpoint_short = self.endpoint.split("/")[-1].split(":")[0]
+
+        # Find best value with best average throughput
+        best_value = 0
         best_throughput = 0.0
 
-        for batch_size, throughputs in self._explore_results.items():
+        for value, throughputs in self._explore_results.items():
             if not throughputs:
                 continue
             avg_throughput = sum(throughputs) / len(throughputs)
             if avg_throughput > best_throughput:
                 best_throughput = avg_throughput
-                best_batch = batch_size
+                best_value = value
 
-        if best_batch > 0:
-            self.optimal_batch_size = best_batch
+        if self._explore_phase == 1:
+            # Phase 1 complete: Save best batch_size and start Phase 2
+            if best_value > 0:
+                self._phase1_best_batch = best_value
+                self._phase1_best_throughput = best_throughput
+                self.optimal_batch_size = best_value
 
-        self._exploring = False
-        self._best_throughput = best_throughput  # Store for config saving
+            logger.file(
+                f"[{endpoint_short}] Phase 1 done: optimal_batch={self.optimal_batch_size}, "
+                f"throughput={best_throughput:.0f}/s. Starting Phase 2..."
+            )
 
-        # Log exploration result
-        endpoint_short = self.endpoint.split("/")[-1].split(":")[0]
-        logger.success(
-            f"[{endpoint_short}] Exploration done: optimal_batch={self.optimal_batch_size}, "
-            f"throughput={best_throughput:.0f}/s"
-        )
+            # Start Phase 2: Explore max_concurrent
+            self._init_phase2_concurrent_exploration()
 
-        # Save config immediately when exploration completes
-        self._save_config_if_available()
+        elif self._explore_phase == 2:
+            # Phase 2 complete: Save best max_concurrent and start Phase 3
+            if best_value > 0:
+                self.optimal_max_concurrent = best_value
+                self._max_concurrent = best_value
+
+            logger.file(
+                f"[{endpoint_short}] Phase 2 done: optimal_max_concurrent={self.optimal_max_concurrent}, "
+                f"throughput={best_throughput:.0f}/s. Starting Phase 3..."
+            )
+
+            # Start Phase 3: Refine batch_size with optimal max_concurrent
+            self._init_phase3_batch_refinement()
+
+        else:
+            # Phase 3 complete: Save best batch_size and finish
+            if best_value > 0:
+                self.optimal_batch_size = best_value
+
+            self._exploring = False
+            self._best_throughput = best_throughput
+
+            logger.okay(
+                f"[{endpoint_short}] Explore done: optimal_batch={self.optimal_batch_size}, "
+                f"optimal_max_concurrent={self.optimal_max_concurrent}, "
+                f"throughput={best_throughput:.0f}/s"
+            )
+
+            # Save config with both optimal values
+            self._save_config_if_available()
 
     def load_from_config(self, config: dict) -> bool:
-        """Load optimal batch size from saved config, skipping exploration.
+        """Load optimal batch size and max_concurrent from saved config, skipping exploration.
 
         Args:
-            config: Dict with optimal_batch_size, throughput, instances
+            config: Dict with optimal_batch_size, optimal_max_concurrent, throughput, instances
 
         Returns:
             True if config was loaded and exploration skipped
@@ -548,6 +696,7 @@ class MachineState:
 
         saved_instances = config.get("instances", 0)
         saved_batch = config.get("optimal_batch_size", 0)
+        saved_max_concurrent = config.get("optimal_max_concurrent", 0)
         saved_throughput = config.get("throughput", 0.0)
 
         # Only use saved config if instances match (GPU configuration unchanged)
@@ -565,10 +714,18 @@ class MachineState:
             self._exploring = False
             self._best_throughput = saved_throughput
 
+            # Load optimal_max_concurrent if available
+            if saved_max_concurrent > 0:
+                self.optimal_max_concurrent = saved_max_concurrent
+                self._max_concurrent = saved_max_concurrent
+            else:
+                # Fallback: calculate based on instances
+                self._max_concurrent = max(6, self.healthy_instances * 2)
+
             endpoint_short = self.endpoint.split("/")[-1].split(":")[0]
             logger.okay(
                 f"[{endpoint_short}] Loaded config: optimal_batch={saved_batch}, "
-                f"throughput={saved_throughput:.0f}/s"
+                f"max_concurrent={self._max_concurrent}, throughput={saved_throughput:.0f}/s"
             )
             return True
 
@@ -587,7 +744,7 @@ class MachineState:
         self._endpoints_list = endpoints_list
 
     def _save_config_if_available(self) -> None:
-        """Save current optimal batch size to config if saver is available."""
+        """Save current optimal config to file if saver is available."""
         if (
             self._config_saver
             and self._endpoints_list
@@ -598,24 +755,53 @@ class MachineState:
                 endpoints=self._endpoints_list,
                 endpoint=self.endpoint,
                 optimal_batch_size=self.optimal_batch_size,
+                optimal_max_concurrent=self.optimal_max_concurrent,
                 throughput=self._best_throughput,
                 instances=self.healthy_instances,
             )
 
-    def to_dict(self) -> dict:
-        """Convert to dictionary for serialization."""
-        return {
+    def to_dict(self, elapsed_time: float = 0.0) -> dict:
+        """Convert to dictionary for serialization.
+
+        Args:
+            elapsed_time: Total elapsed time in seconds for calculating cumulative throughput.
+                         If 0, uses total_latency as fallback.
+        """
+        # Calculate cumulative throughput (actual throughput during the session)
+        if elapsed_time > 0:
+            cumulative_throughput = self._total_items / elapsed_time
+        elif self._total_latency > 0:
+            # Fallback: use total latency (sum of individual request latencies)
+            # Note: This underestimates throughput when requests run in parallel
+            cumulative_throughput = self._total_items / self._total_latency
+        else:
+            cumulative_throughput = 0.0
+
+        result = {
             "endpoint": self.endpoint,
             "healthy": self.healthy,
             "healthy_instances": self.healthy_instances,
             "active_requests": self._active_requests,
             "max_concurrent": self._max_concurrent,
             "optimal_batch_size": self.optimal_batch_size,
+            "optimal_max_concurrent": self.optimal_max_concurrent,
             "throughput_ema": round(self._throughput_ema, 1),
+            "throughput": round(
+                cumulative_throughput, 1
+            ),  # Actual cumulative throughput
             "latency_ema_ms": round(self._latency_ema * 1000, 1),
             "total_items": self._total_items,
             "total_requests": self._total_requests,
         }
+
+        # Add exploration status if exploring
+        if self._exploring:
+            result["exploring_phase"] = self._explore_phase
+            result["exploring_index"] = (
+                f"{self._explore_index + 1}/{len(self._explore_values)}"
+            )
+
+        return result
 
 
 class IteratorBuffer:
@@ -684,6 +870,14 @@ class IteratorBuffer:
     def total_hint(self) -> int | None:
         """Hint for total number of items (may be None)."""
         return self._total_hint
+
+    @property
+    def remaining_hint(self) -> int | None:
+        """Estimate of remaining items (may be None if total_hint not provided)."""
+        if self._total_hint is None:
+            return None
+        with self._lock:
+            return max(0, self._total_hint - self._total_pulled)
 
 
 class MachineScheduler:
@@ -913,12 +1107,9 @@ class TEIClients:
                 machine.healthy_instances = health.healthy
                 machine.total_instances = health.total
 
-                # Update max concurrent requests based on GPU count
-                machine.update_max_concurrent()
-
                 # Initialize exploration if machine became healthy or instances changed
                 if machine.healthy and (
-                    not was_healthy or machine._explore_sizes == []
+                    not was_healthy or machine._explore_values == []
                 ):
                     # Try to load saved config if skip_exploration is enabled
                     config_loaded = False
@@ -936,7 +1127,7 @@ class TEIClients:
                         logger.mesg(
                             f"[{endpoint_short}] {machine.healthy_instances} GPUs, "
                             f"max_concurrent={machine._max_concurrent}, "
-                            f"exploring sizes: {machine._explore_sizes}"
+                            f"exploring Phase {machine._explore_phase}: {machine._explore_values}"
                         )
             except Exception:
                 machine.healthy = False
@@ -1069,6 +1260,11 @@ class TEIClients:
 
             session_start = time.perf_counter()
 
+            # Calculate total capacity for tail optimization
+            total_machine_capacity = sum(
+                m.optimal_batch_size * m._max_concurrent for m in healthy
+            )
+
             while input_index < n_inputs or pending_tasks:
                 # Try to assign work to idle machines
                 while input_index < n_inputs:
@@ -1076,10 +1272,23 @@ class TEIClients:
                     if not machine:
                         break
 
-                    # Get batch size (uses exploration logic)
-                    batch_size = min(
-                        machine.get_next_batch_size(), n_inputs - input_index
-                    )
+                    # Get base batch size
+                    batch_size = machine.get_next_batch_size()
+
+                    # Tail optimization: reduce batch size for better distribution
+                    remaining = n_inputs - input_index
+                    if remaining < total_machine_capacity:
+                        total_idle_slots = sum(
+                            m.available_slots for m in healthy if m.healthy
+                        )
+                        if total_idle_slots > 0:
+                            ideal_batch = (
+                                remaining + total_idle_slots - 1
+                            ) // total_idle_slots
+                            batch_size = max(100, min(batch_size, ideal_batch))
+
+                    # Limit to remaining inputs
+                    batch_size = min(batch_size, remaining)
                     if batch_size <= 0:
                         break
 
@@ -1127,9 +1336,21 @@ class TEIClients:
 
                     # Prepare new batch data (but don't create task yet)
                     if input_index < n_inputs and machine.is_idle:
-                        batch_size = min(
-                            machine.get_next_batch_size(), n_inputs - input_index
-                        )
+                        batch_size = machine.get_next_batch_size()
+
+                        # Tail optimization
+                        remaining = n_inputs - input_index
+                        if remaining < total_machine_capacity:
+                            total_idle_slots = sum(
+                                m.available_slots for m in healthy if m.healthy
+                            )
+                            if total_idle_slots > 0:
+                                ideal_batch = (
+                                    remaining + total_idle_slots - 1
+                                ) // total_idle_slots
+                                batch_size = max(100, min(batch_size, ideal_batch))
+
+                        batch_size = min(batch_size, remaining)
                         if batch_size > 0:
                             start_idx_new = input_index
                             chunk = inputs[input_index : input_index + batch_size]
@@ -1182,7 +1403,7 @@ class TEIClients:
         # Log stats
         if self.verbose:
             throughput = len(combined) / total_time if total_time > 0 else 0
-            logger.success(
+            logger.okay(
                 f"[Pipeline] embed: {len(combined)} items in {total_time*1000:.0f}ms "
                 f"({throughput:.0f}/s), recent_avg={self.machine_scheduler.recent_throughput:.0f}/s"
             )
@@ -1371,6 +1592,11 @@ class TEIClients:
                     }
                     return orjson.dumps(payload)
 
+                # Calculate total capacity for tail optimization
+                total_machine_capacity = sum(
+                    m.optimal_batch_size * m._max_concurrent for m in healthy
+                )
+
                 while not buffer.exhausted or pending_tasks:
                     # Try to assign work to idle machines
                     while not buffer.exhausted:
@@ -1380,6 +1606,23 @@ class TEIClients:
 
                         # Get batch size (uses exploration logic)
                         batch_size = machine.get_next_batch_size()
+
+                        # Tail optimization: reduce batch size when remaining items are limited
+                        # This ensures better distribution across all available instances
+                        remaining = buffer.remaining_hint
+                        if remaining is not None and remaining < total_machine_capacity:
+                            # Calculate how many idle slots are available across all machines
+                            total_idle_slots = sum(
+                                m.available_slots for m in healthy if m.healthy
+                            )
+                            if total_idle_slots > 0:
+                                # Distribute remaining items evenly across idle slots
+                                # Use ceiling division to ensure all items are assigned
+                                ideal_batch = (
+                                    remaining + total_idle_slots - 1
+                                ) // total_idle_slots
+                                # Use smaller batch but not smaller than reasonable minimum
+                                batch_size = max(100, min(batch_size, ideal_batch))
 
                         # Pull a batch from the iterator
                         start_idx, chunk = buffer.get_batch(batch_size)
@@ -1441,6 +1684,22 @@ class TEIClients:
                         # Prepare new batch data (but don't create task yet)
                         if not buffer.exhausted and machine.is_idle:
                             batch_size = machine.get_next_batch_size()
+
+                            # Tail optimization: reduce batch size for better distribution
+                            remaining = buffer.remaining_hint
+                            if (
+                                remaining is not None
+                                and remaining < total_machine_capacity
+                            ):
+                                total_idle_slots = sum(
+                                    m.available_slots for m in healthy if m.healthy
+                                )
+                                if total_idle_slots > 0:
+                                    ideal_batch = (
+                                        remaining + total_idle_slots - 1
+                                    ) // total_idle_slots
+                                    batch_size = max(100, min(batch_size, ideal_batch))
+
                             start_idx_new, chunk = buffer.get_batch(batch_size)
                             if chunk:
                                 # Pre-serialize JSON payload
@@ -1551,9 +1810,13 @@ class TEIClients:
         """Get scheduler statistics."""
         return self.machine_scheduler.get_stats()
 
-    def get_machine_stats(self) -> list[dict]:
-        """Get statistics for all machines."""
-        return [m.to_dict() for m in self.machines]
+    def get_machine_stats(self, elapsed_time: float = 0.0) -> list[dict]:
+        """Get statistics for all machines.
+
+        Args:
+            elapsed_time: Total elapsed time for calculating cumulative throughput.
+        """
+        return [m.to_dict(elapsed_time=elapsed_time) for m in self.machines]
 
     def info(self) -> list[InfoResponse]:
         """Get info from all machines.
