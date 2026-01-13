@@ -125,6 +125,19 @@ class MachineStats(BaseModel):
     requests_per_instance: dict[str, int] = Field(
         default_factory=dict, description="Request count per instance"
     )
+    # Inter-request gap statistics (in milliseconds)
+    inter_request_gap_avg_ms: Optional[float] = Field(
+        None, description="Average inter-request gap in milliseconds"
+    )
+    inter_request_gap_min_ms: Optional[float] = Field(
+        None, description="Minimum inter-request gap in milliseconds"
+    )
+    inter_request_gap_max_ms: Optional[float] = Field(
+        None, description="Maximum inter-request gap in milliseconds"
+    )
+    inter_request_gap_samples: int = Field(
+        0, description="Number of inter-request gap samples collected"
+    )
 
 
 class InfoResponse(BaseModel):
@@ -190,13 +203,34 @@ class TEIMachineStatsData:
     total_errors: int = 0
     requests_per_instance: dict = field(default_factory=dict)
 
-    def to_model(self) -> MachineStats:
-        """Convert to Pydantic model."""
+    def to_model(
+        self, inter_request_gaps: Optional[list[float]] = None
+    ) -> MachineStats:
+        """Convert to Pydantic model.
+
+        Args:
+            inter_request_gaps: List of inter-request gap times in milliseconds
+        """
+        # Calculate gap statistics if data available
+        gap_avg = None
+        gap_min = None
+        gap_max = None
+        gap_samples = 0
+        if inter_request_gaps and len(inter_request_gaps) > 0:
+            gap_samples = len(inter_request_gaps)
+            gap_avg = sum(inter_request_gaps) / gap_samples
+            gap_min = min(inter_request_gaps)
+            gap_max = max(inter_request_gaps)
+
         return MachineStats(
             total_requests=self.total_requests,
             total_inputs=self.total_inputs,
             total_errors=self.total_errors,
             requests_per_instance=self.requests_per_instance,
+            inter_request_gap_avg_ms=round(gap_avg, 2) if gap_avg else None,
+            inter_request_gap_min_ms=round(gap_min, 2) if gap_min else None,
+            inter_request_gap_max_ms=round(gap_max, 2) if gap_max else None,
+            inter_request_gap_samples=gap_samples,
         )
 
 
@@ -390,6 +424,11 @@ class TEIMachineServer:
             name="tei_machine", verbose=enable_perf_tracking
         )
         self._request_counter = 0
+
+        # Inter-request gap tracking (time between consecutive requests)
+        self._last_lsh_end_time: Optional[float] = None
+        self._inter_request_gaps: list[float] = []  # in milliseconds
+        self._gap_window_size: int = 100  # Keep last N gaps for rolling stats
 
         # Pipeline mode (eliminates round barrier)
         self.use_pipeline = use_pipeline
@@ -648,7 +687,7 @@ class TEIMachineServer:
         return InfoResponse(
             port=self.port,
             instances=[inst.to_info() for inst in self.instances],
-            stats=self.stats.to_model(),
+            stats=self.stats.to_model(inter_request_gaps=self._inter_request_gaps),
             scheduler_stats=self.scheduler.get_stats_summary(),
         )
 
@@ -657,6 +696,15 @@ class TEIMachineServer:
         import time as _time
 
         t0 = _time.perf_counter()
+
+        # Calculate inter-request gap (time since last request finished)
+        inter_request_gap_ms: Optional[float] = None
+        if self._last_lsh_end_time is not None:
+            inter_request_gap_ms = (t0 - self._last_lsh_end_time) * 1000
+            self._inter_request_gaps.append(inter_request_gap_ms)
+            # Keep only last N gaps for rolling stats
+            if len(self._inter_request_gaps) > self._gap_window_size:
+                self._inter_request_gaps.pop(0)
 
         # Normalize inputs to list
         inputs = request.inputs
@@ -701,6 +749,9 @@ class TEIMachineServer:
 
             t4 = _time.perf_counter()
 
+            # Record end time for next request's gap calculation
+            self._last_lsh_end_time = t4
+
             # Log detailed timing if perf tracking enabled
             if self.enable_perf_tracking:
                 total = (t4 - t0) * 1000
@@ -708,10 +759,22 @@ class TEIMachineServer:
                 array_conv = (t3 - t2) * 1000
                 lsh_time = (t4 - t3) * 1000
                 overhead = (t1 - t0) * 1000
+
+                # Build gap info string
+                gap_info = ""
+                if inter_request_gap_ms is not None:
+                    gap_info = f", gap={inter_request_gap_ms:.1f}ms"
+                    # Add rolling average if we have enough samples
+                    if len(self._inter_request_gaps) >= 3:
+                        avg_gap = sum(self._inter_request_gaps) / len(
+                            self._inter_request_gaps
+                        )
+                        gap_info += f" (avg={avg_gap:.1f}ms)"
+
                 logger.mesg(
                     f"[LSH timing] n={len(inputs)}, total={total:.1f}ms | "
                     f"embed={embed_time:.1f}ms, np.array={array_conv:.1f}ms, "
-                    f"lsh={lsh_time:.1f}ms, overhead={overhead:.1f}ms"
+                    f"lsh={lsh_time:.1f}ms, overhead={overhead:.1f}ms{gap_info}"
                 )
 
             return lsh_hashes
