@@ -407,6 +407,7 @@ class TEIMachineServer:
         use_gpu_lsh: bool = True,
         enable_perf_tracking: bool = False,
         use_pipeline: bool = True,  # Use pipeline scheduling by default
+        batch_wait_ms: float = 5.0,  # Time to wait for more requests before processing
     ):
         self.instances = instances
         self.port = port
@@ -425,20 +426,31 @@ class TEIMachineServer:
         )
         self._request_counter = 0
 
-        # Inter-request gap tracking (time between consecutive requests)
-        self._last_lsh_end_time: Optional[float] = None
+        # Inter-request ARRIVAL gap tracking (time between consecutive request arrivals)
+        self._last_arrival_time: Optional[float] = None
         self._inter_request_gaps: list[float] = []  # in milliseconds
         self._gap_window_size: int = 100  # Keep last N gaps for rolling stats
 
         # Pipeline mode (eliminates round barrier)
         self.use_pipeline = use_pipeline
 
-        # Idle-filling scheduler for simple load balancing
+        # Shared scheduler for load balancing across requests
         self.scheduler = IdleFillingScheduler(
             workers=instances,
             get_worker_id=lambda inst: inst.container_name,
             max_batch_size=batch_size,
         )
+
+        # Lock for serializing GPU access - multiple concurrent requests would
+        # compete for the same GPUs, causing severe performance degradation
+        self._scheduler_lock: Optional[asyncio.Lock] = None
+        self._pending_requests: int = 0  # Counter for requests waiting/processing
+
+        # Request batching: collect multiple requests and process together
+        self._batch_wait_ms = batch_wait_ms
+        self._batch_queue: list[tuple[list[str], asyncio.Future]] = []
+        self._batch_lock: Optional[asyncio.Lock] = None
+        self._batch_processing: bool = False
 
         # Create FastAPI app
         self.app = self._create_app()
@@ -497,6 +509,12 @@ class TEIMachineServer:
         """Manage application lifecycle."""
         # Startup
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+
+        # Initialize the scheduler lock (must be done in async context)
+        self._scheduler_lock = asyncio.Lock()
+
+        # Initialize batch lock
+        self._batch_lock = asyncio.Lock()
 
         # Initial health check
         await self.health_check_all()
@@ -572,10 +590,11 @@ class TEIMachineServer:
             )
 
         try:
-            # Use adaptive scheduler for distribution
-            embeddings = await self._distribute_with_scheduler(
-                inputs, healthy, request.normalize, request.truncate
-            )
+            # Use lock to serialize GPU access
+            async with self._scheduler_lock:
+                embeddings = await self._distribute_with_scheduler(
+                    inputs, healthy, request.normalize, request.truncate
+                )
             return embeddings
 
         except Exception as e:
@@ -614,6 +633,9 @@ class TEIMachineServer:
 
         Uses adaptive pipeline by default for optimal heterogeneous GPU utilization,
         or falls back to fixed pipeline/round-based scheduling if disabled.
+
+        NOTE: Uses shared scheduler with lock protection. Multiple concurrent
+        requests competing for GPUs causes severe performance degradation.
         """
         # Update scheduler with current healthy instances
         self.scheduler.update_workers(instances)
@@ -657,8 +679,6 @@ class TEIMachineServer:
         # Print performance analysis periodically
         if self.enable_perf_tracking:
             self._request_counter += 1
-            # if self._request_counter % 10 == 0:
-            #     self.perf_tracker.print_analysis()
 
         return embeddings
 
@@ -691,20 +711,59 @@ class TEIMachineServer:
             scheduler_stats=self.scheduler.get_stats_summary(),
         )
 
+    async def _process_lsh_batch(
+        self,
+        all_inputs: list[str],
+        healthy: list,
+        normalize: bool,
+        truncate: bool,
+        bitn: int,
+    ) -> list[list[float]]:
+        """Process a batch of inputs for LSH.
+
+        Returns embeddings (to be converted to LSH hashes by caller).
+        """
+        import time as _time
+
+        t1 = _time.perf_counter()
+
+        embeddings = await self._distribute_with_scheduler(
+            all_inputs, healthy, normalize, truncate
+        )
+
+        t2 = _time.perf_counter()
+
+        if self.enable_perf_tracking:
+            logger.mesg(
+                f"[Batch embed] n={len(all_inputs)}, time={((t2-t1)*1000):.1f}ms"
+            )
+
+        return embeddings
+
     async def lsh(self, request: LSHRequest) -> list[str]:
-        """Handle LSH requests: embed + LSH conversion to hex strings."""
+        """Handle LSH requests: embed + LSH conversion to hex strings.
+
+        Uses dynamic batching: requests arriving while another is processing
+        will be queued and processed together in the next batch.
+        """
         import time as _time
 
         t0 = _time.perf_counter()
 
-        # Calculate inter-request gap (time since last request finished)
+        # Calculate inter-request ARRIVAL gap (time since last request ARRIVED)
+        # This measures how frequently requests are coming in, regardless of processing
         inter_request_gap_ms: Optional[float] = None
-        if self._last_lsh_end_time is not None:
-            inter_request_gap_ms = (t0 - self._last_lsh_end_time) * 1000
+        if self._last_arrival_time is not None:
+            inter_request_gap_ms = (t0 - self._last_arrival_time) * 1000
             self._inter_request_gaps.append(inter_request_gap_ms)
             # Keep only last N gaps for rolling stats
             if len(self._inter_request_gaps) > self._gap_window_size:
                 self._inter_request_gaps.pop(0)
+        # Update arrival time IMMEDIATELY (before processing)
+        self._last_arrival_time = t0
+
+        # Track pending requests (for monitoring queue depth)
+        self._pending_requests += 1
 
         # Normalize inputs to list
         inputs = request.inputs
@@ -712,6 +771,7 @@ class TEIMachineServer:
             inputs = [inputs]
 
         if not inputs:
+            self._pending_requests -= 1
             raise HTTPException(status_code=400, detail="No inputs provided")
 
         self.stats.total_requests += 1
@@ -720,22 +780,25 @@ class TEIMachineServer:
         # Get healthy instances
         healthy = self.get_healthy_instances()
         if not healthy:
+            self._pending_requests -= 1
             self.stats.total_errors += 1
             raise HTTPException(
                 status_code=503, detail="No healthy instances available"
             )
 
         try:
-            t1 = _time.perf_counter()
+            # Use lock to serialize GPU access - concurrent requests would compete
+            # for GPUs and cause severe performance degradation
+            async with self._scheduler_lock:
+                t1 = _time.perf_counter()
 
-            # Get embeddings from TEI instances
-            embeddings = await self._distribute_with_scheduler(
-                inputs, healthy, request.normalize, request.truncate
-            )
+                embeddings = await self._distribute_with_scheduler(
+                    inputs, healthy, request.normalize, request.truncate
+                )
 
-            t2 = _time.perf_counter()
+                t2 = _time.perf_counter()
 
-            # Convert to numpy array for vectorized LSH
+            # Convert to numpy array for vectorized LSH (outside lock)
             embs_array = np.array(embeddings, dtype=np.float32)
             dims = embs_array.shape[1]
 
@@ -749,8 +812,8 @@ class TEIMachineServer:
 
             t4 = _time.perf_counter()
 
-            # Record end time for next request's gap calculation
-            self._last_lsh_end_time = t4
+            # Note: _last_arrival_time is updated at REQUEST ARRIVAL (not end)
+            # This gives us inter-arrival time instead of inter-completion time
 
             # Log detailed timing if perf tracking enabled
             if self.enable_perf_tracking:
@@ -758,12 +821,11 @@ class TEIMachineServer:
                 embed_time = (t2 - t1) * 1000
                 array_conv = (t3 - t2) * 1000
                 lsh_time = (t4 - t3) * 1000
-                overhead = (t1 - t0) * 1000
 
-                # Build gap info string
+                # Build gap info string - this is now ARRIVAL gap
                 gap_info = ""
                 if inter_request_gap_ms is not None:
-                    gap_info = f", gap={inter_request_gap_ms:.1f}ms"
+                    gap_info = f", arrival_gap={inter_request_gap_ms:.1f}ms"
                     # Add rolling average if we have enough samples
                     if len(self._inter_request_gaps) >= 3:
                         avg_gap = sum(self._inter_request_gaps) / len(
@@ -774,12 +836,14 @@ class TEIMachineServer:
                 logger.mesg(
                     f"[LSH timing] n={len(inputs)}, total={total:.1f}ms | "
                     f"embed={embed_time:.1f}ms, np.array={array_conv:.1f}ms, "
-                    f"lsh={lsh_time:.1f}ms, overhead={overhead:.1f}ms{gap_info}"
+                    f"lsh={lsh_time:.1f}ms{gap_info}"
                 )
 
+            self._pending_requests -= 1
             return lsh_hashes
 
         except Exception as e:
+            self._pending_requests -= 1
             self.stats.total_errors += 1
             logger.warn(f"× LSH error: {e}")
             raise HTTPException(status_code=500, detail=str(e))

@@ -22,6 +22,7 @@ import asyncio
 import hashlib
 import httpx
 import json
+import orjson  # Fast JSON serialization
 import os
 import threading
 import time
@@ -31,7 +32,7 @@ from pathlib import Path
 from tclogger import logger
 from typing import Union, Optional, Iterable, Iterator
 
-from .tei_client import TEIClient, InfoResponse, TIMEOUT
+from .tei_client import TEIClient, AsyncTEIClient, InfoResponse, TIMEOUT
 from .tei_compose import MAX_CLIENT_BATCH_SIZE
 from .tei_scheduler import IdleFillingScheduler, distribute_with_scheduler
 
@@ -201,7 +202,10 @@ class MachineState:
     """
 
     endpoint: str
-    client: TEIClient = field(repr=False)
+    client: TEIClient = field(repr=False)  # Sync client for health checks
+    async_client: AsyncTEIClient = field(
+        default=None, repr=False
+    )  # Async client for pipeline
 
     # Health status
     healthy: bool = False
@@ -212,8 +216,10 @@ class MachineState:
     _config_saver: Optional["ExplorationConfig"] = field(default=None, repr=False)
     _endpoints_list: list[str] = field(default_factory=list, repr=False)
 
-    # Busy/idle state for pipeline scheduling
-    busy: bool = False
+    # Concurrent request tracking for pipeline scheduling
+    # Allow multiple concurrent requests to utilize all GPUs on the machine
+    _active_requests: int = 0
+    _max_concurrent: int = 2  # Default, will be updated based on healthy_instances
 
     # Optimal batch size tracking
     # Start with default, then adapt based on performance
@@ -306,7 +312,23 @@ class MachineState:
 
     @property
     def is_idle(self) -> bool:
-        return not self.busy
+        """Check if machine can accept more requests."""
+        return self._active_requests < self._max_concurrent
+
+    @property
+    def busy(self) -> bool:
+        """Legacy property for compatibility."""
+        return self._active_requests >= self._max_concurrent
+
+    @property
+    def active_requests(self) -> int:
+        """Number of currently active requests."""
+        return self._active_requests
+
+    @property
+    def available_slots(self) -> int:
+        """Number of request slots available."""
+        return max(0, self._max_concurrent - self._active_requests)
 
     @property
     def throughput(self) -> float:
@@ -323,11 +345,38 @@ class MachineState:
         """Weight for load balancing based on healthy instances."""
         return self.healthy_instances if self.healthy else 0
 
+    def update_max_concurrent(self) -> None:
+        """Update max concurrent requests based on healthy instances.
+
+        Strategy: Keep 6 requests in flight to ensure server queue is never empty:
+        - 1 being processed by the server (holding the lock)
+        - 4-5 waiting in server's lock queue (ready to start immediately)
+
+        Analysis:
+        - embed time ~340ms per 1000-item batch
+        - client-side overhead per request: ~200ms
+          - buffer.get_batch(): ~10-20ms (pulling 1000 strings from iterator)
+          - JSON serialization: ~30-50ms (for ~200KB payload)
+          - network round trip: ~40-60ms
+          - response parsing: ~20-40ms
+        - total request cycle: ~540ms (embed + overhead)
+
+        With 6 concurrent:
+        - Even when 4 requests complete nearly simultaneously (wave effect),
+        - Client can prepare and send 4 new requests (~200ms total)
+        - Meanwhile, 2 remaining requests keep server busy
+        - Server queue depth: typically 4-5 requests waiting
+        - This breaks the "wave" pattern and keeps GPU continuously fed
+        """
+        self._max_concurrent = 6
+
     def mark_busy(self) -> None:
-        self.busy = True
+        """Increment active request count."""
+        self._active_requests += 1
 
     def mark_idle(self) -> None:
-        self.busy = False
+        """Decrement active request count."""
+        self._active_requests = max(0, self._active_requests - 1)
 
     def record_success(self, latency: float, n_items: int) -> None:
         """Record a successful request and update metrics."""
@@ -375,7 +424,9 @@ class MachineState:
                             else:
                                 self._finalize_exploration()
 
-        self.mark_idle()
+        # NOTE: mark_idle() is NOT called here anymore.
+        # The caller is responsible for calling mark_idle() after record_success().
+        # This avoids double-decrementing _active_requests.
 
     def _should_stop_exploration(self) -> bool:
         """Check if exploration should stop due to performance drop.
@@ -557,7 +608,8 @@ class MachineState:
             "endpoint": self.endpoint,
             "healthy": self.healthy,
             "healthy_instances": self.healthy_instances,
-            "busy": self.busy,
+            "active_requests": self._active_requests,
+            "max_concurrent": self._max_concurrent,
             "optimal_batch_size": self.optimal_batch_size,
             "throughput_ema": round(self._throughput_ema, 1),
             "latency_ema_ms": round(self._latency_ema * 1000, 1),
@@ -642,6 +694,7 @@ class MachineScheduler:
     2. Machines work independently in a pipeline (no round barriers)
     3. Idle machines immediately get new work
     4. Fast machines naturally process more batches
+    5. **NEW**: Allows multiple concurrent requests per machine to keep GPUs fed
 
     This is similar to IdleFillingScheduler but at the machine level.
     """
@@ -649,7 +702,7 @@ class MachineScheduler:
     def __init__(self, machines: list[MachineState]):
         self.machines = machines
 
-        # Event to signal when a machine becomes idle
+        # Event to signal when a machine becomes idle (has available slots)
         self._idle_event = asyncio.Event()
         self._idle_event.set()  # Initially all idle
 
@@ -658,25 +711,25 @@ class MachineScheduler:
         self._throughput_window: int = 10  # Window size for recent throughput
 
     def get_idle_machines(self) -> list[MachineState]:
-        """Get list of idle healthy machines."""
+        """Get list of healthy machines with available request slots."""
         return [m for m in self.machines if m.healthy and m.is_idle]
 
     def get_idle_machine(self) -> Optional[MachineState]:
-        """Get a single idle machine, preferring higher throughput ones."""
+        """Get a machine with available slots, preferring ones with more capacity."""
         idle = self.get_idle_machines()
         if not idle:
             self._idle_event.clear()
             return None
-        # Sort by throughput (highest first)
-        idle.sort(key=lambda m: m.throughput, reverse=True)
+        # Sort by: 1) available slots (more is better), 2) throughput (higher is better)
+        idle.sort(key=lambda m: (m.available_slots, m.throughput), reverse=True)
         return idle[0]
 
     def signal_idle(self) -> None:
-        """Signal that a machine has become idle."""
+        """Signal that a machine has become idle (has available slots)."""
         self._idle_event.set()
 
     async def wait_for_idle(self, timeout: float = 60.0) -> bool:
-        """Wait for a machine to become idle."""
+        """Wait for a machine to have available slots."""
         try:
             await asyncio.wait_for(self._idle_event.wait(), timeout=timeout)
             return True
@@ -702,6 +755,9 @@ class MachineScheduler:
             "machines": [m.to_dict() for m in self.machines],
             "recent_throughput": round(self.recent_throughput, 1),
             "healthy_count": sum(1 for m in self.machines if m.healthy),
+            "total_max_concurrent": sum(
+                m._max_concurrent for m in self.machines if m.healthy
+            ),
         }
 
 
@@ -773,16 +829,24 @@ class TEIClients:
         # Exploration config manager
         self._exploration_config = ExplorationConfig()
 
-        # Create underlying clients for each endpoint
+        # Create underlying clients for each endpoint (sync for health checks)
         self.clients: list[TEIClient] = [
             TEIClient(endpoint=ep, timeout=timeout, verbose=verbose)
             for ep in self.endpoints
         ]
 
+        # Create async clients for each endpoint (for high-throughput pipeline)
+        self.async_clients: list[AsyncTEIClient] = [
+            AsyncTEIClient(endpoint=ep, timeout=timeout, verbose=verbose)
+            for ep in self.endpoints
+        ]
+
         # Machine states for pipeline scheduling
         self.machines: list[MachineState] = [
-            MachineState(endpoint=ep, client=client)
-            for ep, client in zip(self.endpoints, self.clients)
+            MachineState(endpoint=ep, client=sync_client, async_client=async_client)
+            for ep, sync_client, async_client in zip(
+                self.endpoints, self.clients, self.async_clients
+            )
         ]
 
         # Set config saver for all machines (for automatic config persistence)
@@ -803,9 +867,14 @@ class TEIClients:
         )
 
     def close(self) -> None:
-        """Close all HTTP clients."""
+        """Close all HTTP clients (sync clients only, async closed in pipeline)."""
         for client in self.clients:
             client.close()
+
+    async def aclose(self) -> None:
+        """Close all async HTTP clients."""
+        for async_client in self.async_clients:
+            await async_client.close()
 
     def __enter__(self) -> "TEIClients":
         return self
@@ -844,6 +913,9 @@ class TEIClients:
                 machine.healthy_instances = health.healthy
                 machine.total_instances = health.total
 
+                # Update max concurrent requests based on GPU count
+                machine.update_max_concurrent()
+
                 # Initialize exploration if machine became healthy or instances changed
                 if machine.healthy and (
                     not was_healthy or machine._explore_sizes == []
@@ -863,6 +935,7 @@ class TEIClients:
                         endpoint_short = machine.endpoint.split("/")[-1].split(":")[0]
                         logger.mesg(
                             f"[{endpoint_short}] {machine.healthy_instances} GPUs, "
+                            f"max_concurrent={machine._max_concurrent}, "
                             f"exploring sizes: {machine._explore_sizes}"
                         )
             except Exception:
@@ -958,10 +1031,10 @@ class TEIClients:
         normalize: bool,
         truncate: bool,
     ) -> list[list[float]]:
-        """Distribute embed requests using pipeline scheduling.
+        """Distribute embed requests using pure async HTTP calls.
 
-        Each machine processes batches of its optimal size independently.
-        No round barriers - idle machines immediately get new work.
+        Uses AsyncTEIClient directly instead of asyncio.to_thread wrapper,
+        eliminating thread pool overhead and context switching delays.
         """
         n_inputs = len(inputs)
 
@@ -978,11 +1051,12 @@ class TEIClients:
         ) -> tuple[
             MachineState, int, list[list[float]] | None, float, Exception | None
         ]:
-            """Process a batch on a machine."""
+            """Process a batch on a machine using pure async HTTP."""
             task_start = time.perf_counter()
             try:
-                results = await asyncio.to_thread(
-                    machine.client.embed, chunk, normalize=normalize, truncate=truncate
+                # Use async client directly - no thread pool overhead!
+                results = await machine.async_client.embed(
+                    chunk, normalize=normalize, truncate=truncate
                 )
                 latency = time.perf_counter() - task_start
                 return (machine, start_idx, results, latency, None)
@@ -1020,6 +1094,10 @@ class TEIClients:
                     task._start_idx = start_idx  # type: ignore
                     pending_tasks.add(task)
 
+                # Yield to let initial tasks start their HTTP requests
+                if pending_tasks:
+                    await asyncio.sleep(0)
+
                 # If no pending tasks, we're done
                 if not pending_tasks:
                     break
@@ -1030,10 +1108,49 @@ class TEIClients:
                 )
                 pending_tasks = pending_tasks_new
 
-                # Process completed tasks
+                # OPTIMIZATION: First dispatch new requests, then process results
+                # This minimizes the gap between request completion and next request
+
+                # Step 1: Collect all completed results and prepare new batches
+                new_batches = []  # Store (machine, chunk, start_idx) for batch creation
+                completed_results = []
+
                 for task in done:
                     machine, start_idx, results, latency, error = task.result()
+                    completed_results.append(
+                        (machine, start_idx, results, latency, error)
+                    )
 
+                    # Mark idle FIRST
+                    machine.mark_idle()
+                    self.machine_scheduler.signal_idle()
+
+                    # Prepare new batch data (but don't create task yet)
+                    if input_index < n_inputs and machine.is_idle:
+                        batch_size = min(
+                            machine.get_next_batch_size(), n_inputs - input_index
+                        )
+                        if batch_size > 0:
+                            start_idx_new = input_index
+                            chunk = inputs[input_index : input_index + batch_size]
+                            input_index += batch_size
+                            new_batches.append((machine, chunk, start_idx_new))
+                            machine.mark_busy()  # Reserve the slot immediately
+
+                # Step 2: Create all new tasks at once (minimize gap between task creations)
+                for machine, chunk, start_idx_new in new_batches:
+                    new_task = asyncio.create_task(
+                        process_batch(machine, chunk, start_idx_new)
+                    )
+                    new_task._start_idx = start_idx_new  # type: ignore
+                    pending_tasks.add(new_task)
+
+                # Step 3: Single yield to let all new tasks start their HTTP requests
+                if new_batches:
+                    await asyncio.sleep(0)
+
+                # Step 4: Now process results (after new requests are dispatched)
+                for machine, start_idx, results, latency, error in completed_results:
                     if error is None and results is not None:
                         results_map[start_idx] = results
                         n_items = len(results)
@@ -1045,13 +1162,9 @@ class TEIClients:
                             self.machine_scheduler.record_throughput(throughput)
                     else:
                         machine.healthy = False
-                        machine.mark_idle()
                         errors.append(
                             (machine.endpoint, error or Exception("Unknown error"))
                         )
-
-                    # Signal that machine is idle
-                    self.machine_scheduler.signal_idle()
 
             return time.perf_counter() - session_start
 
@@ -1183,11 +1296,11 @@ class TEIClients:
         normalize: bool,
         truncate: bool,
     ) -> list[str]:
-        """Distribute LSH requests using pipeline scheduling with iterator input.
+        """Distribute LSH requests using pure async HTTP calls.
 
-        Each machine processes batches of its optimal size independently.
-        No round barriers - idle machines immediately get new work.
-        Batches are pulled from the iterator on-demand.
+        Uses AsyncTEIClient directly instead of asyncio.to_thread wrapper,
+        eliminating thread pool overhead and context switching delays.
+        This significantly reduces inter-request arrival gaps.
         """
         # Create buffer for thread-safe iterator access
         buffer = IteratorBuffer(inputs, total_hint)
@@ -1200,22 +1313,28 @@ class TEIClients:
         # Stats for logging
         batch_count = 0
 
+        # Create a shared async HTTP client for this pipeline session
+        # This is more efficient than creating one per request
+        shared_client: httpx.AsyncClient | None = None
+
         async def process_batch(
-            machine: MachineState,
             chunk: list[str],
             start_idx: int,
             batch_id: int,
+            machine: MachineState,
+            serialized_payload: bytes,  # Pre-serialized JSON payload
         ) -> tuple[MachineState, int, list[str] | None, float, int, Exception | None]:
-            """Process a batch on a machine."""
+            """Process a batch on a machine using shared async HTTP client."""
             task_start = time.perf_counter()
             try:
-                results = await asyncio.to_thread(
-                    machine.client.lsh,
-                    chunk,
-                    bitn=bitn,
-                    normalize=normalize,
-                    truncate=truncate,
+                # Use pre-serialized content to avoid blocking JSON serialization
+                resp = await shared_client.post(
+                    f"{machine.endpoint}/lsh",
+                    content=serialized_payload,
+                    headers={"Content-Type": "application/json"},
                 )
+                resp.raise_for_status()
+                results = resp.json()
                 latency = time.perf_counter() - task_start
                 return (machine, start_idx, results, latency, batch_id, None)
             except Exception as e:
@@ -1223,91 +1342,182 @@ class TEIClients:
                 return (machine, start_idx, None, latency, batch_id, e)
 
         async def run_pipeline():
-            nonlocal results_map, errors, batch_count, pending_tasks
+            nonlocal results_map, errors, batch_count, pending_tasks, shared_client
 
-            session_start = time.perf_counter()
-            total_processed = 0
-            last_log_pct = 0
-            log_interval_pct = 10  # Log every 10%
+            # Create shared async client for this pipeline session
+            # Configure connection limits to allow multiple concurrent requests to same host
+            limits = httpx.Limits(
+                max_keepalive_connections=10,
+                max_connections=20,
+            )
+            shared_client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout),
+                limits=limits,
+            )
 
-            while not buffer.exhausted or pending_tasks:
-                # Try to assign work to idle machines
-                while not buffer.exhausted:
-                    machine = self.machine_scheduler.get_idle_machine()
-                    if not machine:
+            try:
+                session_start = time.perf_counter()
+                total_processed = 0
+                last_log_pct = 0
+                log_interval_pct = 10  # Log every 10%
+
+                # Helper function to serialize payload using orjson (10x faster than json)
+                def serialize_payload(chunk: list[str]) -> bytes:
+                    payload = {
+                        "inputs": chunk,
+                        "bitn": bitn,
+                        "normalize": normalize,
+                        "truncate": truncate,
+                    }
+                    return orjson.dumps(payload)
+
+                while not buffer.exhausted or pending_tasks:
+                    # Try to assign work to idle machines
+                    while not buffer.exhausted:
+                        machine = self.machine_scheduler.get_idle_machine()
+                        if not machine:
+                            break
+
+                        # Get batch size (uses exploration logic)
+                        batch_size = machine.get_next_batch_size()
+
+                        # Pull a batch from the iterator
+                        start_idx, chunk = buffer.get_batch(batch_size)
+                        if not chunk:
+                            break  # Iterator exhausted
+
+                        batch_count += 1
+
+                        # Pre-serialize JSON payload (fast with orjson)
+                        serialized = serialize_payload(chunk)
+
+                        # Mark machine as busy and create task
+                        machine.mark_busy()
+                        task = asyncio.create_task(
+                            process_batch(
+                                chunk, start_idx, batch_count, machine, serialized
+                            )
+                        )
+                        task._start_idx = start_idx  # type: ignore
+                        pending_tasks.add(task)
+
+                    # Yield to let initial tasks start their HTTP requests
+                    if pending_tasks:
+                        await asyncio.sleep(0)
+
+                    # If no pending tasks, we're done
+                    if not pending_tasks:
                         break
 
-                    # Get batch size (uses exploration logic)
-                    batch_size = machine.get_next_batch_size()
-
-                    # Pull a batch from the iterator
-                    start_idx, chunk = buffer.get_batch(batch_size)
-                    if not chunk:
-                        break  # Iterator exhausted
-
-                    batch_count += 1
-
-                    # Mark machine as busy and create task
-                    machine.mark_busy()
-                    task = asyncio.create_task(
-                        process_batch(machine, chunk, start_idx, batch_count)
+                    # Wait for at least one task to complete
+                    done, pending_tasks_new = await asyncio.wait(
+                        pending_tasks, return_when=asyncio.FIRST_COMPLETED
                     )
-                    task._start_idx = start_idx  # type: ignore
-                    pending_tasks.add(task)
+                    pending_tasks = pending_tasks_new
 
-                # If no pending tasks, we're done
-                if not pending_tasks:
-                    break
+                    # OPTIMIZATION: First dispatch new requests, then process results
+                    # This minimizes the gap between request completion and next request
 
-                # Wait for at least one task to complete
-                done, pending_tasks_new = await asyncio.wait(
-                    pending_tasks, return_when=asyncio.FIRST_COMPLETED
-                )
-                pending_tasks = pending_tasks_new
+                    # Step 1: Collect all completed results and prepare new batches
+                    new_batches = (
+                        []
+                    )  # Store (machine, chunk, start_idx) for batch creation
+                    completed_results = (
+                        []
+                    )  # Store results for processing after dispatch
 
-                # Process completed tasks
-                for task in done:
-                    machine, start_idx, results, latency, batch_id, error = (
-                        task.result()
-                    )
-
-                    if error is None and results is not None:
-                        results_map[start_idx] = results
-                        n_items = len(results)
-                        total_processed += n_items
-                        machine.record_success(latency, n_items)
-
-                        # Record throughput
-                        if latency > 0:
-                            throughput = n_items / latency
-                            self.machine_scheduler.record_throughput(throughput)
-
-                        # Progress logging (only when total is known and large)
-                        if total_hint and total_hint >= 10000:
-                            current_pct = int(total_processed / total_hint * 100)
-                            if current_pct >= last_log_pct + log_interval_pct:
-                                elapsed = time.perf_counter() - session_start
-                                rate = total_processed / elapsed if elapsed > 0 else 0
-                                machine_stats = ", ".join(
-                                    f"{m.endpoint.split('/')[-1].split(':')[0]}:{m.throughput:.0f}/s"
-                                    for m in healthy
-                                )
-                                logger.mesg(
-                                    f"  [{current_pct:3d}%] {total_processed:,}/{total_hint:,} | "
-                                    f"{rate:,.0f}/s | {machine_stats}"
-                                )
-                                last_log_pct = current_pct
-                    else:
-                        machine.healthy = False
-                        machine.mark_idle()
-                        errors.append(
-                            (machine.endpoint, error or Exception("Unknown error"))
+                    for task in done:
+                        machine, start_idx, results, latency, batch_id, error = (
+                            task.result()
+                        )
+                        completed_results.append(
+                            (machine, start_idx, results, latency, batch_id, error)
                         )
 
-                    # Signal that machine is idle
-                    self.machine_scheduler.signal_idle()
+                        # Mark idle FIRST
+                        machine.mark_idle()
+                        self.machine_scheduler.signal_idle()
 
-            return time.perf_counter() - session_start
+                        # Prepare new batch data (but don't create task yet)
+                        if not buffer.exhausted and machine.is_idle:
+                            batch_size = machine.get_next_batch_size()
+                            start_idx_new, chunk = buffer.get_batch(batch_size)
+                            if chunk:
+                                # Pre-serialize JSON payload
+                                serialized = serialize_payload(chunk)
+                                new_batches.append(
+                                    (machine, chunk, start_idx_new, serialized)
+                                )
+                                machine.mark_busy()  # Reserve the slot immediately
+
+                    # Step 2: Create all new tasks at once (minimize gap between task creations)
+                    for machine, chunk, start_idx_new, serialized in new_batches:
+                        batch_count += 1
+                        new_task = asyncio.create_task(
+                            process_batch(
+                                chunk, start_idx_new, batch_count, machine, serialized
+                            )
+                        )
+                        new_task._start_idx = start_idx_new  # type: ignore
+                        pending_tasks.add(new_task)
+
+                    # Step 3: Single yield to let all new tasks start their HTTP requests
+                    if new_batches:
+                        await asyncio.sleep(0)
+
+                    # Step 4: Now process results (after new requests are dispatched)
+                    for (
+                        machine,
+                        start_idx,
+                        results,
+                        latency,
+                        batch_id,
+                        error,
+                    ) in completed_results:
+                        if error is None and results is not None:
+                            results_map[start_idx] = results
+                            n_items = len(results)
+                            total_processed += n_items
+                            machine.record_success(latency, n_items)
+
+                            # Record throughput
+                            if latency > 0:
+                                throughput = n_items / latency
+                                self.machine_scheduler.record_throughput(throughput)
+
+                            # Progress logging (only when total is known and large)
+                            if total_hint and total_hint >= 10000:
+                                current_pct = int(total_processed / total_hint * 100)
+                                if current_pct >= last_log_pct + log_interval_pct:
+                                    elapsed = time.perf_counter() - session_start
+                                    rate = (
+                                        total_processed / elapsed if elapsed > 0 else 0
+                                    )
+                                    # Show cumulative throughput (items / elapsed time) for each machine
+                                    machine_stats = ", ".join(
+                                        (
+                                            f"{m.endpoint.split('/')[-1].split(':')[0]}:"
+                                            f"{m._total_items / elapsed:.0f}/s"
+                                            if elapsed > 0
+                                            else "0/s"
+                                        )
+                                        for m in healthy
+                                    )
+                                    logger.mesg(
+                                        f"  [{current_pct:3d}%] {total_processed:,}/{total_hint:,} | "
+                                        f"{rate:,.0f}/s | {machine_stats}"
+                                    )
+                                    last_log_pct = current_pct
+                        else:
+                            machine.healthy = False
+                            errors.append(
+                                (machine.endpoint, error or Exception("Unknown error"))
+                            )
+
+                return time.perf_counter() - session_start
+            finally:
+                # Always close the shared client
+                await shared_client.aclose()
 
         # Run the pipeline
         total_time = asyncio.run(run_pipeline())

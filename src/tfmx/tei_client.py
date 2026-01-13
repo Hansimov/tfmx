@@ -389,6 +389,194 @@ class TEIClient:
             raise
 
 
+class AsyncTEIClient:
+    """Asynchronous client for TEI services.
+
+    Designed for high-throughput scenarios where multiple concurrent requests
+    are needed. Uses httpx.AsyncClient to avoid thread pool overhead.
+
+    Example:
+        async with AsyncTEIClient("http://localhost:28800") as client:
+            embs = await client.embed(["Hello", "World"])
+            hashes = await client.lsh(["Hello", "World"])
+    """
+
+    def __init__(
+        self,
+        endpoint: str = None,
+        host: str = HOST,
+        port: int = PORT,
+        timeout: float = TIMEOUT,
+        verbose: bool = False,
+    ):
+        """Initialize async TEI client.
+
+        Args:
+            endpoint: Full endpoint URL (e.g., "http://localhost:28800").
+                     If provided, host and port are ignored.
+            host: Server host (default: localhost)
+            port: Server port (default: 28800)
+            timeout: Request timeout in seconds (default: 60.0)
+            verbose: Enable verbose logging
+        """
+        if endpoint:
+            self.endpoint = endpoint.rstrip("/")
+        else:
+            self.endpoint = f"http://{host}:{port}"
+
+        self.timeout = timeout
+        self.verbose = verbose
+        self._client: httpx.AsyncClient | None = None
+
+    async def _get_client(self) -> httpx.AsyncClient:
+        """Get or create the async HTTP client."""
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+        return self._client
+
+    async def close(self) -> None:
+        """Close the HTTP client."""
+        if self._client is not None:
+            await self._client.aclose()
+            self._client = None
+
+    async def __aenter__(self) -> "AsyncTEIClient":
+        return self
+
+    async def __aexit__(self, *args) -> None:
+        await self.close()
+
+    def _log_fail(self, action: str, error: Exception) -> None:
+        """Log error message."""
+        if self.verbose:
+            logger.warn(f"× AsyncTEI {action} error: {error}")
+
+    def _log_okay(self, action: str, message: str) -> None:
+        """Log success message."""
+        if self.verbose:
+            logger.okay(f"✓ AsyncTEI {action}: {message}")
+
+    def _extract_error_detail(self, e: httpx.HTTPStatusError) -> str:
+        """Extract error detail from HTTP status error response."""
+        try:
+            return e.response.json().get("detail", str(e))
+        except Exception:
+            return str(e)
+
+    async def health(self) -> HealthResponse:
+        """Check health status of the TEI service.
+
+        Returns:
+            HealthResponse with status, healthy count, and total count.
+        """
+        client = await self._get_client()
+        try:
+            resp = await client.get(f"{self.endpoint}/health")
+            resp.raise_for_status()
+            data = resp.json()
+            result = HealthResponse.from_dict(data)
+            self._log_okay("health", f"status={result.status}")
+            return result
+        except httpx.HTTPStatusError as e:
+            try:
+                data = e.response.json()
+                if "detail" in data and isinstance(data["detail"], dict):
+                    return HealthResponse.from_dict(data["detail"])
+            except Exception:
+                pass
+            self._log_fail("health", e)
+            raise
+        except Exception as e:
+            self._log_fail("health", e)
+            raise
+
+    async def embed(
+        self,
+        inputs: Union[str, list[str]],
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[list[float]]:
+        """Generate embeddings for input texts.
+
+        Args:
+            inputs: Single text or list of texts to embed.
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of embedding vectors (list of floats).
+        """
+        if isinstance(inputs, str):
+            inputs = [inputs]
+
+        payload = {
+            "inputs": inputs,
+            "normalize": normalize,
+            "truncate": truncate,
+        }
+
+        client = await self._get_client()
+        try:
+            resp = await client.post(f"{self.endpoint}/embed", json=payload)
+            resp.raise_for_status()
+            embs = resp.json()
+            self._log_okay(
+                "embed",
+                f"n={len(embs)}, dims={len(embs[0]) if embs else 0}",
+            )
+            return embs
+        except httpx.HTTPStatusError as e:
+            error_detail = self._extract_error_detail(e)
+            self._log_fail("embed", error_detail)
+            raise ValueError(f"Embed failed: {error_detail}") from e
+        except Exception as e:
+            self._log_fail("embed", e)
+            raise
+
+    async def lsh(
+        self,
+        inputs: Union[str, list[str]],
+        bitn: int = 2048,
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[str]:
+        """Generate LSH hash hex strings for input texts.
+
+        Args:
+            inputs: Single text or list of texts.
+            bitn: Number of LSH hash bits (default: 2048, range: 64-8192)
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of hex strings representing LSH hashes.
+        """
+        if isinstance(inputs, str):
+            inputs = [inputs]
+
+        payload = {
+            "inputs": inputs,
+            "bitn": bitn,
+            "normalize": normalize,
+            "truncate": truncate,
+        }
+
+        client = await self._get_client()
+        try:
+            resp = await client.post(f"{self.endpoint}/lsh", json=payload)
+            resp.raise_for_status()
+            hashes = resp.json()
+            self._log_okay("lsh", f"n={len(hashes)}, bitn={bitn}")
+            return hashes
+        except httpx.HTTPStatusError as e:
+            error_detail = self._extract_error_detail(e)
+            self._log_fail("lsh", error_detail)
+            raise ValueError(f"LSH failed: {error_detail}") from e
+        except Exception as e:
+            self._log_fail("lsh", e)
+            raise
+
+
 class TEIClientArgParser:
     """Argument parser for TEI Client CLI."""
 
