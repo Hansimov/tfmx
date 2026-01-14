@@ -66,7 +66,7 @@ BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Use value from tei_compose
 # Probe batch size for adaptive scheduling (small for quick measurement)
 MICRO_BATCH_SIZE = 100
 MIN_BATCH_SIZE = 50  # Minimum batch size
-MAX_BATCH_SIZE = 500  # Maximum batch size
+MAX_BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Must match TEI container limit
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
 
 

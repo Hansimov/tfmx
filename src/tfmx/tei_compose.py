@@ -68,7 +68,7 @@ TEI_TAG = "86-1.8"  # Fallback
 TEI_IMAGE_BASE = "ghcr.io/huggingface/text-embeddings-inference"
 TEI_IMAGE_MIRROR = "m.daocloud.io"
 
-MAX_CLIENT_BATCH_SIZE = 500
+MAX_CLIENT_BATCH_SIZE = 300
 
 
 class GPUInfo:
@@ -325,7 +325,7 @@ class ComposeFileGenerator:
                 f'    - "32768"',
                 f"    - --max-client-batch-size",
                 f'    - "{MAX_CLIENT_BATCH_SIZE}"',
-                f"  restart: unless-stopped",
+                # f"  restart: unless-stopped",
                 f"  healthcheck:",
                 f'    test: ["CMD", "curl", "-f", "http://localhost:80/health"]',
                 f"    interval: 30s",
