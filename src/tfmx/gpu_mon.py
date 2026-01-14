@@ -207,18 +207,18 @@ class GPUMonitor:
 
     def display_curve(self, gpu_idx: Union[int, str]):
         """Display curve settings for GPU(s)"""
-        gpu_count = self.controller.get_gpu_count()
-        if gpu_count == 0:
+        gpu_indices = self.controller.get_gpu_indices()
+        if not gpu_indices:
             log_error("× No GPU found")
             return
 
         if is_str_and_all(gpu_idx):
-            indices = list(range(gpu_count))
+            indices = gpu_indices
         else:
             indices = [parse_idx(gpu_idx)]
 
         for idx in indices:
-            if idx is None or idx >= gpu_count:
+            if idx is None or idx not in gpu_indices:
                 continue
             curve = self.config.get_curve(idx)
             temp = self.controller.get_gpu_temp(idx)
@@ -238,18 +238,18 @@ class GPUMonitor:
         curve_points: list[tuple[int, int]],
     ):
         """Set curve for GPU(s)"""
-        gpu_count = self.controller.get_gpu_count()
-        if gpu_count == 0:
+        gpu_indices = self.controller.get_gpu_indices()
+        if not gpu_indices:
             log_error("× No GPU found")
             return
 
         if is_str_and_all(gpu_idx):
-            indices = list(range(gpu_count))
+            indices = gpu_indices
         else:
             indices = [parse_idx(gpu_idx)]
 
         for idx in indices:
-            if idx is None or idx >= gpu_count:
+            if idx is None or idx not in gpu_indices:
                 continue
             self.config.set_curve(idx, curve_points)
             if curve_points:
@@ -261,18 +261,18 @@ class GPUMonitor:
 
     def reset_to_auto(self, gpu_idx: Union[int, str]):
         """Reset GPU(s) to automatic control"""
-        gpu_count = self.controller.get_gpu_count()
-        if gpu_count == 0:
+        gpu_indices = self.controller.get_gpu_indices()
+        if not gpu_indices:
             log_error("× No GPU found")
             return
 
         if is_str_and_all(gpu_idx):
-            indices = list(range(gpu_count))
+            indices = gpu_indices
         else:
             indices = [parse_idx(gpu_idx)]
 
         for idx in indices:
-            if idx is None or idx >= gpu_count:
+            if idx is None or idx not in gpu_indices:
                 continue
             self.config.set_curve(idx, None)
             self.controller.set_auto_control(idx)
@@ -354,9 +354,10 @@ class GPUMonitor:
 
         self.running = True
         interval = self.config.get_interval()
-        gpu_count = self.controller.get_gpu_count()
+        gpu_indices = self.controller.get_gpu_indices()
 
         logger.note(f"  Starting GPU monitor (interval: {interval}s)")
+        logger.note(f"  Available GPUs: {gpu_indices}")
         logger.note(f"  Press Ctrl+C to stop")
 
         # Setup signal handler for graceful shutdown
@@ -369,7 +370,7 @@ class GPUMonitor:
 
         try:
             while self.running:
-                for gpu_idx in range(gpu_count):
+                for gpu_idx in gpu_indices:
                     if not self.running:
                         break
                     self.apply_curve_once(gpu_idx)
@@ -531,4 +532,4 @@ if __name__ == "__main__":
     # gpu_mon -c a:file           # Load curve from file and start monitoring
     # gpu_mon -c 0:auto           # Reset GPU 0 to automatic control
     # gpu_mon -c a:auto -s        # Reset all GPUs to auto and save config
-    # gpu_mon -c a:30-0/40-30/50-65/60-80/75-100 -s
+    # gpu_mon -c a:30-50/50-65/60-80/75-100 -s

@@ -246,6 +246,7 @@ class GPUControllerBase:
     def __init__(self, verbose: bool = True):
         self.verbose = verbose
         self._gpu_count = None
+        self._gpu_indices = None  # List of available GPU indices
         self._fan_count = None
         self._fans_per_gpu = 2  # Most GPUs have 2 fans
 
@@ -253,16 +254,64 @@ class GPUControllerBase:
         """Check if we have permission to control fans"""
         return check_nv_permission()
 
+    def get_gpu_indices(self) -> list[int]:
+        """Get list of available GPU indices.
+        Handles cases where some GPUs have errors (e.g., GPU6 offline).
+        Returns actual GPU indices that are accessible.
+        """
+        if self._gpu_indices is not None:
+            return self._gpu_indices
+
+        # Parse nvidia-smi --list-gpus output to get actual GPU indices
+        # Example output: "GPU 0: NVIDIA GeForce RTX 3080 (UUID: GPU-xxx)"
+        cmd = f"{NV_SMI} --list-gpus 2>/dev/null"
+        output = shell_cmd(cmd, getoutput=True, showcmd=False)
+        indices = []
+        try:
+            for line in output.strip().split("\n"):
+                line = line.strip()
+                if line.startswith("GPU "):
+                    # Extract GPU index from "GPU X: ..."
+                    idx_str = line.split(":")[0].replace("GPU ", "").strip()
+                    if idx_str.isdigit():
+                        indices.append(int(idx_str))
+        except Exception:
+            pass
+
+        if not indices:
+            # Fallback: assume sequential indices from 0 to count-1
+            count = self.get_gpu_count()
+            indices = list(range(count))
+
+        self._gpu_indices = sorted(indices)
+        return self._gpu_indices
+
     def get_gpu_count(self) -> int:
-        """Get number of GPUs"""
+        """Get number of GPUs.
+        Handles cases where some GPUs have errors by filtering output lines.
+        """
         if self._gpu_count is not None:
             return self._gpu_count
-        cmd = f"{NV_SMI} --query-gpu=count --format=csv,noheader | head -1"
+        # Use --list-gpus which is more robust - counts actual GPU lines
+        cmd = f"{NV_SMI} --list-gpus 2>/dev/null | grep -c 'GPU [0-9]'"
         output = shell_cmd(cmd, getoutput=True, showcmd=False)
         try:
             self._gpu_count = int(output.strip())
         except Exception:
-            self._gpu_count = 0
+            # Fallback: try query-gpu but filter for numeric lines only
+            cmd = f"{NV_SMI} --query-gpu=count --format=csv,noheader 2>/dev/null"
+            output = shell_cmd(cmd, getoutput=True, showcmd=False)
+            try:
+                # Find first line that is a valid integer
+                for line in output.strip().split("\n"):
+                    line = line.strip()
+                    if line.isdigit():
+                        self._gpu_count = int(line)
+                        break
+                else:
+                    self._gpu_count = 0
+            except Exception:
+                self._gpu_count = 0
         return self._gpu_count
 
     def get_fan_count(self) -> int:
