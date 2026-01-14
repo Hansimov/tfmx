@@ -1,48 +1,31 @@
 import argparse
 import json
-import os
 import signal
 import time
 
 from pathlib import Path
-from tclogger import logger, shell_cmd, log_error
+from tclogger import logger, log_error
 from typing import Union
 
-MIN_FAN_PERCENT = 0
-MAX_FAN_PERCENT = 100
+from tfmx.gpu_ctl import (
+    MIN_FAN_PERCENT,
+    MAX_FAN_PERCENT,
+    is_none_or_empty,
+    is_str_and_all,
+    parse_idx,
+    check_nv_permission,
+    GPUControllerBase,
+)
+
 SPEED_STEP = 5  # Fan speed adjustment step (round up to multiples of this)
 COOLDOWN_DELAY = 10.0  # Seconds to wait before decreasing fan speed
 DEFAULT_CONFIG_FILE = "gpu_mon.config.json"
 DEFAULT_INTERVAL = 1.0
 
-NV_SETTINGS = "DISPLAY=:0 nvidia-settings"
-NV_SMI = "nvidia-smi"
-
 
 def get_script_dir() -> Path:
     """Get the directory of current script"""
     return Path(__file__).parent
-
-
-def is_none_or_empty(val: Union[str, None]) -> bool:
-    """val is None or empty"""
-    return val is None or (isinstance(val, str) and val.strip() == "")
-
-
-def is_str_and_all(idx: str) -> bool:
-    """idx starts with 'a'"""
-    if isinstance(idx, str) and idx.strip().lower().startswith("a"):
-        return True
-    return False
-
-
-def parse_idx(idx: Union[str, int]) -> int:
-    """Parse index string to int"""
-    try:
-        return int(idx)
-    except Exception:
-        log_error(f"× Invalid idx: {idx}")
-        return None
 
 
 def round_speed_up(speed: int, step: int = SPEED_STEP) -> int:
@@ -193,89 +176,15 @@ class GPUMonConfig:
         self.config["interval"] = interval
 
 
-class GPUController:
-    """Control GPU fan via nvidia-settings"""
+class GPUController(GPUControllerBase):
+    """Control GPU fan via nvidia-settings (extends GPUControllerBase)"""
 
     def __init__(self, verbose: bool = True):
-        self.verbose = verbose
-        self._gpu_count = None
+        super().__init__(verbose)
 
-    def get_gpu_count(self) -> int:
-        """Get number of GPUs"""
-        if self._gpu_count is not None:
-            return self._gpu_count
-        cmd = f"{NV_SMI} --query-gpu=count --format=csv,noheader | head -1"
-        output = shell_cmd(cmd, getoutput=True, showcmd=False)
-        try:
-            self._gpu_count = int(output.strip())
-        except Exception:
-            self._gpu_count = 0
-        return self._gpu_count
-
-    def get_gpu_temp(self, gpu_idx: int) -> int:
-        """Get GPU core temperature"""
-        cmd = f"{NV_SMI} -i {gpu_idx} --query-gpu=temperature.gpu --format=csv,noheader"
-        output = shell_cmd(cmd, getoutput=True, showcmd=False)
-        try:
-            return int(output.strip())
-        except Exception:
-            return None
-
-    def get_all_gpu_temps(self) -> dict[int, int]:
-        """Get all GPU temperatures"""
-        temps = {}
-        for i in range(self.get_gpu_count()):
-            temp = self.get_gpu_temp(i)
-            if temp is not None:
-                temps[i] = temp
-        return temps
-
-    def get_fan_speed(self, fan_idx: int) -> int:
-        """Get current fan speed"""
-        cmd = f"{NV_SETTINGS} -q '[fan:{fan_idx}]/GPUCurrentFanSpeed' -t"
-        output = shell_cmd(cmd, getoutput=True, showcmd=False)
-        try:
-            return int(output.strip())
-        except Exception:
-            return None
-
-    def get_control_state(self, gpu_idx: int) -> int:
-        """Get GPU fan control state (0=auto, 1=manual)"""
-        cmd = f"{NV_SETTINGS} -q '[gpu:{gpu_idx}]/GPUFanControlState' -t"
-        output = shell_cmd(cmd, getoutput=True, showcmd=False)
-        try:
-            return int(output.strip())
-        except Exception:
-            return None
-
-    def set_control_state(self, gpu_idx: Union[int, str], state: int) -> bool:
-        """Set GPU fan control state"""
-        if is_str_and_all(gpu_idx):
-            cmd = f"{NV_SETTINGS} -a 'GPUFanControlState={state}'"
-        else:
-            cmd = f"{NV_SETTINGS} -a '[gpu:{gpu_idx}]/GPUFanControlState={state}'"
-        # output = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
-        output = shell_cmd(cmd, getoutput=True, showcmd=False)
-        return "assigned" in output.lower() or "error" not in output.lower()
-
-    def set_fan_speed(self, fan_idx: Union[int, str], speed: int) -> bool:
-        """Set fan speed"""
-        speed = min(max(speed, MIN_FAN_PERCENT), MAX_FAN_PERCENT)
-        if is_str_and_all(fan_idx):
-            cmd = f"{NV_SETTINGS} -a 'GPUTargetFanSpeed={speed}'"
-        else:
-            cmd = f"{NV_SETTINGS} -a '[fan:{fan_idx}]/GPUTargetFanSpeed={speed}'"
-        # output = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
-        output = shell_cmd(cmd, getoutput=True, showcmd=False)
-        return "assigned" in output.lower() or "error" not in output.lower()
-
-    def set_auto_control(self, gpu_idx: Union[int, str]) -> bool:
-        """Reset to automatic fan control"""
-        return self.set_control_state(gpu_idx, 0)
-
-    def set_manual_control(self, gpu_idx: Union[int, str]) -> bool:
-        """Enable manual fan control"""
-        return self.set_control_state(gpu_idx, 1)
+    def check_permission(self) -> bool:
+        """Check if we have permission to control fans"""
+        return check_nv_permission()
 
 
 class GPUMonitor:
@@ -432,13 +341,17 @@ class GPUMonitor:
     def _set_fan_speed(self, gpu_idx: int, speed: int, temp: int):
         """Actually set fan speed and update tracking"""
         self.controller.set_manual_control(gpu_idx)
-        self.controller.set_fan_speed(gpu_idx, speed)
+        self.controller.set_gpu_fan_speed(gpu_idx, speed)
         self._last_speeds[gpu_idx] = speed
         if self.verbose:
             logger.mesg(f"  GPU {gpu_idx}: {temp}°C -> {speed}%")
 
     def run_loop(self):
         """Run monitoring loop"""
+        # Check permissions before starting
+        if not self.controller.check_permission():
+            return
+
         self.running = True
         interval = self.config.get_interval()
         gpu_count = self.controller.get_gpu_count()

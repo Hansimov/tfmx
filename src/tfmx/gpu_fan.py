@@ -3,10 +3,17 @@ import argparse
 from tclogger import logger, shell_cmd, log_error
 from typing import Union, Literal
 
-MIN_FAN_PERCENT = 0
-MAX_FAN_PERCENT = 100
+from tfmx.gpu_ctl import (
+    MIN_FAN_PERCENT,
+    MAX_FAN_PERCENT,
+    get_nv_settings_cmd,
+    set_use_sudo,
+    check_nv_permission,
+    is_none_or_empty,
+    is_str_and_all,
+    parse_idx,
+)
 
-NV_SETTINGS = "DISPLAY=:0 nvidia-settings"
 GREP_GPU = "grep -Ei 'gpu:'"
 GREP_FAN = "grep -Ei 'fan:'"
 GREP_GPU_OR_FAN = "grep -Ei '(gpu:|fan:)'"
@@ -44,18 +51,6 @@ OP_DEVICES = {
 }
 
 
-def is_none_or_empty(val: Union[str, None]) -> bool:
-    """val is None or empty"""
-    return val is None or val.strip() == ""
-
-
-def is_str_and_all(idx: str) -> bool:
-    """idx starts with 'a'"""
-    if isinstance(idx, str) and idx.strip().lower().startswith("a"):
-        return True
-    return False
-
-
 def is_op_key_has_no_idx(op_key: str) -> bool:
     """op_key should not have idx"""
     return op_key in NO_IDX_OP_KEYS
@@ -64,15 +59,6 @@ def is_op_key_has_no_idx(op_key: str) -> bool:
 def is_op_key_has_no_val(op_key: str) -> bool:
     """op_key should not have val"""
     return op_key in NO_VAL_OP_KEYS
-
-
-def parse_idx(idx: Union[str, int]) -> int:
-    try:
-        idx = int(idx)
-        return idx
-    except Exception as e:
-        log_error(f"× Invalid idx: {idx}")
-        return None
 
 
 def parse_val(val: Union[str, int]) -> Union[int, None]:
@@ -209,64 +195,63 @@ class GPUFanController:
 
     def get_gpus(self) -> str:
         """Get GPU list"""
-        get_s = "-q gpus"
-        cmd = f"{NV_SETTINGS} {get_s} | {GREP_GPU}"
+        cmd = get_nv_settings_cmd("-q gpus", f"| {GREP_GPU}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def get_core_temp(self, gpu_idx: int) -> str:
-        get_s = f"-q '[gpu:{gpu_idx}]/GPUCoreTemp'"
+        nv_args = f"-q '[gpu:{gpu_idx}]/GPUCoreTemp'"
         if self.terse:
-            cmd = f"{NV_SETTINGS} {get_s} -t"
+            cmd = get_nv_settings_cmd(f"{nv_args} -t")
         else:
-            cmd = f"{NV_SETTINGS} {get_s} | {GREP_GPU}"
+            cmd = get_nv_settings_cmd(nv_args, f"| {GREP_GPU}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def get_control_state(self, gpu_idx: int) -> str:
         """Get GPU fan control state"""
-        get_s = f"-q '[gpu:{gpu_idx}]/GPUFanControlState'"
+        nv_args = f"-q '[gpu:{gpu_idx}]/GPUFanControlState'"
         if self.terse:
-            cmd = f"{NV_SETTINGS} {get_s} -t"
+            cmd = get_nv_settings_cmd(f"{nv_args} -t")
         else:
-            cmd = f"{NV_SETTINGS} {get_s} | {GREP_GPU}"
+            cmd = get_nv_settings_cmd(nv_args, f"| {GREP_GPU}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def set_control_state(self, gpu_idx: int, control_state: int):
         """Set GPU fan control state"""
-        set_s = f"-a '[gpu:{gpu_idx}]/GPUFanControlState={control_state}'"
-        cmd = f"{NV_SETTINGS} {set_s} | {GREP_GPU}"
+        nv_args = f"-a '[gpu:{gpu_idx}]/GPUFanControlState={control_state}'"
+        cmd = get_nv_settings_cmd(nv_args, f"| {GREP_GPU}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
 
     def get_fan_speed(self, fan_idx: int) -> str:
         """Get GPU fan speed percentage"""
-        get_s = f"-q '[fan:{fan_idx}]/GPUCurrentFanSpeed'"
+        nv_args = f"-q '[fan:{fan_idx}]/GPUCurrentFanSpeed'"
         if self.terse:
-            cmd = f"{NV_SETTINGS} {get_s} -t"
+            cmd = get_nv_settings_cmd(f"{nv_args} -t")
         else:
-            cmd = f"{NV_SETTINGS} {get_s} | {GREP_FAN}"
+            cmd = get_nv_settings_cmd(nv_args, f"| {GREP_FAN}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
 
     def set_fan_speed(self, fan_idx: int, fan_speed: int):
         """Set GPU fan speed percentage"""
-        set_s = f"-a '[fan:{fan_idx}]/GPUTargetFanSpeed={fan_speed}'"
-        cmd = f"{NV_SETTINGS} {set_s} | {GREP_FAN}"
+        nv_args = f"-a '[fan:{fan_idx}]/GPUTargetFanSpeed={fan_speed}'"
+        cmd = get_nv_settings_cmd(nv_args, f"| {GREP_FAN}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
 
     def execute(self, nv_args: list[str]):
         nv_args_str = " ".join(nv_args)
         if self.terse:
-            cmd = f"{NV_SETTINGS} {nv_args_str} -t"
+            cmd = get_nv_settings_cmd(f"{nv_args_str} -t")
         else:
-            cmd = f"{NV_SETTINGS} {nv_args_str} | {GREP_GPU_OR_FAN}"
+            cmd = get_nv_settings_cmd(nv_args_str, f"| {GREP_GPU_OR_FAN}")
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
 
@@ -279,6 +264,10 @@ class GPUFanArgParser(argparse.ArgumentParser):
         self.add_argument("-gt", "--gpu-temp", type=str)
         self.add_argument("-cs", "--control-state", type=str)
         self.add_argument("-fs", "--fan-speed", type=str)
+        # permission args
+        self.add_argument(
+            "-S", "--sudo", action="store_true", help="Use sudo for nvidia-settings"
+        )
         # log args
         self.add_argument("-q", "--quiet", action="store_true")
         self.add_argument("-t", "--terse", action="store_true")
@@ -287,6 +276,12 @@ class GPUFanArgParser(argparse.ArgumentParser):
 
 def main():
     args = GPUFanArgParser().args
+    # Set sudo mode if requested, or auto-detect
+    if args.sudo:
+        set_use_sudo(True)
+    else:
+        # Auto-detect permission requirements
+        check_nv_permission()
     c = GPUFanController(verbose=not args.quiet, terse=args.terse)
     p = NvidiaSettingsParser()
     kivs = []
