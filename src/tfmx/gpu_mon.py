@@ -10,6 +10,8 @@ from typing import Union
 
 MIN_FAN_PERCENT = 0
 MAX_FAN_PERCENT = 100
+SPEED_STEP = 5  # Fan speed adjustment step (round up to multiples of this)
+COOLDOWN_DELAY = 10.0  # Seconds to wait before decreasing fan speed
 DEFAULT_CONFIG_FILE = "gpu_mon.config.json"
 DEFAULT_INTERVAL = 1.0
 
@@ -41,6 +43,17 @@ def parse_idx(idx: Union[str, int]) -> int:
     except Exception:
         log_error(f"× Invalid idx: {idx}")
         return None
+
+
+def round_speed_up(speed: int, step: int = SPEED_STEP) -> int:
+    """Round speed up to the nearest multiple of step.
+    E.g., step=5: 0->0, 1->5, 5->5, 6->10, 77->80, 100->100
+    """
+    if speed <= 0:
+        return 0
+    if speed >= 100:
+        return 100
+    return min(((speed + step - 1) // step) * step, MAX_FAN_PERCENT)
 
 
 def parse_curve_points(curve_str: str) -> Union[list[tuple[int, int]], None]:
@@ -279,6 +292,9 @@ class GPUMonitor:
         self.verbose = verbose
         self.running = False
         self._last_speeds = {}  # Track last set speeds to avoid redundant commands
+        self._cooldown_start = (
+            {}
+        )  # Track when temperature dropped below current speed zone
 
     def display_curve(self, gpu_idx: Union[int, str]):
         """Display curve settings for GPU(s)"""
@@ -352,10 +368,17 @@ class GPUMonitor:
             self.config.set_curve(idx, None)
             self.controller.set_auto_control(idx)
             self._last_speeds.pop(idx, None)
+            self._cooldown_start.pop(idx, None)
             logger.success(f"  GPU {idx}: Reset to automatic control")
 
     def apply_curve_once(self, gpu_idx: int):
-        """Apply curve for single GPU based on current temperature"""
+        """Apply curve for single GPU based on current temperature.
+
+        Smooth control logic:
+        1. Round speed up to SPEED_STEP multiples (e.g., 5%)
+        2. Increase speed immediately when temp rises above current zone
+        3. Delay speed decrease by COOLDOWN_DELAY seconds when temp drops
+        """
         curve = self.config.get_curve(gpu_idx)
         if not curve:
             return  # auto mode, skip
@@ -364,19 +387,55 @@ class GPUMonitor:
         if temp is None:
             return
 
-        target_speed = calculate_fan_speed(temp, curve)
-        if target_speed is None:
+        # Calculate target speed and round up to step multiples
+        raw_target_speed = calculate_fan_speed(temp, curve)
+        if raw_target_speed is None:
+            return
+        target_speed = round_speed_up(raw_target_speed)
+
+        last_speed = self._last_speeds.get(gpu_idx)
+        current_time = time.time()
+
+        # First time setting speed
+        if last_speed is None:
+            self._set_fan_speed(gpu_idx, target_speed, temp)
             return
 
-        # Only set if speed changed
-        last_speed = self._last_speeds.get(gpu_idx)
-        if last_speed != target_speed:
-            # Ensure manual control is enabled
-            self.controller.set_manual_control(gpu_idx)
-            self.controller.set_fan_speed(gpu_idx, target_speed)
-            self._last_speeds[gpu_idx] = target_speed
-            if self.verbose:
-                logger.mesg(f"  GPU {gpu_idx}: {temp}°C -> {target_speed}%")
+        # Speed needs to increase -> apply immediately (safety first)
+        if target_speed > last_speed:
+            # Clear cooldown timer since we're increasing
+            self._cooldown_start.pop(gpu_idx, None)
+            self._set_fan_speed(gpu_idx, target_speed, temp)
+            return
+
+        # Speed needs to decrease -> wait for cooldown delay
+        if target_speed < last_speed:
+            cooldown_start = self._cooldown_start.get(gpu_idx)
+            if cooldown_start is None:
+                # Start cooldown timer
+                self._cooldown_start[gpu_idx] = current_time
+                if self.verbose:
+                    logger.mesg(
+                        f"  GPU {gpu_idx}: {temp}°C, waiting to decrease "
+                        f"({last_speed}% -> {target_speed}%)"
+                    )
+            elif current_time - cooldown_start >= COOLDOWN_DELAY:
+                # Cooldown period passed, apply decrease
+                self._cooldown_start.pop(gpu_idx, None)
+                self._set_fan_speed(gpu_idx, target_speed, temp)
+            # else: still waiting for cooldown
+            return
+
+        # Speed unchanged -> clear cooldown timer
+        self._cooldown_start.pop(gpu_idx, None)
+
+    def _set_fan_speed(self, gpu_idx: int, speed: int, temp: int):
+        """Actually set fan speed and update tracking"""
+        self.controller.set_manual_control(gpu_idx)
+        self.controller.set_fan_speed(gpu_idx, speed)
+        self._last_speeds[gpu_idx] = speed
+        if self.verbose:
+            logger.mesg(f"  GPU {gpu_idx}: {temp}°C -> {speed}%")
 
     def run_loop(self):
         """Run monitoring loop"""
