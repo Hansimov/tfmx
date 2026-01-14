@@ -779,11 +779,12 @@ class TEIBenchmark:
             metrics.chars_per_second = metrics.total_chars / metrics.total_time
 
         # Get per-machine stats with elapsed time for accurate throughput calculation
+        logger.note(f"Machine stats:")
         machine_stats = self.clients.get_machine_stats(elapsed_time=metrics.total_time)
         for ms in machine_stats:
-            logger.mesg(
-                f"  {ms['endpoint']}: {ms['total_items']:,} items, "
-                f"{ms['total_requests']} batches, "
+            logger.file(
+                f"  {ms['endpoint']:<22}: {ms['total_items']:,} items, "
+                f"{ms['total_requests']:>2} batches, "
                 f"throughput={ms['throughput']:.0f}/s"
             )
 

@@ -29,6 +29,7 @@ Examples:
 import argparse
 import httpx
 import json
+import orjson
 
 from dataclasses import dataclass
 from tclogger import logger, logstr, rows_to_table_str, dict_to_lines
@@ -429,9 +430,12 @@ class AsyncTEIClient:
         self._client: httpx.AsyncClient | None = None
 
     async def _get_client(self) -> httpx.AsyncClient:
-        """Get or create the async HTTP client."""
+        """Get or create the async HTTP client with connection pooling."""
         if self._client is None:
-            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+            self._client = httpx.AsyncClient(
+                timeout=httpx.Timeout(self.timeout),
+                limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
+            )
         return self._client
 
     async def close(self) -> None:
@@ -517,7 +521,13 @@ class AsyncTEIClient:
 
         client = await self._get_client()
         try:
-            resp = await client.post(f"{self.endpoint}/embed", json=payload)
+            # Use orjson for fast pre-serialization to avoid blocking
+            content = orjson.dumps(payload)
+            resp = await client.post(
+                f"{self.endpoint}/embed",
+                content=content,
+                headers={"Content-Type": "application/json"},
+            )
             resp.raise_for_status()
             embs = resp.json()
             self._log_okay(
@@ -563,7 +573,13 @@ class AsyncTEIClient:
 
         client = await self._get_client()
         try:
-            resp = await client.post(f"{self.endpoint}/lsh", json=payload)
+            # Use orjson for fast pre-serialization to avoid blocking
+            content = orjson.dumps(payload)
+            resp = await client.post(
+                f"{self.endpoint}/lsh",
+                content=content,
+                headers={"Content-Type": "application/json"},
+            )
             resp.raise_for_status()
             hashes = resp.json()
             self._log_okay("lsh", f"n={len(hashes)}, bitn={bitn}")
