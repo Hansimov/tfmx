@@ -7,7 +7,6 @@ from tfmx.gpu_ctl import (
     MIN_FAN_PERCENT,
     MAX_FAN_PERCENT,
     get_nv_settings_cmd,
-    set_use_sudo,
     check_nv_permission,
     is_none_or_empty,
     is_str_and_all,
@@ -264,10 +263,6 @@ class GPUFanArgParser(argparse.ArgumentParser):
         self.add_argument("-gt", "--gpu-temp", type=str)
         self.add_argument("-cs", "--control-state", type=str)
         self.add_argument("-fs", "--fan-speed", type=str)
-        # permission args
-        self.add_argument(
-            "-S", "--sudo", action="store_true", help="Use sudo for nvidia-settings"
-        )
         # log args
         self.add_argument("-q", "--quiet", action="store_true")
         self.add_argument("-t", "--terse", action="store_true")
@@ -276,12 +271,8 @@ class GPUFanArgParser(argparse.ArgumentParser):
 
 def main():
     args = GPUFanArgParser().args
-    # Set sudo mode if requested, or auto-detect
-    if args.sudo:
-        set_use_sudo(True)
-    else:
-        # Auto-detect permission requirements
-        check_nv_permission()
+    # Auto-detect permission requirements (will use sudo if needed)
+    check_nv_permission()
     c = GPUFanController(verbose=not args.quiet, terse=args.terse)
     p = NvidiaSettingsParser()
     kivs = []

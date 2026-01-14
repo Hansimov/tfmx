@@ -14,10 +14,9 @@ MAX_FAN_PERCENT = 100
 
 NV_SMI = "nvidia-smi"
 
-# Global flag to use sudo for nvidia-settings
+# Global state for sudo and X11
 _USE_SUDO = False
 _PERMISSION_CHECKED = False
-_HAS_PERMISSION = False
 _X_DISPLAY = None  # Cached X display
 
 
@@ -93,20 +92,17 @@ def build_sudo_cmd(cmd: str) -> str:
     sudopass = os.environ.get("SUDOPASS", "")
     xauth = get_xauthority_path()
     display = get_x_display()
-
-    # Set DISPLAY and XAUTHORITY environment variables
     env_vars = f"DISPLAY={display} XAUTHORITY={xauth}"
 
     if sudopass:
-        # Wrap in bash -c to handle pipe correctly
         escaped_cmd = cmd.replace("'", "'\\''")
         return f"bash -c 'echo \"$SUDOPASS\" | sudo -S env {env_vars} {escaped_cmd} 2>/dev/null'"
-    # For interactive sudo
     return f"sudo env {env_vars} {cmd}"
 
 
 def get_nv_settings_cmd(nv_args: str = "", suffix: str = "") -> str:
-    """Get nvidia-settings command with sudo if needed.
+    """Get nvidia-settings command with proper DISPLAY and XAUTHORITY.
+    Uses sudo if _USE_SUDO is True (auto-detected by check_nv_permission).
 
     Args:
         nv_args: Arguments to pass to nvidia-settings
@@ -114,10 +110,6 @@ def get_nv_settings_cmd(nv_args: str = "", suffix: str = "") -> str:
 
     Returns:
         Complete command string ready for shell execution
-
-    Note:
-        Always sets DISPLAY and XAUTHORITY for X11 access.
-        When using sudo, uses build_sudo_cmd for proper env handling.
     """
     nv_settings = get_nv_settings_base()
     base_cmd = f"{nv_settings} {nv_args}".strip()
@@ -125,14 +117,13 @@ def get_nv_settings_cmd(nv_args: str = "", suffix: str = "") -> str:
         base_cmd = f"{base_cmd} {suffix}"
     if _USE_SUDO:
         return build_sudo_cmd(base_cmd)
-    # For non-sudo, still need DISPLAY and XAUTHORITY
     xauth = get_xauthority_path()
     display = get_x_display()
     return f"DISPLAY={display} XAUTHORITY={xauth} {base_cmd}"
 
 
 def set_use_sudo(use_sudo: bool):
-    """Set whether to use sudo for nvidia-settings"""
+    """Manually set whether to use sudo for nvidia-settings"""
     global _USE_SUDO
     _USE_SUDO = use_sudo
 
@@ -159,91 +150,86 @@ def parse_idx(idx: Union[str, int]) -> int:
 
 
 def check_x_server() -> bool:
-    """Check if X server is available on :0"""
+    """Check if X server is available"""
     xauth = get_xauthority_path()
-    # Try to query X server
-    cmd = f"DISPLAY=:0 XAUTHORITY={xauth} xdpyinfo >/dev/null 2>&1"
+    display = get_x_display()
+    cmd = f"DISPLAY={display} XAUTHORITY={xauth} xdpyinfo >/dev/null 2>&1"
     result = os.system(cmd)
     return result == 0
 
 
 def check_nv_permission() -> bool:
     """Check if we have permission to control fans.
-    Try without sudo first, then with sudo if needed.
+    Auto-detects whether sudo is needed by testing actual set operation.
     Returns True if we have permission (with or without sudo).
-
-    Tests actual set operation to ensure write permission.
     """
-    global _USE_SUDO, _PERMISSION_CHECKED, _HAS_PERMISSION
+    global _USE_SUDO, _PERMISSION_CHECKED
 
     if _PERMISSION_CHECKED:
-        return _HAS_PERMISSION
+        return True
 
-    _PERMISSION_CHECKED = True
+    xauth = get_xauthority_path()
+    display = get_x_display()
+    nv_settings = get_nv_settings_base()
 
-    def test_permission(use_sudo: bool) -> bool:
+    def build_test_cmd(nv_args: str, use_sudo: bool) -> str:
+        base_cmd = f"{nv_settings} {nv_args}"
+        if use_sudo:
+            return build_sudo_cmd(base_cmd)
+        return f"DISPLAY={display} XAUTHORITY={xauth} {base_cmd}"
+
+    def test_write_permission(use_sudo: bool) -> bool:
         """Test if we can actually set fan control state"""
-        xauth = get_xauthority_path()
-        display = get_x_display()
-        nv_settings = get_nv_settings_base()
-
-        def build_cmd(nv_args: str) -> str:
-            base_cmd = f"{nv_settings} {nv_args}"
-            if use_sudo:
-                return build_sudo_cmd(base_cmd)
-            # For non-sudo, still need DISPLAY and XAUTHORITY
-            return f"DISPLAY={display} XAUTHORITY={xauth} {base_cmd}"
-
         # First get current state
-        query_cmd = build_cmd("-q '[gpu:0]/GPUFanControlState' -t")
+        query_cmd = build_test_cmd("-q '[gpu:0]/GPUFanControlState' -t", use_sudo)
         query_output = shell_cmd(query_cmd, getoutput=True, showcmd=False)
 
-        # Check for X server / display errors
-        if (
-            "control display" in query_output.lower()
-            or "authorization" in query_output.lower()
-        ):
+        # Check for X11 errors
+        if "authorization" in query_output.lower():
             return False
-        if "error" in query_output.lower() or "permission" in query_output.lower():
+        if "control display" in query_output.lower():
             return False
 
-        # Try to set the same state (no actual change, just test permission)
         try:
             current_state = int(query_output.strip())
         except Exception:
             current_state = 0
 
-        set_cmd = build_cmd(f"-a '[gpu:0]/GPUFanControlState={current_state}'")
+        # Try to set the same state (no actual change, just test permission)
+        set_cmd = build_test_cmd(
+            f"-a '[gpu:0]/GPUFanControlState={current_state}'", use_sudo
+        )
         set_output = shell_cmd(set_cmd, getoutput=True, showcmd=False)
 
         # Check if set was successful
         if "assigned" in set_output.lower():
             return True
-        if "error" in set_output.lower() or "permission" in set_output.lower():
+        if "not permitted" in set_output.lower():
+            return False
+        if "error" in set_output.lower():
             return False
         return True
 
     # First try without sudo
-    if test_permission(use_sudo=False):
-        _HAS_PERMISSION = True
+    if test_write_permission(use_sudo=False):
+        _PERMISSION_CHECKED = True
         return True
 
     # Try with sudo
-    logger.warn("  nvidia-settings requires elevated permissions, trying with sudo...")
-    if test_permission(use_sudo=True):
+    logger.hint("  nvidia-settings requires elevated permissions, trying with sudo...")
+    if test_write_permission(use_sudo=True):
         _USE_SUDO = True
-        _HAS_PERMISSION = True
+        _PERMISSION_CHECKED = True
         logger.success("  Using sudo for nvidia-settings")
         return True
 
-    # Check if X server is the problem
+    # Permission check failed
     if not check_x_server():
         logger.warn(
-            "× X server not accessible on DISPLAY=:0\n"
+            f"× X server not accessible on DISPLAY={display}\n"
             "  Fan control requires X server. Please ensure:\n"
             "  1. X server is running (check with: ps aux | grep X)\n"
-            "  2. Try starting X: sudo X :0 &\n"
-            "  3. Or use a display manager (lightdm, gdm, etc.)"
+            "  2. DISPLAY and XAUTHORITY are set correctly"
         )
     else:
         logger.warn(
@@ -251,7 +237,6 @@ def check_nv_permission() -> bool:
             "  Please check NVIDIA driver settings and Coolbits configuration.\n"
             '  You may need to add \'Option "Coolbits" "12"\' to xorg.conf'
         )
-    _HAS_PERMISSION = False
     return False
 
 
