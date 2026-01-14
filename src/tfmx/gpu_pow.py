@@ -1,4 +1,5 @@
 import argparse
+import os
 
 from tclogger import logger, shell_cmd, log_error
 from typing import Union, Literal
@@ -92,6 +93,18 @@ def parse_val_by_op_key(val: str, op_key: OpKeyType) -> Union[int, None]:
         return parse_val(val)
 
 
+def build_sudo_cmd(cmd: str) -> str:
+    """Build a command with sudo, using SUDOPASS if available.
+    Uses $SUDOPASS environment variable to avoid interactive password prompt.
+    If SUDOPASS is not set, uses regular sudo (prompts for password).
+    """
+    sudopass = os.environ.get("SUDOPASS", "")
+    if sudopass:
+        escaped_cmd = cmd.replace("'", "'\\''")
+        return f"bash -c 'echo \"$SUDOPASS\" | sudo -S {escaped_cmd} 2>/dev/null'"
+    return f"sudo {cmd}"
+
+
 class NvidiaSmiParser:
     def key_idx_val_to_ops(self, op_key: OpKeyType, idx_val_str: str) -> OpsType:
         """Usages:
@@ -160,7 +173,8 @@ class GPUPowerController:
             idx_s = ""
         else:
             idx_s = f" -i {gpu_idx}"
-        cmd = f"sudo {NVIDIA_SMI}{idx_s} -pm {mode}"
+        base_cmd = f"{NVIDIA_SMI}{idx_s} -pm {mode}"
+        cmd = build_sudo_cmd(base_cmd)
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output
@@ -185,7 +199,8 @@ class GPUPowerController:
             idx_s = ""
         else:
             idx_s = f" -i {gpu_idx}"
-        cmd = f"sudo {NVIDIA_SMI}{idx_s} -pl {power_limit}"
+        base_cmd = f"{NVIDIA_SMI}{idx_s} -pl {power_limit}"
+        cmd = build_sudo_cmd(base_cmd)
         output: str = shell_cmd(cmd, getoutput=True, showcmd=self.verbose)
         logger.okay(output, verbose=self.verbose)
         return output

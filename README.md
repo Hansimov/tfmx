@@ -19,8 +19,8 @@ gpu_fan -cs a:1
 Set GPU power limit:
 
 ```sh
-gpu_pow -pl a:240
-gpu_pow -pl 0:240
+gpu_pow -pm a:1 && gpu_pow -pl a:240
+gpu_pow -pm a:1 && gpu_pow -pl 0:240
 ```
 
 Set GPU monitor:
