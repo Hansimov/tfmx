@@ -285,7 +285,7 @@ class GPUFanArgParser(argparse.ArgumentParser):
         self.args, _ = self.parse_known_args()
 
 
-def control_gpu_fan():
+def main():
     args = GPUFanArgParser().args
     c = GPUFanController(verbose=not args.quiet, terse=args.terse)
     p = NvidiaSettingsParser()
@@ -305,30 +305,30 @@ def control_gpu_fan():
 
 
 if __name__ == "__main__":
-    control_gpu_fan()
+    main()
 
     # Case: Get GPUs list
-    # python -m tfmx.gpu_fan -gs
+    # gpu_fan -gs
 
     # Case: Get GPU0 core temperature
-    # python -m tfmx.gpu_fan -gt 0
-    # python -m tfmx.gpu_fan -gt 0,1
-    # python -m tfmx.gpu_fan -gt a
-    # python -m tfmx.gpu_fan -gt 0 -q
-    # python -m tfmx.gpu_fan -gt 0 -t
+    # gpu_fan -gt 0
+    # gpu_fan -gt 0,1
+    # gpu_fan -gt a
+    # gpu_fan -gt 0 -q
+    # gpu_fan -gt 0 -t
 
     # Case: Get/Set GPU0 fan control state
-    # python -m tfmx.gpu_fan -cs 0
-    # python -m tfmx.gpu_fan -cs a
-    # python -m tfmx.gpu_fan -cs a:1
-    # python -m tfmx.gpu_fan -cs 0:1
-    # python -m tfmx.gpu_fan -cs 0 -q
-    # python -m tfmx.gpu_fan -cs 0 -t
+    # gpu_fan -cs 0
+    # gpu_fan -cs a
+    # gpu_fan -cs a:1
+    # gpu_fan -cs 0:1
+    # gpu_fan -cs 0 -q
+    # gpu_fan -cs 0 -t
 
     # Case: Get/Set Fan0 speed percentage
-    # python -m tfmx.gpu_fan -fs 0
-    # python -m tfmx.gpu_fan -fs 0 -q
-    # python -m tfmx.gpu_fan -fs 0 -t
-    # python -m tfmx.gpu_fan -fs 0,1:50
-    # python -m tfmx.gpu_fan -fs a:80
-    # python -m tfmx.gpu_fan -fs "0,1:35;2,3:30"
+    # gpu_fan -fs 0
+    # gpu_fan -fs 0 -q
+    # gpu_fan -fs 0 -t
+    # gpu_fan -fs 0,1:50
+    # gpu_fan -fs a:80
+    # gpu_fan -fs "0,1:35;2,3:30"

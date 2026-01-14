@@ -36,4 +36,4 @@ from .perf_tracker import (
     reset_global_tracker,
 )
 from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
-from .gpu_fan import control_gpu_fan
+from .gpu_pow import NvidiaSmiParser, GPUPowerController, GPUPowerArgParser
