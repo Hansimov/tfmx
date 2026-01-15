@@ -393,6 +393,7 @@ Examples:
   gpu_mon -c a                  # Show all GPUs curve settings
   gpu_mon -c 0:50-80/75-100     # Set GPU 0 curve: 50°C->80%, 75°C->100%
   gpu_mon -c a:50-80/75-100 -s  # Set all GPUs curve and save config
+  gpu_mon -c "a:50-80/75-100;3:30-100"  # Set all GPUs, then override GPU 3
   gpu_mon -c a:file             # Load curve from config file
   gpu_mon -c 0:auto             # Reset GPU 0 to automatic control
   gpu_mon -c a:auto -s          # Reset all GPUs to auto and save
@@ -456,6 +457,37 @@ def parse_curve_arg(curve_arg: str) -> tuple[str, str]:
     return (gpu_idx, curve_val)
 
 
+def parse_multi_curve_arg(curve_arg: str) -> list[tuple[str, str]]:
+    """Parse multi-GPU curve argument separated by semicolons.
+    
+    Format: "<gpu1>:<curve1>;<gpu2>:<curve2>;..."
+    Example: "a:30-50/50-65/60-80/75-100;3:30-100"
+    
+    Returns list of (gpu_idx, curve_str) tuples.
+    Later entries can override earlier ones (e.g., GPU 3 overrides 'a').
+    """
+    results = []
+    
+    # Check if this is a multi-curve format (contains ; with : after it)
+    if ";" in curve_arg:
+        # Split by semicolon to get individual GPU settings
+        segments = curve_arg.split(";")
+        for segment in segments:
+            segment = segment.strip()
+            if not segment:
+                continue
+            gpu_idx, curve_val = parse_curve_arg(segment)
+            if curve_val is not None:
+                results.append((gpu_idx, curve_val))
+    else:
+        # Single GPU curve setting
+        gpu_idx, curve_val = parse_curve_arg(curve_arg)
+        if curve_val is not None:
+            results.append((gpu_idx, curve_val))
+    
+    return results
+
+
 def main():
     args = GPUMonArgParser().args
 
@@ -497,20 +529,42 @@ def main():
         monitor.run_loop()
 
     else:
-        # Set curve
-        curve_points = parse_curve_points(curve_val)
-        if curve_points is None:
-            log_error(f"× Invalid curve format: {curve_val}")
-            return
-
-        # Parse multiple GPU indices
-        if is_str_and_all(gpu_idx):
-            monitor.set_curve(gpu_idx, curve_points)
+        # Check if this is a multi-curve format (contains ; separator)
+        multi_curves = parse_multi_curve_arg(args.curve)
+        
+        if len(multi_curves) > 1:
+            # Multi-GPU curve setting: "a:curve1;3:curve2"
+            for gpu_idx, curve_val in multi_curves:
+                if curve_val.lower() == "auto":
+                    monitor.reset_to_auto(gpu_idx)
+                else:
+                    curve_points = parse_curve_points(curve_val)
+                    if curve_points is None:
+                        log_error(f"× Invalid curve format for GPU {gpu_idx}: {curve_val}")
+                        return
+                    # Parse multiple GPU indices (e.g., "0,1" or "a")
+                    if is_str_and_all(gpu_idx):
+                        monitor.set_curve(gpu_idx, curve_points)
+                    else:
+                        for idx in gpu_idx.split(","):
+                            idx = idx.strip()
+                            if idx:
+                                monitor.set_curve(idx, curve_points)
         else:
-            for idx in gpu_idx.split(","):
-                idx = idx.strip()
-                if idx:
-                    monitor.set_curve(idx, curve_points)
+            # Single curve setting
+            curve_points = parse_curve_points(curve_val)
+            if curve_points is None:
+                log_error(f"× Invalid curve format: {curve_val}")
+                return
+
+            # Parse multiple GPU indices
+            if is_str_and_all(gpu_idx):
+                monitor.set_curve(gpu_idx, curve_points)
+            else:
+                for idx in gpu_idx.split(","):
+                    idx = idx.strip()
+                    if idx:
+                        monitor.set_curve(idx, curve_points)
 
         if args.save:
             config.save()
@@ -533,3 +587,4 @@ if __name__ == "__main__":
     # gpu_mon -c 0:auto           # Reset GPU 0 to automatic control
     # gpu_mon -c a:auto -s        # Reset all GPUs to auto and save config
     # gpu_mon -c a:30-50/50-65/60-80/75-100 -s
+    # gpu_mon -c "a:30-50/50-65/60-80/75-100;3:30-100" -s  # Set all, override GPU 3
