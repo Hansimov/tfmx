@@ -242,9 +242,9 @@ class MachineState:
     optimal_batch_size: int = MAX_CLIENT_BATCH_SIZE
     optimal_max_concurrent: int = 6
     _batch_size_min: int = 500  # Minimum batch size to try
-    _batch_size_max: int = 5000  # Maximum batch size to try
+    _batch_size_max: int = 3000  # Maximum batch size to try (reduced to prevent GPU overload)
     _max_concurrent_min: int = 2  # Minimum max_concurrent to try
-    _max_concurrent_max: int = 20  # Maximum max_concurrent to try
+    _max_concurrent_max: int = 12  # Maximum max_concurrent to try (reduced to prevent GPU overload)
 
     # Throughput tracking (EMA for real-time estimation)
     _throughput_ema: float = 0.0  # items/second
@@ -296,24 +296,31 @@ class MachineState:
         which gives a more accurate baseline for batch_size exploration.
         """
         # Use finer granularity: half of MAX_CLIENT_BATCH_SIZE
-        step_size = MAX_CLIENT_BATCH_SIZE // 2  # 250
+        step_size = MAX_CLIENT_BATCH_SIZE // 2  # 150
+
+        # Start conservatively: use step_size as minimum
+        # This ensures we don't overload GPU during initial exploration
+        # The exploration will naturally find larger optimal values if GPU can handle it
+        min_start = step_size
+
         self._explore_step = step_size
 
-        # Start exploration from step_size, no upper limit yet
-        # Initial range: from step_size up to 2x instances * MAX_CLIENT_BATCH_SIZE
-        initial_max = self._explore_n_instances * MAX_CLIENT_BATCH_SIZE * 2
+        # Start exploration from min_start
+        # Initial range: up to 1.5x instances * MAX_CLIENT_BATCH_SIZE (conservative)
+        initial_max = self._explore_n_instances * MAX_CLIENT_BATCH_SIZE * 3 // 2
 
         self._explore_values = []
-        for size in range(step_size, initial_max + 1, step_size):
+        for size in range(min_start, initial_max + 1, step_size):
             if size <= self._batch_size_max:
                 self._explore_values.append(size)
 
         # Ensure we have at least one value
         if not self._explore_values:
-            self._explore_values = [step_size]
+            self._explore_values = [min_start]
 
         # Minimum value to explore before allowing early stop
-        self._explore_min_value = self._explore_n_instances * MAX_CLIENT_BATCH_SIZE
+        # Use half of full capacity as the minimum threshold
+        self._explore_min_value = self._explore_n_instances * MAX_CLIENT_BATCH_SIZE // 2
 
         # Reset exploration state
         self._explore_index = 0
@@ -338,6 +345,10 @@ class MachineState:
             start += 1
         self._explore_values = list(range(start, self._max_concurrent_max + 1, 2))
 
+        # Ensure we have at least one value
+        if not self._explore_values:
+            self._explore_values = [start]
+
         # Minimum value before allowing early stop
         self._explore_min_value = start
 
@@ -359,17 +370,22 @@ class MachineState:
 
         # Get the Phase 1 best batch as center point
         center = self._phase1_best_batch
-        step_size = MAX_CLIENT_BATCH_SIZE // 4  # 125 (finer granularity)
+        step_size = MAX_CLIENT_BATCH_SIZE // 4  # 75 with MAX_CLIENT_BATCH_SIZE=300
 
         # Explore range: center - 2*step to center + 4*step
         # Bias towards larger batches since more concurrent requests can handle them
-        min_val = max(self._batch_size_min, center - 2 * step_size)
+        min_val = max(step_size, center - 2 * step_size)  # At least step_size, not _batch_size_min
         max_val = min(self._batch_size_max, center + 4 * step_size)
+
+        # Ensure min_val <= max_val to avoid empty range
+        if min_val > max_val:
+            min_val = max_val
 
         self._explore_values = list(range(min_val, max_val + 1, step_size))
 
-        # Remove the center value if it exists (already tested in Phase 1)
-        # Actually keep it for comparison, but it will be quick since we have prior data
+        # Ensure we have at least one value (the center point)
+        if not self._explore_values:
+            self._explore_values = [center if center > 0 else step_size]
 
         # Minimum value before allowing early stop: center point
         self._explore_min_value = center
