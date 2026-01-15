@@ -20,40 +20,6 @@ _PERMISSION_CHECKED = False
 _X_DISPLAY = None  # Cached X display
 
 
-def get_x_display() -> str:
-    """Get the correct X display for nvidia-settings.
-    Tries to detect the actual display used by the local X server.
-    """
-    global _X_DISPLAY
-    if _X_DISPLAY is not None:
-        return _X_DISPLAY
-
-    # Try to find display from /tmp/.X*-lock files
-    lock_files = glob.glob("/tmp/.X*-lock")
-    for lock_file in lock_files:
-        try:
-            # Extract display number from filename like /tmp/.X0-lock
-            display_num = lock_file.replace("/tmp/.X", "").replace("-lock", "")
-            _X_DISPLAY = f":{display_num}"
-            return _X_DISPLAY
-        except Exception:
-            pass
-
-    # Try common displays
-    for display in [":0", ":1", ":2"]:
-        _X_DISPLAY = display
-        return _X_DISPLAY
-
-    _X_DISPLAY = ":0"
-    return _X_DISPLAY
-
-
-def get_nv_settings_base() -> str:
-    """Get nvidia-settings command with correct display"""
-    display = get_x_display()
-    return f"nvidia-settings --ctrl-display={display}"
-
-
 def get_xauthority_path() -> str:
     """Get the correct XAUTHORITY path.
     In some environments (like PVE VMs), X server runs as root or via GDM.
@@ -82,6 +48,92 @@ def get_xauthority_path() -> str:
 
     # Fallback
     return runtime_xauth
+
+
+def _test_display_with_nvidia(display: str) -> bool:
+    """Test if a display can access NVIDIA GPU via nvidia-settings.
+    Returns True if the display has valid NVIDIA GPU access.
+    """
+    xauth = get_xauthority_path()
+    # Quick test: query GPU count - if it returns a number, display works
+    cmd = f"DISPLAY={display} XAUTHORITY={xauth} nvidia-settings --ctrl-display={display} -q gpus 2>/dev/null | grep -c '\\[gpu:'"
+    output = shell_cmd(cmd, getoutput=True, showcmd=False)
+    try:
+        gpu_count = int(output.strip())
+        return gpu_count > 0
+    except Exception:
+        return False
+
+
+def _get_candidate_displays() -> list[str]:
+    """Get list of candidate X displays, sorted by priority.
+    Excludes virtual displays (like :99 used by Xvfb) and prioritizes
+    physical displays.
+    """
+    candidates = []
+
+    # Priority 1: Environment variable DISPLAY (if set and looks valid)
+    env_display = os.environ.get("DISPLAY", "")
+    if env_display and env_display.startswith(":"):
+        try:
+            display_num = int(env_display.split(":")[1].split(".")[0])
+            # Only trust low-numbered displays from env (avoid Xvfb :99, etc.)
+            if display_num < 10:
+                candidates.append(env_display.split(".")[0])  # Remove screen number
+        except Exception:
+            pass
+
+    # Priority 2: Lock files, but only for low-numbered displays
+    lock_files = sorted(glob.glob("/tmp/.X*-lock"))
+    for lock_file in lock_files:
+        try:
+            display_num_str = lock_file.replace("/tmp/.X", "").replace("-lock", "")
+            display_num = int(display_num_str)
+            # Skip high-numbered displays (likely Xvfb, VNC, etc.)
+            # Physical X servers typically use :0, :1, :2
+            if display_num >= 10:
+                continue
+            display = f":{display_num}"
+            if display not in candidates:
+                candidates.append(display)
+        except Exception:
+            pass
+
+    # Priority 3: Common default displays
+    for display in [":0", ":1", ":2"]:
+        if display not in candidates:
+            candidates.append(display)
+
+    return candidates
+
+
+def get_x_display() -> str:
+    """Get the correct X display for nvidia-settings.
+    Tries to detect the actual display used by the local X server
+    by testing each candidate display for NVIDIA GPU access.
+    """
+    global _X_DISPLAY
+    if _X_DISPLAY is not None:
+        return _X_DISPLAY
+
+    candidates = _get_candidate_displays()
+
+    # Test each candidate display
+    for display in candidates:
+        if _test_display_with_nvidia(display):
+            _X_DISPLAY = display
+            return _X_DISPLAY
+
+    # Fallback: return first candidate even if test failed
+    # (might work with sudo)
+    _X_DISPLAY = candidates[0] if candidates else ":0"
+    return _X_DISPLAY
+
+
+def get_nv_settings_base() -> str:
+    """Get nvidia-settings command with correct display"""
+    display = get_x_display()
+    return f"nvidia-settings --ctrl-display={display}"
 
 
 def build_sudo_cmd(cmd: str) -> str:
@@ -163,13 +215,13 @@ def check_nv_permission() -> bool:
     Auto-detects whether sudo is needed by testing actual set operation.
     Returns True if we have permission (with or without sudo).
     """
-    global _USE_SUDO, _PERMISSION_CHECKED
+    global _USE_SUDO, _PERMISSION_CHECKED, _X_DISPLAY
 
     if _PERMISSION_CHECKED:
         return True
 
-    xauth = get_xauthority_path()
     display = get_x_display()
+    xauth = get_xauthority_path()
     nv_settings = get_nv_settings_base()
 
     def build_test_cmd(nv_args: str, use_sudo: bool) -> str:
@@ -188,6 +240,9 @@ def check_nv_permission() -> bool:
         if "authorization" in query_output.lower():
             return False
         if "control display" in query_output.lower():
+            return False
+        # "Bad handle" means wrong display or no GPU access
+        if "bad handle" in query_output.lower():
             return False
 
         try:
@@ -208,7 +263,33 @@ def check_nv_permission() -> bool:
             return False
         if "error" in set_output.lower():
             return False
+        if "bad handle" in set_output.lower():
+            return False
         return True
+
+    def try_alternative_displays_with_sudo() -> bool:
+        """Try alternative displays with sudo if main display failed."""
+        global _X_DISPLAY
+        candidates = _get_candidate_displays()
+        for alt_display in candidates:
+            if alt_display == display:
+                continue
+            # Test this display with sudo
+            alt_nv_settings = f"nvidia-settings --ctrl-display={alt_display}"
+            test_cmd = build_sudo_cmd(
+                f"{alt_nv_settings} -q '[gpu:0]/GPUFanControlState' -t"
+            )
+            output = shell_cmd(test_cmd, getoutput=True, showcmd=False)
+            if "bad handle" not in output.lower() and "error" not in output.lower():
+                try:
+                    int(output.strip())
+                    # This display works!
+                    _X_DISPLAY = alt_display
+                    logger.hint(f"  Found working display: {alt_display}")
+                    return True
+                except Exception:
+                    pass
+        return False
 
     # First try without sudo
     if test_write_permission(use_sudo=False):
@@ -223,13 +304,22 @@ def check_nv_permission() -> bool:
         logger.success("  Using sudo for nvidia-settings")
         return True
 
+    # Current display doesn't work, try alternatives with sudo
+    logger.hint(f"  Display {display} not working, trying alternatives...")
+    if try_alternative_displays_with_sudo():
+        _USE_SUDO = True
+        _PERMISSION_CHECKED = True
+        logger.success(f"  Using sudo for nvidia-settings with display {_X_DISPLAY}")
+        return True
+
     # Permission check failed
     if not check_x_server():
         logger.warn(
             f"× X server not accessible on DISPLAY={display}\n"
             "  Fan control requires X server. Please ensure:\n"
             "  1. X server is running (check with: ps aux | grep X)\n"
-            "  2. DISPLAY and XAUTHORITY are set correctly"
+            "  2. DISPLAY and XAUTHORITY are set correctly\n"
+            "  3. If using Xvfb/VNC, ensure a physical X server is also running"
         )
     else:
         logger.warn(
