@@ -19,18 +19,17 @@ gpu_fan -cs a:1
 Set GPU power limit:
 
 ```sh
-# M-X
-gpu_pow -pm a:1 && gpu_pow -pl 0:220
+# M-X GPU-0/1
+gpu_pow -pm a:1 && gpu_pow -pl "0:160;1:240"
 
-# M-A GPU-1/2
-# gpu_pow -pm a:1 && gpu_pow -pl a:220
-gpu_pow -pm a:1 && gpu_pow -pl 0,1:160
+# M-A GPU-0/1
+gpu_pow -pm a:1 && gpu_pow -pl "0,1:160"
 ```
 
 Set GPU fan speed:
 
 ```sh
-gpu_fan -fs a:100
+gpu_fan -cs a:1 && gpu_fan -fs a:100
 ```
 
 Set GPU monitor with curve:
@@ -42,7 +41,7 @@ Set GPU monitor with curve:
 Run tei compose and machine:
 
 ```sh
-tei_compose up && sleep 20 && tei_machine run --perf-track
+tei_compose up && sleep 45 && tei_machine run --perf-track
 ```
 
 Run tei benchmark:
