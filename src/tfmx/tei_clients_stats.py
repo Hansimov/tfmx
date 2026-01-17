@@ -36,10 +36,10 @@ CLI_EPILOG = """
 Examples:
   export TEI_EPS="http://localhost:28800,http://ai122:28800"
   
-  # Note: -E/--endpoints and -v/--verbose must be placed BEFORE the subcommand
-  tei_clients_stats -E $TEI_EPS -v health
-  tei_clients_stats -E $TEI_EPS -v embed "Hello" "World"
-  tei_clients_stats -E $TEI_EPS -v lsh "Hello, world"
+  # Action comes first
+  tei_clients_stats health -E $TEI_EPS -v
+  tei_clients_stats embed -E $TEI_EPS -v "Hello" "World"
+  tei_clients_stats lsh -E $TEI_EPS -v "Hello, world"
 """
 
 
@@ -381,188 +381,20 @@ class TEIClientsWithStats:
         return responses
 
 
-class TEIClientsWithStatsArgParser:
-    """Argument parser for TEI Clients with Stats CLI."""
-
-    def __init__(self):
-        # Create main parser with common arguments at root level
-        self.parser = argparse.ArgumentParser(
-            description="TEI Clients with Stats - Multi-machine client with verbose logging",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=CLI_EPILOG,
-        )
-
-        # Add common arguments to main parser
-        self._add_common_arguments(self.parser)
-
-        # Setup subcommands (they won't have these common arguments repeated)
-        self._setup_subcommands()
-        self.args = self.parser.parse_args()
-
-    def _add_common_arguments(self, parser):
-        """Add common arguments to a parser."""
-        parser.add_argument(
-            "-E",
-            "--endpoints",
-            type=str,
-            required=False,
-            help="Comma-separated list of tei_machine endpoints",
-        )
-        parser.add_argument(
-            "-v",
-            "--verbose",
-            action="store_true",
-            help="Enable verbose output and progress logging",
-        )
-
-    def _setup_subcommands(self):
-        """Setup subcommands."""
-        # Action subcommands
-        subparsers = self.parser.add_subparsers(dest="action", help="Action to perform")
-
-        # health
-        subparsers.add_parser(
-            "health",
-            help="Check health of all machines",
-        )
-
-        # info
-        subparsers.add_parser(
-            "info",
-            help="Get info from all machines",
-        )
-
-        # embed
-        embed_parser = subparsers.add_parser(
-            "embed",
-            help="Generate embeddings",
-        )
-        embed_parser.add_argument(
-            "texts",
-            nargs="+",
-            help="Texts to embed",
-        )
-
-        # lsh
-        lsh_parser = subparsers.add_parser(
-            "lsh",
-            help="Generate LSH hashes",
-        )
-        lsh_parser.add_argument(
-            "texts",
-            nargs="+",
-            help="Texts to hash",
-        )
-        lsh_parser.add_argument(
-            "-b",
-            "--bitn",
-            type=int,
-            default=2048,
-            help="Number of LSH bits (default: 2048)",
-        )
-
-
-class TEIClientsWithStatsCLI:
-    """CLI interface for TEI Clients with Stats operations."""
-
-    def __init__(self, clients: TEIClientsWithStats):
-        """Initialize CLI with TEI clients.
-
-        Args:
-            clients: TEIClientsWithStats instance to use for operations
-        """
-        self.clients = clients
-
-    def run_health(self) -> None:
-        """Run health check and display results."""
-        machines = self.clients.machines
-        if not machines:
-            logger.warn("× No machine info available")
-            return
-
-        for i, machine in enumerate(machines):
-            logger.note(f"[Machine {i+1}] {machine.endpoint}")
-            machine.client.log_machine_health()
-
-    def run_info(self) -> None:
-        """Get and display info from all machines."""
-        machines = self.clients.machines
-        if not machines:
-            logger.warn("× No machine info available")
-            return
-
-        for i, machine in enumerate(machines):
-            logger.okay(f"[Machine {i+1}] {machine.endpoint}")
-            machine.client.log_machine_info()
-            print()
-
-    def run_embed(self, texts: list[str]) -> None:
-        """Generate and display embeddings.
-
-        Args:
-            texts: List of texts to embed
-        """
-        if not texts:
-            logger.warn("× No input texts provided")
-            return
-
-        embs = self.clients.embed(texts)
-        print(json.dumps(embs, indent=2))
-
-    def run_lsh(self, texts: list[str], bitn: int = 2048) -> None:
-        """Generate and display LSH hashes.
-
-        Args:
-            texts: List of texts to hash
-            bitn: Number of LSH bits
-        """
-        if not texts:
-            logger.warn("× No input texts provided")
-            return
-
-        hashes = self.clients.lsh(texts, bitn=bitn)
-        for text, hash_str in zip(texts, hashes):
-            text_preview = text[:40] + "..." if len(text) > 40 else text
-            hash_preview = hash_str[:32] + "..." if len(hash_str) > 32 else hash_str
-            logger.mesg(f"'{text_preview}'")
-            logger.file(f"  → {hash_preview}")
-
-
 def main():
     """Main entry point for CLI."""
-    arg_parser = TEIClientsWithStatsArgParser()
-    args = arg_parser.args
+    from .tei_clients_cli import (
+        TEIClientsArgParserBase,
+        run_cli_main,
+    )
 
-    if args.action is None:
-        arg_parser.parser.print_help()
-        return
-
-    # Validate endpoints argument
-    if not args.endpoints:
-        logger.warn("× Error: -E/--endpoints is required")
-        arg_parser.parser.print_help()
-        return
-
-    endpoints = [ep.strip() for ep in args.endpoints.split(",")]
-    clients = TEIClientsWithStats(endpoints=endpoints, verbose=args.verbose)
-
-    try:
-        cli = TEIClientsWithStatsCLI(clients)
-        if args.action == "health":
-            cli.run_health()
-        elif args.action == "info":
-            cli.run_info()
-        elif args.action == "embed":
-            cli.run_embed(args.texts)
-        elif args.action == "lsh":
-            cli.run_lsh(args.texts, args.bitn)
-    except httpx.ConnectError as e:
-        logger.warn(f"× Connection failed: {e}")
-        logger.hint(f"  Check if all TEI machines are running")
-    except Exception as e:
-        logger.warn(f"× Error: {e}")
-    finally:
-        clients.close()
+    run_cli_main(
+        parser_class=TEIClientsArgParserBase,
+        clients_class=TEIClientsWithStats,
+        description="TEI Clients with Stats - Multi-machine client with verbose logging",
+        epilog=CLI_EPILOG,
+        extra_args={"verbose": True},  # Add --verbose flag for stats version
+    )
 
 
 if __name__ == "__main__":

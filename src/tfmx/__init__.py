@@ -17,8 +17,9 @@ from .tei_clients_core import (
     ClientsHealthResponse,
     IteratorBuffer,
 )
-from .tei_clients import TEIClients, TEIClientsArgParser
-from .tei_clients_stats import TEIClientsWithStats, TEIClientsWithStatsArgParser
+from .tei_clients import TEIClients
+from .tei_clients_stats import TEIClientsWithStats
+from .tei_clients_cli import TEIClientsArgParserBase, TEIClientsCLIBase
 from .tei_performance import (
     ExplorationConfig,
     PerformanceTracker,

@@ -1,17 +1,27 @@
 """TEI Multi-Machine Client - Production Version
 
-Clean, high-performance client for distributing embed/lsh requests across
-multiple TEI machines using optimized pipeline scheduling.
+High-performance client for distributing embed/lsh requests across
+multiple TEI machines using optimized async pipeline scheduling.
 
-This is the production version without verbose logging or stats.
-For testing/exploration with performance stats, use TEIClientsWithStats
-from tei_clients_stats.py.
+This is the clean production version without verbose logging.
+For testing/benchmarking with detailed stats, use TEIClientsWithStats.
 
-Features:
+Key Features:
 - Async pipeline scheduling for maximum throughput
 - Auto-loads optimal batch sizes from tei_clients.config.json
-- Health checking and auto-recovery
-- Round-robin for small batches, pipeline for large batches
+- Smart routing: round-robin for small batches, pipeline for large batches
+- Automatic health checking and recovery
+- Iterator support for memory-efficient processing
+
+Usage:
+    from tfmx import TEIClients
+    
+    endpoints = ["http://machine1:28800", "http://machine2:28800"]
+    with TEIClients(endpoints) as clients:
+        embeddings = clients.embed(texts)
+        lsh_hashes = clients.lsh(texts, bitn=2048)
+
+See TEI.md for detailed usage guide.
 """
 
 import argparse
@@ -35,20 +45,20 @@ CLI_EPILOG = """
 Examples:
   export TEI_EPS="http://localhost:28800,http://ai122:28800"
   
-  # Note: -E/--endpoints must be placed BEFORE the subcommand
-  tei_clients -E $TEI_EPS health
-  tei_clients -E $TEI_EPS info
-  tei_clients -E $TEI_EPS embed "Hello" "World"
-  tei_clients -E $TEI_EPS lsh "Hello"
-  tei_clients -E $TEI_EPS lsh -b 2048 "Hello, world"
+  # Action comes first
+  tei_clients health -E $TEI_EPS
+  tei_clients info -E $TEI_EPS
+  tei_clients embed -E $TEI_EPS "Hello" "World"
+  tei_clients lsh -E $TEI_EPS "Hello"
+  tei_clients lsh -E $TEI_EPS -b 2048 "Hello, world"
 """
 
 
 class TEIClients:
     """Production multi-machine TEI client with optimal pipeline scheduling.
 
-    Connects to multiple TEI machines and distributes requests efficiently.
-    Automatically loads optimal batch sizes from saved config if available.
+    Automatically loads optimal batch sizes from tei_clients.config.json.
+    Uses round-robin for small batches (<1000), pipeline for large batches.
 
     Example:
         ```python
@@ -57,17 +67,15 @@ class TEIClients:
             "http://machine2:28800",
         ])
 
-        # Auto-detects: small batches use round-robin, large use pipeline
-        embs = clients.embed(["Hello", "World"])
-        lsh_hashes = clients.lsh(large_dataset, bitn=2048)
-
+        embeddings = clients.embed(texts)
+        lsh_hashes = clients.lsh(texts, bitn=2048)
         clients.close()
         ```
 
     Context manager:
         ```python
         with TEIClients(endpoints) as clients:
-            embs = clients.embed(texts)
+            results = clients.lsh(large_dataset, bitn=2048)
         ```
     """
 
@@ -337,192 +345,20 @@ class TEIClients:
         return responses
 
 
-class TEIClientsArgParser:
-    """Argument parser for TEI Clients CLI."""
-
-    def __init__(self):
-        # Create main parser with common arguments at root level
-        self.parser = argparse.ArgumentParser(
-            description="TEI Clients - Connect to multiple TEI machines",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=CLI_EPILOG,
-        )
-
-        # Add common arguments to main parser
-        self._add_common_arguments(self.parser)
-
-        # Setup subcommands (they won't have these common arguments repeated)
-        self._setup_subcommands()
-        self.args = self.parser.parse_args()
-
-    def _add_common_arguments(self, parser):
-        """Add common arguments to a parser."""
-        parser.add_argument(
-            "-E",
-            "--endpoints",
-            type=str,
-            required=False,
-            help="Comma-separated list of tei_machine endpoints",
-        )
-
-    def _setup_subcommands(self):
-        """Setup subcommands."""
-        # Action subcommands
-        subparsers = self.parser.add_subparsers(dest="action", help="Action to perform")
-
-        # health
-        subparsers.add_parser(
-            "health",
-            help="Check health of all machines",
-        )
-
-        # info
-        subparsers.add_parser(
-            "info",
-            help="Get info from all machines",
-        )
-
-        # embed
-        embed_parser = subparsers.add_parser(
-            "embed",
-            help="Generate embeddings",
-        )
-        embed_parser.add_argument(
-            "texts",
-            nargs="+",
-            help="Texts to embed",
-        )
-
-        # lsh
-        lsh_parser = subparsers.add_parser(
-            "lsh",
-            help="Generate LSH hashes",
-        )
-        lsh_parser.add_argument(
-            "texts",
-            nargs="+",
-            help="Texts to hash",
-        )
-        lsh_parser.add_argument(
-            "-b",
-            "--bitn",
-            type=int,
-            default=2048,
-            help="Number of LSH bits (default: 2048)",
-        )
-
-
-class TEIClientsCLI:
-    """CLI interface for TEI Clients operations."""
-
-    def __init__(self, clients: TEIClients):
-        """Initialize CLI with TEI clients.
-
-        Args:
-            clients: TEIClients instance to use for operations
-        """
-        self.clients = clients
-
-    def run_health(self) -> None:
-        """Run health check and display results."""
-        from tclogger import logger
-
-        machines = self.clients.machines
-        if not machines:
-            logger.warn("× No machine info available")
-            return
-
-        for i, machine in enumerate(machines):
-            logger.note(f"[Machine {i+1}] {machine.endpoint}")
-            machine.client.log_machine_health()
-
-    def run_info(self) -> None:
-        """Get and display info from all machines."""
-        from tclogger import logger
-
-        machines = self.clients.machines
-        if not machines:
-            logger.warn("× No machine info available")
-            return
-
-        for i, machine in enumerate(machines):
-            logger.okay(f"[Machine {i+1}] {machine.endpoint}")
-            machine.client.log_machine_info()
-            print()
-
-    def run_embed(self, texts: list[str]) -> None:
-        """Generate and display embeddings.
-
-        Args:
-            texts: List of texts to embed
-        """
-        from tclogger import logger
-
-        if not texts:
-            logger.warn("× No input texts provided")
-            return
-
-        embs = self.clients.embed(texts)
-        print(json.dumps(embs, indent=2))
-
-    def run_lsh(self, texts: list[str], bitn: int = 2048) -> None:
-        """Generate and display LSH hashes.
-
-        Args:
-            texts: List of texts to hash
-            bitn: Number of LSH bits
-        """
-        from tclogger import logger
-
-        if not texts:
-            logger.warn("× No input texts provided")
-            return
-
-        hashes = self.clients.lsh(texts, bitn=bitn)
-        for text, hash_str in zip(texts, hashes):
-            text_preview = text[:40] + "..." if len(text) > 40 else text
-            hash_preview = hash_str[:32] + "..." if len(hash_str) > 32 else hash_str
-            logger.mesg(f"'{text_preview}'")
-            logger.file(f"  → {hash_preview}")
-
-
 def main():
     """Main entry point for CLI."""
-    from tclogger import logger
+    from .tei_clients_cli import (
+        TEIClientsArgParserBase,
+        run_cli_main,
+    )
 
-    arg_parser = TEIClientsArgParser()
-    args = arg_parser.args
-
-    if args.action is None:
-        arg_parser.parser.print_help()
-        return
-
-    # Validate endpoints argument
-    if not args.endpoints:
-        logger.warn("× Error: -E/--endpoints is required")
-        arg_parser.parser.print_help()
-        return
-
-    endpoints = [ep.strip() for ep in args.endpoints.split(",")]
-    clients = TEIClients(endpoints=endpoints)
-
-    try:
-        cli = TEIClientsCLI(clients)
-        if args.action == "health":
-            cli.run_health()
-        elif args.action == "info":
-            cli.run_info()
-        elif args.action == "embed":
-            cli.run_embed(args.texts)
-        elif args.action == "lsh":
-            cli.run_lsh(args.texts, args.bitn)
-    except httpx.ConnectError as e:
-        logger.warn(f"× Connection failed: {e}")
-        logger.hint(f"  Check if all TEI machines are running")
-    except Exception as e:
-        logger.warn(f"× Error: {e}")
-    finally:
-        clients.close()
+    run_cli_main(
+        parser_class=TEIClientsArgParserBase,
+        clients_class=TEIClients,
+        description="TEI Clients - Connect to multiple TEI machines",
+        epilog=CLI_EPILOG,
+        extra_args=None,  # No extra args for production version
+    )
 
 
 if __name__ == "__main__":
