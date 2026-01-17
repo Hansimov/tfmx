@@ -1,24 +1,25 @@
-"""TEI Multi-Machine Client - Production Version
+"""TEI Multi-Machine Client with Stats - Testing/Exploration Version
 
-Clean, high-performance client for distributing embed/lsh requests across
-multiple TEI machines using optimized pipeline scheduling.
+Multi-machine TEI client with verbose logging and performance statistics,
+designed for testing, benchmarking, and exploration scenarios.
 
-This is the production version without verbose logging or stats.
-For testing/exploration with performance stats, use TEIClientsWithStats
-from tei_clients_stats.py.
+This version adds detailed logging, per-machine stats, and progress tracking
+on top of the core TEIClients functionality using composition pattern.
+
+For clean production use without stats overhead, use TEIClients from tei_clients.py.
 
 Features:
-- Async pipeline scheduling for maximum throughput
-- Auto-loads optimal batch sizes from tei_clients.config.json
-- Health checking and auto-recovery
-- Round-robin for small batches, pipeline for large batches
+- All production features from TEIClients
+- Verbose logging with per-machine throughput tracking
+- Progress indicators for large batches (10k+ items)
+- Performance statistics and metrics
 """
 
 import argparse
-import asyncio
 import httpx
 import json
 from typing import Union, Iterable
+from tclogger import logger, logstr
 
 from .tei_client import TEIClient, AsyncTEIClient, InfoResponse, TIMEOUT
 from .tei_clients_core import (
@@ -30,43 +31,42 @@ from .tei_clients_core import (
 from .tei_performance import ExplorationConfig
 
 
-# ANCHOR[id=clients-clis]
+# ANCHOR[id=clients-stats-clis]
 CLI_EPILOG = """
 Examples:
   export TEI_EPS="http://localhost:28800,http://ai122:28800"
   
-  # Note: -E/--endpoints must be placed BEFORE the subcommand
-  tei_clients -E $TEI_EPS health
-  tei_clients -E $TEI_EPS info
-  tei_clients -E $TEI_EPS embed "Hello" "World"
-  tei_clients -E $TEI_EPS lsh "Hello"
-  tei_clients -E $TEI_EPS lsh -b 2048 "Hello, world"
+  # Note: -E/--endpoints and -v/--verbose must be placed BEFORE the subcommand
+  tei_clients_stats -E $TEI_EPS -v health
+  tei_clients_stats -E $TEI_EPS -v embed "Hello" "World"
+  tei_clients_stats -E $TEI_EPS -v lsh "Hello, world"
 """
 
 
-class TEIClients:
-    """Production multi-machine TEI client with optimal pipeline scheduling.
+class TEIClientsWithStats:
+    """Multi-machine TEI client with verbose logging and performance stats.
 
-    Connects to multiple TEI machines and distributes requests efficiently.
-    Automatically loads optimal batch sizes from saved config if available.
+    This is the stats-enabled version for testing/benchmarking. It provides
+    detailed progress logging, per-machine throughput tracking, and other
+    performance metrics.
 
     Example:
         ```python
-        clients = TEIClients([
+        clients = TEIClientsWithStats([
             "http://machine1:28800",
             "http://machine2:28800",
-        ])
+        ], verbose=True)
 
-        # Auto-detects: small batches use round-robin, large use pipeline
-        embs = clients.embed(["Hello", "World"])
-        lsh_hashes = clients.lsh(large_dataset, bitn=2048)
+        # Will print detailed progress and stats
+        embs = clients.embed(large_dataset)
+        lsh_hashes = clients.lsh(texts, bitn=2048)
 
         clients.close()
         ```
 
     Context manager:
         ```python
-        with TEIClients(endpoints) as clients:
+        with TEIClientsWithStats(endpoints, verbose=True) as clients:
             embs = clients.embed(texts)
         ```
     """
@@ -75,26 +75,29 @@ class TEIClients:
         self,
         endpoints: list[str],
         timeout: float = TIMEOUT,
+        verbose: bool = False,
     ):
-        """Initialize multi-machine TEI client.
+        """Initialize multi-machine TEI client with stats.
 
         Args:
             endpoints: List of tei_machine endpoint URLs
                       (e.g., ["http://machine1:28800", "http://machine2:28800"])
             timeout: Request timeout in seconds (default: 60.0)
+            verbose: Enable verbose logging and progress indicators
         """
         self.endpoints = [ep.rstrip("/") for ep in endpoints]
         self.timeout = timeout
+        self.verbose = verbose
 
         # Create underlying clients for each endpoint
         self.clients: list[TEIClient] = [
-            TEIClient(endpoint=ep, timeout=timeout, verbose=False)
+            TEIClient(endpoint=ep, timeout=timeout, verbose=verbose)
             for ep in self.endpoints
         ]
 
         # Create async clients for pipeline
         self.async_clients: list[AsyncTEIClient] = [
-            AsyncTEIClient(endpoint=ep, timeout=timeout, verbose=False)
+            AsyncTEIClient(endpoint=ep, timeout=timeout, verbose=verbose)
             for ep in self.endpoints
         ]
 
@@ -112,11 +115,11 @@ class TEIClients:
         # Pipeline scheduler
         self.machine_scheduler = MachineScheduler(self.machines)
 
-        # Pipeline executor (composition)
+        # Pipeline executor with stats callbacks (composition)
         self._pipeline = _TEIClientsPipeline(
             machine_scheduler=self.machine_scheduler,
-            on_progress=None,  # No verbose logging in production
-            on_complete=None,
+            on_progress=self._log_progress,
+            on_complete=self._log_complete,
         )
 
         # Round-robin index for small batches
@@ -132,6 +135,47 @@ class TEIClients:
                 machine._max_concurrent = saved.get(
                     "optimal_max_concurrent", machine._max_concurrent
                 )
+                if self.verbose:
+                    short_name = machine.endpoint.split("//")[-1].split(":")[0]
+                    logger.note(
+                        f"[{short_name}] Loaded config: "
+                        f"batch_size={machine.batch_size}, "
+                        f"max_concurrent={machine._max_concurrent}"
+                    )
+
+    def _log_progress(
+        self, processed: int, total: int, elapsed: float, machine_stats: dict
+    ) -> None:
+        """Callback for logging progress during pipeline execution.
+
+        Format: [20%] 20000/100000 | localhost:1000/s | ai122:2400/s | 3400/s
+        """
+        pct = int(processed / total * 100)
+        total_rate = processed / elapsed if elapsed > 0 else 0
+
+        # Build per-machine stats: host:rate/s
+        ep_stats = " | ".join(
+            (
+                f"{s['host']}:{int(s['items']/elapsed)}/s"
+                if elapsed > 0
+                else f"{s['host']}:0/s"
+            )
+            for s in machine_stats.values()
+        )
+
+        logger.mesg(
+            f"  [{pct:3d}%] {processed:,}/{total:,} | {ep_stats} | {logstr.okay(int(total_rate))}/s"
+        )
+
+    def _log_complete(
+        self, total_items: int, batch_count: int, total_time: float
+    ) -> None:
+        """Callback for logging completion stats."""
+        throughput = total_items / total_time if total_time > 0 else 0
+        logger.okay(
+            f"[Pipeline] Complete: {total_items} items, {batch_count} batches, "
+            f"{total_time:.2f}s, {throughput:.0f}/s"
+        )
 
     def close(self) -> None:
         """Close all HTTP clients."""
@@ -143,7 +187,7 @@ class TEIClients:
         for async_client in self.async_clients:
             await async_client.close()
 
-    def __enter__(self) -> "TEIClients":
+    def __enter__(self) -> "TEIClientsWithStats":
         return self
 
     def __exit__(self, *args) -> None:
@@ -337,13 +381,13 @@ class TEIClients:
         return responses
 
 
-class TEIClientsArgParser:
-    """Argument parser for TEI Clients CLI."""
+class TEIClientsWithStatsArgParser:
+    """Argument parser for TEI Clients with Stats CLI."""
 
     def __init__(self):
         # Create main parser with common arguments at root level
         self.parser = argparse.ArgumentParser(
-            description="TEI Clients - Connect to multiple TEI machines",
+            description="TEI Clients with Stats - Multi-machine client with verbose logging",
             formatter_class=argparse.RawDescriptionHelpFormatter,
             epilog=CLI_EPILOG,
         )
@@ -363,6 +407,12 @@ class TEIClientsArgParser:
             type=str,
             required=False,
             help="Comma-separated list of tei_machine endpoints",
+        )
+        parser.add_argument(
+            "-v",
+            "--verbose",
+            action="store_true",
+            help="Enable verbose output and progress logging",
         )
 
     def _setup_subcommands(self):
@@ -412,21 +462,19 @@ class TEIClientsArgParser:
         )
 
 
-class TEIClientsCLI:
-    """CLI interface for TEI Clients operations."""
+class TEIClientsWithStatsCLI:
+    """CLI interface for TEI Clients with Stats operations."""
 
-    def __init__(self, clients: TEIClients):
+    def __init__(self, clients: TEIClientsWithStats):
         """Initialize CLI with TEI clients.
 
         Args:
-            clients: TEIClients instance to use for operations
+            clients: TEIClientsWithStats instance to use for operations
         """
         self.clients = clients
 
     def run_health(self) -> None:
         """Run health check and display results."""
-        from tclogger import logger
-
         machines = self.clients.machines
         if not machines:
             logger.warn("× No machine info available")
@@ -438,8 +486,6 @@ class TEIClientsCLI:
 
     def run_info(self) -> None:
         """Get and display info from all machines."""
-        from tclogger import logger
-
         machines = self.clients.machines
         if not machines:
             logger.warn("× No machine info available")
@@ -456,8 +502,6 @@ class TEIClientsCLI:
         Args:
             texts: List of texts to embed
         """
-        from tclogger import logger
-
         if not texts:
             logger.warn("× No input texts provided")
             return
@@ -472,8 +516,6 @@ class TEIClientsCLI:
             texts: List of texts to hash
             bitn: Number of LSH bits
         """
-        from tclogger import logger
-
         if not texts:
             logger.warn("× No input texts provided")
             return
@@ -488,9 +530,7 @@ class TEIClientsCLI:
 
 def main():
     """Main entry point for CLI."""
-    from tclogger import logger
-
-    arg_parser = TEIClientsArgParser()
+    arg_parser = TEIClientsWithStatsArgParser()
     args = arg_parser.args
 
     if args.action is None:
@@ -504,10 +544,10 @@ def main():
         return
 
     endpoints = [ep.strip() for ep in args.endpoints.split(",")]
-    clients = TEIClients(endpoints=endpoints)
+    clients = TEIClientsWithStats(endpoints=endpoints, verbose=args.verbose)
 
     try:
-        cli = TEIClientsCLI(clients)
+        cli = TEIClientsWithStatsCLI(clients)
         if args.action == "health":
             cli.run_health()
         elif args.action == "info":
@@ -528,4 +568,4 @@ def main():
 if __name__ == "__main__":
     main()
 
-    # LINK: src/tfmx/tei_clients.py#clients-clis
+    # LINK: src/tfmx/tei_clients_stats.py#clients-stats-clis

@@ -9,11 +9,22 @@ from .embed_server import EmbedServerArgParser
 from .tei_compose import TEIComposer, TEIComposeArgParser
 from .tei_compose import GPUInfo, GPUDetector
 from .tei_compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
-from .tei_client import TEIClient, TEIClientArgParser
+from .tei_client import TEIClient, AsyncTEIClient, TEIClientArgParser
 from .tei_client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
+from .tei_clients_core import (
+    MachineState,
+    MachineScheduler,
+    ClientsHealthResponse,
+    IteratorBuffer,
+)
 from .tei_clients import TEIClients, TEIClientsArgParser
-from .tei_clients import MachineState, MachineScheduler, ClientsHealthResponse
-from .tei_clients import ExplorationConfig
+from .tei_clients_stats import TEIClientsWithStats, TEIClientsWithStatsArgParser
+from .tei_performance import (
+    ExplorationConfig,
+    PerformanceTracker,
+    PerformanceMetrics,
+    ExplorationState,
+)
 from .tei_scheduler import (
     WorkerState,
     IdleFillingScheduler,

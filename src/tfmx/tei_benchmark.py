@@ -49,7 +49,7 @@ import json
 from dataclasses import dataclass, field
 from tclogger import logger, logstr
 
-from .tei_clients import TEIClients
+from .tei_clients_stats import TEIClientsWithStats
 from .tei_benchtext import TEIBenchTextGenerator
 
 
@@ -169,32 +169,38 @@ class TEIBenchmark:
         bitn: int = 2048,
         timeout: float = 120.0,
         verbose: bool = False,
-        skip_exploration: bool = False,
     ):
         """Initialize the benchmark runner.
 
         Args:
             endpoints: List of TEI machine endpoints
-            batch_size: Number of samples per batch
+            batch_size: Number of samples per batch (informational, actual batch sizes from config)
             bitn: Number of LSH bits
             timeout: Request timeout in seconds
             verbose: Enable verbose logging
-            skip_exploration: If True, use saved optimal batch sizes instead of re-exploring
         """
         self.endpoints = endpoints
         self.batch_size = batch_size
         self.bitn = bitn
         self.timeout = timeout
         self.verbose = verbose
-        self.skip_exploration = skip_exploration
 
-        # Initialize client
-        self.clients = TEIClients(
+        # Initialize client with stats (benchmark is a testing tool)
+        self.clients = TEIClientsWithStats(
             endpoints=endpoints,
             timeout=timeout,
             verbose=verbose,
-            skip_exploration=skip_exploration,
         )
+
+        # Show loaded configuration
+        logger.note("> Loaded configuration:")
+        logger.mesg(f"  Endpoints: {len(self.endpoints)}")
+        for machine in self.clients.machines:
+            short_name = machine.endpoint.split("//")[-1]
+            logger.file(
+                f"    - {short_name:<15} : batch_size={machine.batch_size}, "
+                f"max_concurrent={machine._max_concurrent}"
+            )
 
     def close(self) -> None:
         """Close the clients."""
@@ -232,7 +238,6 @@ class TEIBenchmark:
     def run(
         self,
         samples: list[str],
-        warmup_samples: int = 100,
     ) -> BenchmarkMetrics:
         """Run the benchmark using pipeline mode.
 
@@ -241,7 +246,6 @@ class TEIBenchmark:
 
         Args:
             samples: List of text samples to process
-            warmup_samples: Number of samples for warmup (default: 100)
 
         Returns:
             BenchmarkMetrics with detailed results
@@ -259,16 +263,6 @@ class TEIBenchmark:
         metrics.avg_chars_per_sample = (
             metrics.total_chars / len(samples) if samples else 0
         )
-
-        # Warmup
-        if warmup_samples > 0:
-            logger.note(f"> Warmup with {warmup_samples} samples...")
-            warmup_data = samples[:warmup_samples]
-            try:
-                self.clients.lsh(warmup_data, bitn=self.bitn)
-                logger.okay("  Warmup completed")
-            except Exception as e:
-                logger.warn(f"  Warmup failed: {e}")
 
         logger.note(f"> Running benchmark (pipeline mode)...")
         logger.mesg(f"  Samples: {len(samples):,}")
@@ -302,16 +296,6 @@ class TEIBenchmark:
         if metrics.total_time > 0:
             metrics.samples_per_second = total_processed / metrics.total_time
             metrics.chars_per_second = metrics.total_chars / metrics.total_time
-
-        # Get per-machine stats with elapsed time for accurate throughput calculation
-        logger.note(f"Machine stats:")
-        machine_stats = self.clients.get_machine_stats(elapsed_time=metrics.total_time)
-        for ms in machine_stats:
-            logger.file(
-                f"  {ms['endpoint']:<22}: {ms['total_items']:,} items, "
-                f"{ms['total_requests']:>2} batches, "
-                f"throughput={ms['throughput']:.0f}/s"
-            )
 
         logger.okay(f"  Benchmark completed in {metrics.total_time:.2f} sec")
 
@@ -379,12 +363,6 @@ class TEIBenchmarkArgParser:
             help="Random seed for text generation (default: 42)",
         )
         self.parser.add_argument(
-            "--warmup",
-            type=int,
-            default=100,
-            help="Number of warmup samples (default: 100)",
-        )
-        self.parser.add_argument(
             "-t",
             "--timeout",
             type=float,
@@ -403,12 +381,6 @@ class TEIBenchmarkArgParser:
             type=str,
             default=None,
             help="Output file for results (JSON format)",
-        )
-        self.parser.add_argument(
-            "--explore",
-            action="store_true",
-            default=False,
-            help="Force re-exploration of optimal batch sizes (ignore saved config)",
         )
 
         # Action subcommands
@@ -497,7 +469,7 @@ def main():
             return
 
         endpoints = [ep.strip() for ep in args.endpoints.split(",")]
-        clients = TEIClients(endpoints=endpoints, verbose=args.verbose)
+        clients = TEIClientsWithStats(endpoints=endpoints, verbose=args.verbose)
         try:
             health = clients.health()
             logger.note(f"> Health check results:")
@@ -545,7 +517,7 @@ def main():
                 batch_size=batch_size,
                 bitn=args.bitn,
                 timeout=args.timeout,
-                verbose=False,  # Disable verbose for cleaner output
+                verbose=False,  # Disable verbose for cleaner tune output
             ) as benchmark:
                 if not benchmark.check_health():
                     logger.warn("× Health check failed, skipping tune")
@@ -553,8 +525,7 @@ def main():
 
                 try:
                     metrics = benchmark.run(
-                        samples=samples,
-                        warmup_samples=min(100, args.test_samples // 10),
+                        samples=test_samples,
                     )
 
                     results.append(
@@ -625,17 +596,13 @@ def main():
         )
 
         # Run benchmark
-        # Default: use saved config (skip_exploration=True)
-        # With --explore: force re-exploration (skip_exploration=False)
-        skip_exploration = not args.explore
-
+        # Note: Optimal batch sizes are automatically loaded from config
         with TEIBenchmark(
             endpoints=endpoints,
             batch_size=args.batch_size,
             bitn=args.bitn,
             timeout=args.timeout,
             verbose=args.verbose,
-            skip_exploration=skip_exploration,
         ) as benchmark:
             # Check health first
             if not benchmark.check_health():
@@ -644,7 +611,6 @@ def main():
             # Run benchmark
             metrics = benchmark.run(
                 samples=samples,
-                warmup_samples=args.warmup,
             )
 
             # Print results
@@ -653,7 +619,6 @@ def main():
             # Save results if output specified
             if args.output:
                 results = metrics.to_dict()
-                results["scheduler_stats"] = stats
                 with open(args.output, "w") as f:
                     json.dump(results, f, indent=2)
                 logger.okay(f"\n> Results saved to: {args.output}")
