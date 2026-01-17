@@ -1,45 +1,59 @@
-"""TEI (Text Embeddings Inference) Benchmark
+"""TEI Benchmark - Performance Testing for TEI Services
 
-This module provides benchmarking tools for TEI services,
-measuring throughput, latency, and performance across multiple machines.
+Benchmarking tool for measuring throughput and performance of TEI services
+across multiple machines.
+
+Features:
+- Multi-machine load testing with realistic text generation
+- Real-time progress tracking (every 5 seconds)
+- Per-machine throughput monitoring
+- Auto-tune batch sizes for optimal performance
+- JSON results export
+
+Usage:
+    # Basic benchmark
+    tei_benchmark -E "http://m1:28800,http://m2:28800" run -n 100000
+    
+    # Auto-tune batch sizes
+    tei_benchmark -E "http://m1:28800,http://m2:28800" tune
+    
+    # Verbose with results saved
+    tei_benchmark -E "http://m1:28800,http://m2:28800" -v run -o results.json
+
+See TEI.md for detailed usage guide.
 """
 
 # ANCHOR[id=benchmark-clis]
 CLI_EPILOG = """
 Examples:
-  # Default benchmark: 200k samples, 2 machines
   export TEI_EPS="http://localhost:28800,http://ai122:28800"
   
-  # Note: -E/--endpoints must be placed BEFORE the subcommand
-  tei_benchmark -E $TEI_EPS run
+  # Basic benchmark (action comes first)
+  tei_benchmark run -E $TEI_EPS
+  tei_benchmark run -E $TEI_EPS -n 100000
   
-  # Custom sample count and batch size
-  tei_benchmark -E $TEI_EPS run -n 100000     # 100k samples
-  tei_benchmark -E $TEI_EPS run -b 3000       # batch size 3000
-  
-  # Custom text length (longer texts for better GPU utilization)
-  tei_benchmark -E $TEI_EPS run --min-len 150 --max-len 400
+  # Custom text length
+  tei_benchmark run -E $TEI_EPS --min-len 150 --max-len 400
   
   # Auto-tune batch size for optimal performance
-  tei_benchmark -E $TEI_EPS tune              # Test batch sizes 100-2000
-  tei_benchmark -E $TEI_EPS tune --min-batch 500 --max-batch 3000 --step 250
-  # Note: Scheduler splits large batches into ≤100 per instance automatically
+  tei_benchmark tune -E $TEI_EPS
+  tei_benchmark tune -E $TEI_EPS --min-batch 500 --max-batch 3000 --step 250
   
-  # Benchmark single machine
-  tei_benchmark -E "http://localhost:28800" run -n 50000
-  
-  # Only generate samples (for debugging)
-  tei_benchmark generate -n 1000 --show       # Show 10 samples
+  # Single machine benchmark
+  tei_benchmark run -E "http://localhost:28800" -n 50000
   
   # LSH bit size options
-  tei_benchmark -E $TEI_EPS run --bitn 1024   # 1024 bits
-  tei_benchmark -E $TEI_EPS run --bitn 4096   # 4096 bits
+  tei_benchmark run -E $TEI_EPS --bitn 1024
+  tei_benchmark run -E $TEI_EPS --bitn 4096
   
   # Verbose output and save results
-  tei_benchmark -E $TEI_EPS -v run -o results.json
+  tei_benchmark run -E $TEI_EPS -v -o results.json
   
   # Health check
-  tei_benchmark -E $TEI_EPS health
+  tei_benchmark health -E $TEI_EPS
+  
+  # Generate test samples only
+  tei_benchmark generate -n 1000 --show
 """
 
 import argparse
@@ -316,66 +330,36 @@ class TEIBenchmarkArgParser:
 
     def _setup_arguments(self):
         """Setup all command-line arguments."""
-        # Common arguments
-        self.parser.add_argument(
+        # Create subparsers FIRST (so action comes before options)
+        subparsers = self.parser.add_subparsers(
+            dest="action",
+            help="Action to perform",
+            required=True,  # Make action required
+        )
+
+        # Common parent parser for shared arguments
+        parent_parser = argparse.ArgumentParser(add_help=False)
+        parent_parser.add_argument(
             "-E",
             "--endpoints",
             type=str,
             default=None,
-            help="Comma-separated list of TEI machine endpoints (e.g., http://localhost:28800,http://ai122:28800)",
+            help="Comma-separated list of TEI machine endpoints",
         )
-        self.parser.add_argument(
-            "-n",
-            "--num-samples",
-            type=int,
-            default=100000,
-            help="Number of text samples to generate (default: 100000)",
-        )
-        self.parser.add_argument(
-            "-b",
-            "--batch-size",
-            type=int,
-            default=2000,
-            help="Batch size for requests (default: 2000, scheduler splits into ≤100 per instance)",
-        )
-        self.parser.add_argument(
-            "--bitn",
-            type=int,
-            default=2048,
-            help="Number of LSH bits (default: 2048)",
-        )
-        self.parser.add_argument(
-            "--min-len",
-            type=int,
-            default=100,
-            help="Minimum text length in characters (default: 100)",
-        )
-        self.parser.add_argument(
-            "--max-len",
-            type=int,
-            default=300,
-            help="Maximum text length in characters (default: 300)",
-        )
-        self.parser.add_argument(
-            "--seed",
-            type=int,
-            default=42,
-            help="Random seed for text generation (default: 42)",
-        )
-        self.parser.add_argument(
+        parent_parser.add_argument(
             "-t",
             "--timeout",
             type=float,
             default=120.0,
             help="Request timeout in seconds (default: 120.0)",
         )
-        self.parser.add_argument(
+        parent_parser.add_argument(
             "-v",
             "--verbose",
             action="store_true",
             help="Enable verbose output",
         )
-        self.parser.add_argument(
+        parent_parser.add_argument(
             "-o",
             "--output",
             type=str,
@@ -383,27 +367,92 @@ class TEIBenchmarkArgParser:
             help="Output file for results (JSON format)",
         )
 
-        # Action subcommands
-        subparsers = self.parser.add_subparsers(dest="action", help="Action to perform")
-
         # run - main benchmark
-        run_parser = subparsers.add_parser("run", help="Run the benchmark")
+        run_parser = subparsers.add_parser(
+            "run",
+            help="Run the benchmark",
+            parents=[parent_parser],
+        )
+        run_parser.add_argument(
+            "-n",
+            "--num-samples",
+            type=int,
+            default=100000,
+            help="Number of text samples to generate (default: 100000)",
+        )
+        run_parser.add_argument(
+            "-b",
+            "--batch-size",
+            type=int,
+            default=2000,
+            help="Batch size for requests (default: 2000)",
+        )
+        run_parser.add_argument(
+            "--bitn",
+            type=int,
+            default=2048,
+            help="Number of LSH bits (default: 2048)",
+        )
+        run_parser.add_argument(
+            "--min-len",
+            type=int,
+            default=100,
+            help="Minimum text length in characters (default: 100)",
+        )
+        run_parser.add_argument(
+            "--max-len",
+            type=int,
+            default=300,
+            help="Maximum text length in characters (default: 300)",
+        )
+        run_parser.add_argument(
+            "--seed",
+            type=int,
+            default=42,
+            help="Random seed for text generation (default: 42)",
+        )
 
         # tune - auto-tune batch size
         tune_parser = subparsers.add_parser(
-            "tune", help="Auto-tune batch size for optimal performance"
+            "tune",
+            help="Auto-tune batch size for optimal performance",
+            parents=[parent_parser],
+        )
+        tune_parser.add_argument(
+            "--bitn",
+            type=int,
+            default=2048,
+            help="Number of LSH bits (default: 2048)",
+        )
+        tune_parser.add_argument(
+            "--min-len",
+            type=int,
+            default=100,
+            help="Minimum text length in characters (default: 100)",
+        )
+        tune_parser.add_argument(
+            "--max-len",
+            type=int,
+            default=300,
+            help="Maximum text length in characters (default: 300)",
+        )
+        tune_parser.add_argument(
+            "--seed",
+            type=int,
+            default=42,
+            help="Random seed for text generation (default: 42)",
         )
         tune_parser.add_argument(
             "--min-batch",
             type=int,
             default=100,
-            help="Minimum batch size to test (default: 100, scheduler will split into micro-batches of ≤100 per instance)",
+            help="Minimum batch size to test (default: 100)",
         )
         tune_parser.add_argument(
             "--max-batch",
             type=int,
             default=2000,
-            help="Maximum batch size to test (default: 2000, large batches utilize multiple instances in parallel)",
+            help="Maximum batch size to test (default: 2000)",
         )
         tune_parser.add_argument(
             "--step",
@@ -415,12 +464,38 @@ class TEIBenchmarkArgParser:
             "--test-samples",
             type=int,
             default=50000,
-            help="Number of samples for each test (default: 50000, enough to utilize multiple GPU instances)",
+            help="Number of samples for each test (default: 50000)",
         )
 
         # generate - only generate samples
         gen_parser = subparsers.add_parser(
-            "generate", help="Only generate text samples"
+            "generate",
+            help="Only generate text samples",
+        )
+        gen_parser.add_argument(
+            "-n",
+            "--num-samples",
+            type=int,
+            default=1000,
+            help="Number of text samples to generate (default: 1000)",
+        )
+        gen_parser.add_argument(
+            "--min-len",
+            type=int,
+            default=100,
+            help="Minimum text length in characters (default: 100)",
+        )
+        gen_parser.add_argument(
+            "--max-len",
+            type=int,
+            default=300,
+            help="Maximum text length in characters (default: 300)",
+        )
+        gen_parser.add_argument(
+            "--seed",
+            type=int,
+            default=42,
+            help="Random seed for text generation (default: 42)",
         )
         gen_parser.add_argument(
             "--show",
@@ -435,7 +510,11 @@ class TEIBenchmarkArgParser:
         )
 
         # health - check endpoint health
-        health_parser = subparsers.add_parser("health", help="Check endpoint health")
+        health_parser = subparsers.add_parser(
+            "health",
+            help="Check endpoint health",
+            parents=[parent_parser],
+        )
 
 
 def main():
