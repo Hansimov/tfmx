@@ -37,7 +37,6 @@ from typing import Optional, Union
 
 PORT = 28800  # default port for tei_machine
 HOST = "localhost"
-TIMEOUT = 60.0
 
 
 @dataclass
@@ -130,7 +129,6 @@ class TEIClient:
         endpoint: str = None,
         host: str = HOST,
         port: int = PORT,
-        timeout: float = TIMEOUT,
         verbose: bool = False,
     ):
         """Initialize TEI client.
@@ -140,7 +138,6 @@ class TEIClient:
                      If provided, host and port are ignored.
             host: Server host (default: localhost)
             port: Server port (default: 28800)
-            timeout: Request timeout in seconds (default: 60.0)
             verbose: Enable verbose logging
         """
         if endpoint:
@@ -148,9 +145,8 @@ class TEIClient:
         else:
             self.endpoint = f"http://{host}:{port}"
 
-        self.timeout = timeout
         self.verbose = verbose
-        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout))
+        self.client = httpx.Client(timeout=httpx.Timeout(60.0))
 
     def close(self) -> None:
         """Close the HTTP client."""
@@ -407,7 +403,6 @@ class AsyncTEIClient:
         endpoint: str = None,
         host: str = HOST,
         port: int = PORT,
-        timeout: float = TIMEOUT,
         verbose: bool = False,
     ):
         """Initialize async TEI client.
@@ -417,7 +412,6 @@ class AsyncTEIClient:
                      If provided, host and port are ignored.
             host: Server host (default: localhost)
             port: Server port (default: 28800)
-            timeout: Request timeout in seconds (default: 60.0)
             verbose: Enable verbose logging
         """
         if endpoint:
@@ -425,7 +419,6 @@ class AsyncTEIClient:
         else:
             self.endpoint = f"http://{host}:{port}"
 
-        self.timeout = timeout
         self.verbose = verbose
         self._client: httpx.AsyncClient | None = None
 
@@ -433,7 +426,7 @@ class AsyncTEIClient:
         """Get or create the async HTTP client with connection pooling."""
         if self._client is None:
             self._client = httpx.AsyncClient(
-                timeout=httpx.Timeout(self.timeout),
+                timeout=httpx.Timeout(60.0),
                 limits=httpx.Limits(max_keepalive_connections=10, max_connections=20),
             )
         return self._client

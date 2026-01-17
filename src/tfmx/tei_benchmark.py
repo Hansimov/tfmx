@@ -181,7 +181,6 @@ class TEIBenchmark:
         endpoints: list[str],
         batch_size: int = 1000,
         bitn: int = 2048,
-        timeout: float = 120.0,
         verbose: bool = False,
     ):
         """Initialize the benchmark runner.
@@ -190,19 +189,16 @@ class TEIBenchmark:
             endpoints: List of TEI machine endpoints
             batch_size: Number of samples per batch (informational, actual batch sizes from config)
             bitn: Number of LSH bits
-            timeout: Request timeout in seconds
             verbose: Enable verbose logging
         """
         self.endpoints = endpoints
         self.batch_size = batch_size
         self.bitn = bitn
-        self.timeout = timeout
         self.verbose = verbose
 
         # Initialize client with stats (benchmark is a testing tool)
         self.clients = TEIClientsWithStats(
             endpoints=endpoints,
-            timeout=timeout,
             verbose=verbose,
         )
 
@@ -345,13 +341,6 @@ class TEIBenchmarkArgParser:
             type=str,
             default=None,
             help="Comma-separated list of TEI machine endpoints",
-        )
-        parent_parser.add_argument(
-            "-t",
-            "--timeout",
-            type=float,
-            default=120.0,
-            help="Request timeout in seconds (default: 120.0)",
         )
         parent_parser.add_argument(
             "-v",
@@ -595,7 +584,6 @@ def main():
                 endpoints=endpoints,
                 batch_size=batch_size,
                 bitn=args.bitn,
-                timeout=args.timeout,
                 verbose=False,  # Disable verbose for cleaner tune output
             ) as benchmark:
                 if not benchmark.check_health():
@@ -680,7 +668,6 @@ def main():
             endpoints=endpoints,
             batch_size=args.batch_size,
             bitn=args.bitn,
-            timeout=args.timeout,
             verbose=args.verbose,
         ) as benchmark:
             # Check health first

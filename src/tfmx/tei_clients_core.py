@@ -8,19 +8,19 @@ and stats/exploration versions (TEIClientsWithStats):
 - IteratorBuffer: Thread-safe iterator buffering
 - ClientsHealthResponse: Health status aggregation
 - _TEIClientsPipeline: Core pipeline implementation (composition component)
+- _TEIClientsBase: Abstract base class with shared method implementations
 
-Design: Uses composition pattern to allow both clean production clients
-and stats-enabled clients to share the same core pipeline logic.
+Design: Uses composition pattern for pipeline + inheritance for shared methods.
 """
 
 import asyncio
 import threading
 import time
+from abc import ABC
 from dataclasses import dataclass, field
-from typing import Optional, Iterator, Callable, Any
-from tclogger import logger
+from typing import Optional, Iterator, Callable, Any, Union, Iterable
 
-from .tei_client import TEIClient, AsyncTEIClient
+from .tei_client import TEIClient, AsyncTEIClient, InfoResponse
 from .tei_compose import MAX_CLIENT_BATCH_SIZE
 
 
@@ -422,3 +422,275 @@ class _TEIClientsPipeline:
             self.on_complete(len(combined), batch_count, total_time)
 
         return combined
+
+
+class _TEIClientsBase(ABC):
+    """Abstract base class for multi-machine TEI clients.
+
+    Provides all shared method implementations. Subclasses only need to:
+    1. Implement __init__ (with their specific parameters)
+    2. Initialize self._pipeline with appropriate callbacks
+    3. Optionally override _load_config() for verbose logging
+
+    This eliminates ~380 lines of duplicated code between production
+    and stats-enabled versions.
+    """
+
+    def __init__(self, endpoints: list[str]):
+        """Base initialization - subclasses should call this via super().
+
+        Args:
+            endpoints: List of tei_machine endpoint URLs
+        """
+        self.endpoints = [ep.rstrip("/") for ep in endpoints]
+
+        # Create underlying clients for each endpoint
+        # Note: verbose parameter must be set by subclass before calling super()
+        verbose = getattr(self, "_verbose", False)
+        self.clients: list[TEIClient] = [
+            TEIClient(endpoint=ep, verbose=verbose) for ep in self.endpoints
+        ]
+
+        # Create async clients for pipeline
+        self.async_clients: list[AsyncTEIClient] = [
+            AsyncTEIClient(endpoint=ep, verbose=verbose) for ep in self.endpoints
+        ]
+
+        # Machine states for pipeline scheduling
+        self.machines: list[MachineState] = [
+            MachineState(endpoint=ep, client=sync_client, async_client=async_client)
+            for ep, sync_client, async_client in zip(
+                self.endpoints, self.clients, self.async_clients
+            )
+        ]
+
+        # Load optimal batch sizes from config
+        self._load_config()
+
+        # Pipeline scheduler
+        self.machine_scheduler = MachineScheduler(self.machines)
+
+        # Pipeline executor - subclass must set this
+        self._pipeline: Optional[_TEIClientsPipeline] = None
+
+        # Round-robin index for small batches
+        self._rr_index = 0
+
+    def _load_config(self) -> None:
+        """Load optimal configurations from saved config file.
+
+        Subclasses can override to add verbose logging.
+        """
+        from .tei_performance import ExplorationConfig
+
+        config = ExplorationConfig()
+        for machine in self.machines:
+            saved = config.get_machine_config(self.endpoints, machine.endpoint)
+            if saved:
+                machine.batch_size = saved.get("optimal_batch_size", machine.batch_size)
+                machine._max_concurrent = saved.get(
+                    "optimal_max_concurrent", machine._max_concurrent
+                )
+
+    def close(self) -> None:
+        """Close all HTTP clients."""
+        for client in self.clients:
+            client.close()
+
+    async def aclose(self) -> None:
+        """Close all async HTTP clients."""
+        for async_client in self.async_clients:
+            await async_client.close()
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args) -> None:
+        self.close()
+
+    def refresh_health(self) -> ClientsHealthResponse:
+        """Refresh health status of all machines.
+
+        Returns:
+            ClientsHealthResponse with aggregated health info.
+        """
+        for machine in self.machines:
+            self._refresh_machine_health(machine)
+        return ClientsHealthResponse.from_machines(self.machines)
+
+    def _refresh_machine_health(self, machine: MachineState) -> None:
+        """Refresh health for a single machine."""
+        try:
+            health = machine.client.health()
+            machine.healthy = health.status == "healthy" or health.healthy > 0
+            machine.healthy_instances = health.healthy
+            machine.total_instances = health.total
+        except Exception:
+            machine.healthy = False
+            machine.healthy_instances = 0
+
+    def health(self) -> ClientsHealthResponse:
+        """Check health status of all machines.
+
+        Returns:
+            ClientsHealthResponse with aggregated health info.
+        """
+        return self.refresh_health()
+
+    def _ensure_healthy(self) -> list[MachineState]:
+        """Ensure healthy machines are available, refreshing if needed."""
+        healthy = self.machine_scheduler.get_healthy_machines()
+        if not healthy:
+            self.refresh_health()
+            healthy = self.machine_scheduler.get_healthy_machines()
+        if not healthy:
+            raise ValueError("No healthy machines available")
+        return healthy
+
+    def embed(
+        self,
+        inputs: Union[str, list[str]],
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[list[float]]:
+        """Generate embeddings for input texts using multiple machines.
+
+        Args:
+            inputs: Single text or list of texts to embed.
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of embedding vectors (list of floats).
+
+        Raises:
+            ValueError: When no healthy machines available or all requests fail
+        """
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        if not inputs:
+            return []
+
+        healthy = self._ensure_healthy()
+
+        # Small inputs: single machine, round-robin
+        if len(inputs) <= 10:
+            machine = healthy[self._rr_index % len(healthy)]
+            self._rr_index += 1
+            return machine.client.embed(inputs, normalize=normalize, truncate=truncate)
+
+        # Single machine: direct call
+        if len(healthy) == 1:
+            return healthy[0].client.embed(
+                inputs, normalize=normalize, truncate=truncate
+            )
+
+        # Multiple machines: pipeline
+        return self._pipeline.run_pipeline(
+            inputs=inputs,
+            healthy=healthy,
+            request_fn=lambda m, chunk: m.async_client.embed(
+                chunk, normalize=normalize, truncate=truncate
+            ),
+            action_name="embed",
+        )
+
+    def lsh(
+        self,
+        inputs: Union[str, list[str]],
+        bitn: int = 2048,
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[str]:
+        """Generate LSH hash hex strings for input texts using multiple machines.
+
+        Args:
+            inputs: Single text or list of texts.
+            bitn: Number of LSH hash bits (default: 2048, range: 64-8192)
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of hex strings representing LSH hashes.
+
+        Raises:
+            ValueError: When no healthy machines available or all requests fail
+        """
+        if isinstance(inputs, str):
+            inputs = [inputs]
+        if not inputs:
+            return []
+
+        healthy = self._ensure_healthy()
+
+        # Small inputs: single machine, round-robin
+        if len(inputs) <= 10:
+            machine = healthy[self._rr_index % len(healthy)]
+            self._rr_index += 1
+            return machine.client.lsh(
+                inputs, bitn=bitn, normalize=normalize, truncate=truncate
+            )
+
+        # Single machine: direct call
+        if len(healthy) == 1:
+            return healthy[0].client.lsh(
+                inputs, bitn=bitn, normalize=normalize, truncate=truncate
+            )
+
+        # Multiple machines: pipeline
+        return self._pipeline.run_pipeline(
+            inputs=inputs,
+            healthy=healthy,
+            request_fn=lambda m, chunk: m.async_client.lsh(
+                chunk, bitn=bitn, normalize=normalize, truncate=truncate
+            ),
+            action_name="lsh",
+        )
+
+    def lsh_iter(
+        self,
+        inputs: Iterable[str],
+        total_hint: int | None = None,
+        bitn: int = 2048,
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[str]:
+        """Generate LSH hashes for an iterable of texts using pipeline scheduling.
+
+        Optimized for large datasets where you don't want to materialize
+        the entire input list in memory.
+
+        Args:
+            inputs: Iterable of texts (can be generator, iterator, or list)
+            total_hint: Optional hint for total number of items (for progress logging)
+            bitn: Number of LSH hash bits (default: 2048)
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of hex strings representing LSH hashes, in input order.
+        """
+        healthy = self._ensure_healthy()
+        return self._pipeline.run_pipeline(
+            inputs=iter(inputs),
+            healthy=healthy,
+            request_fn=lambda m, chunk: m.async_client.lsh(
+                chunk, bitn=bitn, normalize=normalize, truncate=truncate
+            ),
+            action_name="lsh",
+            total_hint=total_hint,
+        )
+
+    def info(self) -> list[InfoResponse]:
+        """Get info from all machines.
+
+        Returns:
+            List of InfoResponse from each machine.
+        """
+        responses = []
+        for machine in self.machines:
+            try:
+                responses.append(machine.client.info())
+            except Exception:
+                pass
+        return responses
