@@ -40,18 +40,12 @@ Examples:
   tei_compose logs -f --tail 50     # Follow with 50 lines buffer
 
 Startup Strategy:
-  The 'up' command uses a smart two-phase startup approach:
-  1. First attempts to start all services together (fastest)
-  2. If batch start fails (e.g., GPU errors), automatically falls back
-     to individual service startup with health checks
-  3. Each GPU failure is isolated and won't prevent other GPUs from starting
-  
-  This provides optimal performance when all GPUs are healthy, while
-  maintaining robustness when some GPUs have issues.
+  The 'up' command detects healthy GPUs and starts all services together.
+  Pre-checks GPU health to filter out unhealthy GPUs before deployment.
 
 Health Check:
   - Use 'tei_compose health' to diagnose GPU issues before deployment
-  - Individual startup mode pre-checks each GPU before starting its container
+  - Unhealthy GPUs are automatically excluded from deployment
 """
 
 import argparse
@@ -103,28 +97,69 @@ class GPUDetector:
     """GPU detection and management."""
 
     @staticmethod
-    def detect(gpu_ids: Optional[str] = None) -> list[GPUInfo]:
-        """Detect available GPUs and their compute capabilities."""
+    def detect(
+        gpu_ids: Optional[str] = None, check_health: bool = True
+    ) -> list[GPUInfo]:
+        """Detect available GPUs and their compute capabilities.
+
+        Args:
+            gpu_ids: Comma-separated GPU IDs to filter by
+            check_health: Whether to pre-check GPU health and filter unhealthy GPUs
+
+        Returns:
+            List of healthy GPUInfo objects
+        """
         try:
             result = subprocess.run(
                 "nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader,nounits",
                 shell=True,
                 capture_output=True,
                 text=True,
-                check=True,
             )
+            # Note: nvidia-smi may return exit code 0 even with some GPU errors
+            # The error messages go to stderr, but stdout still contains healthy GPUs
+
             gpus = []
+            unhealthy_gpus = []
+
             for line in result.stdout.strip().split("\n"):
                 if line.strip():
                     parts = line.split(",")
-                    index = int(parts[0].strip())
-                    compute_cap = parts[1].strip()
-                    gpus.append(GPUInfo(index, compute_cap))
+                    if len(parts) >= 2:
+                        try:
+                            index = int(parts[0].strip())
+                            compute_cap = parts[1].strip()
+                            gpus.append(GPUInfo(index, compute_cap))
+                        except (ValueError, IndexError):
+                            continue
+
+            # Check stderr for GPU errors (e.g., dropped GPUs)
+            if result.stderr:
+                stderr_lower = result.stderr.lower()
+                if "error" in stderr_lower or "unable" in stderr_lower:
+                    logger.warn(f"[tfmx] nvidia-smi warnings detected:")
+                    for line in result.stderr.strip().split("\n"):
+                        if line.strip():
+                            logger.warn(f"  {line.strip()}")
 
             # Filter by specified GPU IDs
             if gpu_ids:
                 specified = [int(x.strip()) for x in gpu_ids.split(",")]
                 gpus = [g for g in gpus if g.index in specified]
+
+            # Health check each GPU if enabled
+            if check_health:
+                healthy_gpus = []
+                for gpu in gpus:
+                    is_healthy, msg = GPUDetector.check_gpu_health(gpu.index)
+                    if is_healthy:
+                        healthy_gpus.append(gpu)
+                    else:
+                        unhealthy_gpus.append((gpu.index, msg))
+                        logger.warn(
+                            f"[tfmx] GPU {gpu.index} excluded (unhealthy): {msg}"
+                        )
+                gpus = healthy_gpus
 
             return gpus
         except (subprocess.CalledProcessError, FileNotFoundError) as e:
@@ -147,19 +182,51 @@ class GPUDetector:
                 text=True,
                 timeout=10,
             )
+
+            # Check stderr for errors (nvidia-smi may return 0 even with errors)
+            if result.stderr:
+                stderr_lower = result.stderr.lower()
+                if (
+                    "error" in stderr_lower
+                    or "unable" in stderr_lower
+                    or "unknown" in stderr_lower
+                ):
+                    return False, f"nvidia-smi error: {result.stderr.strip()}"
+
             if result.returncode != 0:
                 error_msg = result.stderr.strip() or "Unknown error"
                 return False, f"nvidia-smi failed: {error_msg}"
 
             # Check for NVML errors in output
-            if "error" in result.stdout.lower() or "failed" in result.stdout.lower():
+            stdout_lower = result.stdout.lower()
+            if "error" in stdout_lower or "failed" in stdout_lower:
                 return False, f"GPU error: {result.stdout.strip()}"
+
+            # Verify we got valid output (should contain GPU name)
+            if not result.stdout.strip():
+                return False, "No GPU info returned"
 
             return True, result.stdout.strip()
         except subprocess.TimeoutExpired:
-            return False, "nvidia-smi timeout"
+            return False, "nvidia-smi timeout (GPU may be frozen)"
         except Exception as e:
             return False, f"Health check failed: {e}"
+
+    @staticmethod
+    def get_unhealthy_gpu_summary() -> str:
+        """Get a summary of any unhealthy GPUs for diagnostic purposes."""
+        try:
+            result = subprocess.run(
+                "nvidia-smi --query-gpu=index,compute_cap --format=csv,noheader,nounits",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            if result.stderr and "error" in result.stderr.lower():
+                return result.stderr.strip()
+            return ""
+        except Exception:
+            return ""
 
 
 class ModelConfigManager:
@@ -495,56 +562,6 @@ class TEIComposer:
             full_cmd, shell=True, capture_output=capture_output, text=True
         )
 
-    def _start_service_isolated(
-        self, gpu: GPUInfo, check_health: bool = True
-    ) -> tuple[bool, str]:
-        """Start a single service in isolation with error handling.
-
-        Args:
-            gpu: GPU info for the service to start
-            check_health: Whether to pre-check GPU health
-
-        Returns:
-            (success, message) tuple
-        """
-        service_name = self._get_service_name(gpu)
-        container_name = self._get_container_name(gpu)
-
-        # Pre-check GPU health
-        if check_health:
-            is_healthy, health_msg = GPUDetector.check_gpu_health(gpu.index)
-            if not is_healthy:
-                return False, f"GPU {gpu.index} unhealthy: {health_msg}"
-
-        # Try to start the service
-        try:
-            result = self._run_service_cmd("up -d", gpu, capture_output=True)
-            if result.returncode != 0:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                # Check for common NVML errors
-                if "nvml" in error_msg.lower() or "nvidia" in error_msg.lower():
-                    return False, f"NVIDIA runtime error: {error_msg}"
-                return False, f"Failed to start: {error_msg}"
-
-            # Verify container is running
-            check_result = subprocess.run(
-                f'docker ps --filter "name=^/{container_name}$" --format "{{{{.Status}}}}"',
-                shell=True,
-                capture_output=True,
-                text=True,
-            )
-            status = check_result.stdout.strip()
-            if status and status.startswith("Up"):
-                return True, f"Started successfully"
-            else:
-                return (
-                    False,
-                    f"Container not running after start: {status or 'not found'}",
-                )
-
-        except Exception as e:
-            return False, f"Exception during start: {e}"
-
     def _start_all_together(self) -> tuple[bool, str]:
         """Try to start all services together.
 
@@ -552,45 +569,53 @@ class TEIComposer:
             (success, message) tuple
         """
         try:
-            result = self._run_compose_cmd("up -d", capture_output=True)
+            # Use --remove-orphans to clean up containers from previous deployments
+            # (e.g., when GPUs change or some GPUs are removed)
+            result = self._run_compose_cmd(
+                "up -d --remove-orphans", capture_output=True
+            )
             if result.returncode != 0:
-                error_msg = result.stderr.strip() if result.stderr else "Unknown error"
-                return False, error_msg
-            return True, "All services started together"
+                error_msg = ""
+                if result.stderr:
+                    # Handle bytes or string
+                    if isinstance(result.stderr, bytes):
+                        error_msg = result.stderr.decode("utf-8", errors="replace")
+                    else:
+                        error_msg = result.stderr
+                    error_msg = error_msg.strip()
+                return False, error_msg or "Unknown error"
+
+            # Return stdout for progress info display
+            stdout_msg = ""
+            if result.stdout:
+                if isinstance(result.stdout, bytes):
+                    stdout_msg = result.stdout.decode("utf-8", errors="replace")
+                else:
+                    stdout_msg = result.stdout
+                stdout_msg = stdout_msg.strip()
+
+            return True, stdout_msg or "All services started together"
         except Exception as e:
             return False, f"Exception: {e}"
-
-    def _start_individually(self) -> dict[int, tuple[bool, str]]:
-        """Start each GPU service independently with error handling.
-
-        Returns:
-            Dictionary mapping GPU index to (success, message) tuples
-        """
-        results: dict[int, tuple[bool, str]] = {}
-        logger.mesg(f"[tfmx] Starting services individually...")
-
-        for gpu in self.gpus:
-            service_name = self._get_service_name(gpu)
-            logger.mesg(f"[tfmx] Starting {service_name} (GPU {gpu.index})...")
-            success, message = self._start_service_isolated(gpu, check_health=True)
-            results[gpu.index] = (success, message)
-
-            if success:
-                logger.okay(f"  ✓ GPU {gpu.index}: {message}")
-            else:
-                logger.warn(f"  × GPU {gpu.index}: {message}")
-
-        return results
 
     def up(self) -> None:
         """Start all TEI containers.
 
         Strategy:
-        1. Try to start all services together for efficiency
-        2. If batch start fails, fall back to individual startup with error isolation
+        1. Pre-check all GPUs and filter unhealthy ones
+        2. Start all services together
+        3. Show diagnostics if startup fails
         """
         if not self.gpus:
-            logger.warn("× No GPUs detected")
+            logger.warn("× No healthy GPUs detected")
+            # Show diagnostic info
+            gpu_summary = GPUDetector.get_unhealthy_gpu_summary()
+            if gpu_summary:
+                logger.warn(f"[tfmx] GPU issues detected:")
+                for line in gpu_summary.split("\n"):
+                    if line.strip():
+                        logger.warn(f"  {line.strip()}")
+            logger.hint("[tfmx] System may require reboot to recover dropped GPUs")
             return
 
         logger.mesg(f"[tfmx] Starting TEI for model: {self.model_name}")
@@ -612,70 +637,57 @@ class TEIComposer:
         # Generate compose file
         self.generate_compose_file()
 
-        # Try to start all services together first
-        logger.mesg(f"[tfmx] Attempting to start all services together...")
+        # Start all services together
+        logger.mesg(f"[tfmx] Starting all services...")
         success, message = self._start_all_together()
 
         if success:
-            logger.okay(f"[tfmx] {message}")
-            # Verify all containers are running
-            all_running = True
-            for gpu in self.gpus:
-                container_name = self._get_container_name(gpu)
-                check_result = subprocess.run(
-                    f'docker ps --filter "name=^/{container_name}$" --format "{{{{.Status}}}}"',
-                    shell=True,
-                    capture_output=True,
-                    text=True,
-                )
-                status = check_result.stdout.strip()
-                if not status or not status.startswith("Up"):
-                    all_running = False
-                    break
-
-            if all_running:
-                logger.okay(
-                    f"[tfmx] All GPU services started successfully: {[g.index for g in self.gpus]}"
-                )
-            else:
-                logger.warn(
-                    f"[tfmx] Some containers failed to start, falling back to individual startup..."
-                )
-                # Clean up partial deployment
-                self._run_compose_cmd("down", capture_output=True)
-                # Start individually
-                results = self._start_individually()
-                self._show_startup_summary(results)
+            # Show progress info
+            if message and message != "All services started together":
+                for line in message.split("\n"):
+                    if line.strip():
+                        logger.mesg(f" {line}")
+            logger.okay(
+                f"[tfmx] All GPU services started successfully: {[g.index for g in self.gpus]}"
+            )
         else:
-            logger.warn(f"[tfmx] Batch startup failed: {message}")
-            logger.mesg(f"[tfmx] Falling back to individual service startup...")
-            # Start individually
-            results = self._start_individually()
-            self._show_startup_summary(results)
+            # Parse error message and display with appropriate colors
+            logger.warn(f"[tfmx] Startup failed")
+            if message:
+                error_found = False
+                for line in message.split("\n"):
+                    line = line.strip()
+                    if not line:
+                        continue
+                    # Check if line contains error indicators
+                    if any(
+                        keyword in line.lower()
+                        for keyword in ["error", "failed", "unable"]
+                    ):
+                        logger.warn(f" {line}")
+                        error_found = True
+                    else:
+                        # Normal progress messages
+                        logger.mesg(f" {line}")
+
+                # Show hint only if NVIDIA error detected
+                if error_found and (
+                    "nvml" in message.lower() or "nvidia" in message.lower()
+                ):
+                    logger.hint(
+                        "[tfmx] NVIDIA runtime error - system may require reboot to recover dropped GPUs"
+                    )
 
         # Show status
         self.ps()
-
-    def _show_startup_summary(self, results: dict[int, tuple[bool, str]]) -> None:
-        """Show summary of individual startup results."""
-        succeeded = [idx for idx, (ok, _) in results.items() if ok]
-        failed = [idx for idx, (ok, _) in results.items() if not ok]
-
-        print()
-        if succeeded:
-            logger.okay(f"[tfmx] Successfully started: GPU {succeeded}")
-        if failed:
-            logger.warn(f"[tfmx] Failed to start: GPU {failed}")
-            for idx in failed:
-                _, msg = results[idx]
-                logger.warn(f"  GPU {idx}: {msg}")
 
     def down(self) -> None:
         """Stop and remove all TEI containers."""
         if not self.compose_file.exists():
             logger.warn(f"× Compose file not found: {self.compose_file}")
             return
-        self._run_compose_cmd("down")
+        # Use --remove-orphans to clean up any orphaned containers
+        self._run_compose_cmd("down --remove-orphans")
 
     def stop(self) -> None:
         """Stop all TEI containers (keep containers)."""
