@@ -20,29 +20,29 @@ Examples:
   tei_compose setup                 # Setup model cache (run once before first 'up')
   
   # With specific model
-  tei_compose -m "$MODEL" generate  # Generate compose file only
-  tei_compose -m "$MODEL" up        # Start with specified model
-  tei_compose -m "Alibaba-NLP/gte-multilingual-base" up  # Use model name directly
+  tei_compose generate -m "$MODEL"  # Generate compose file only
+  tei_compose up -m "$MODEL"        # Start with specified model
+  tei_compose up -m "Alibaba-NLP/gte-multilingual-base"  # Use model name directly
   
   # With specific GPUs
-  tei_compose -g "0,1" up           # Start on GPU 0 and 1
-  tei_compose -g "2" up             # Start on GPU 2 only
+  tei_compose up -g "0,1"           # Start on GPU 0 and 1
+  tei_compose up -g "2"             # Start on GPU 2 only
   
   # Custom port and project name
-  tei_compose -p 28890 up           # Use port 28890 as base
-  tei_compose -j my-tei up          # Custom project name
+  tei_compose up -p 28890           # Use port 28890 as base
+  tei_compose up -j my-tei          # Custom project name
   
   # With HuggingFace token for private models
-  tei_compose -t hf_**** up         # Use HF token
+  tei_compose up -t hf_****         # Use HF token
   
   # With HTTP proxy for downloading models (useful in restricted network environments)
-  tei_compose --proxy http://127.0.0.1:11111 up  # Use local proxy
+  tei_compose up --proxy http://127.0.0.1:11111  # Use local proxy
   
   # Advanced: Manual device mount mode (bypasses nvidia-container-cli)
-  tei_compose --mount-mode manual up  # Use when nvidia-container-runtime fails due to GPU issues
+  tei_compose up --mount-mode manual  # Use when nvidia-container-runtime fails due to GPU issues
   
   # Combined: Manual mode with proxy (recommended for GPU issues + network restrictions)
-  tei_compose --mount-mode manual --proxy http://127.0.0.1:11111 up
+  tei_compose up --mount-mode manual --proxy http://127.0.0.1:11111
   
   # Advanced log viewing
   tei_compose logs -f               # Follow logs in real-time
@@ -1158,88 +1158,152 @@ class TEIComposeArgParser:
         self._setup_arguments()
         self.args = self.parser.parse_args()
 
-    def _setup_arguments(self):
-        """Setup all command-line arguments."""
-        # Model configuration
-        self.parser.add_argument(
+    def _add_common_arguments(self, parser):
+        """Add common arguments shared by most commands."""
+        parser.add_argument(
             "-m",
             "--model-name",
             type=str,
             default=MODEL_NAME,
             help=f"Model name (default: {MODEL_NAME})",
         )
-        self.parser.add_argument(
+        parser.add_argument(
             "-p",
             "--port",
             type=int,
             default=SERVER_PORT,
             help=f"Starting port (default: {SERVER_PORT})",
         )
-        self.parser.add_argument(
+        parser.add_argument(
             "-j",
             "--project-name",
             type=str,
             default=None,
             help="Project name (default: tei--MODEL_NAME)",
         )
-        self.parser.add_argument(
+        parser.add_argument(
             "-g",
             "--gpus",
             type=str,
             default=None,
             help="Comma-separated GPU IDs (default: all)",
         )
-        self.parser.add_argument(
+
+    def _add_deployment_arguments(self, parser):
+        """Add deployment-specific arguments (for up, generate, setup)."""
+        parser.add_argument(
             "-t",
             "--hf-token",
             type=str,
             default=None,
             help="HuggingFace token for private models",
         )
-        self.parser.add_argument(
+        parser.add_argument(
             "--mount-mode",
             type=str,
             choices=["nvidia-runtime", "manual"],
             default=DEVICE_MOUNT_MODE,
-            help=f"Device mount mode: 'nvidia-runtime' (default, requires nvidia-container-runtime) or 'manual' (bypasses NVML detection, useful when some GPUs have issues) (default: {DEVICE_MOUNT_MODE})",
+            help=f"Device mount mode (default: {DEVICE_MOUNT_MODE})",
         )
-        self.parser.add_argument(
+        parser.add_argument(
             "--proxy",
             type=str,
             default=None,
-            help="HTTP/HTTPS proxy for downloading models (e.g., http://127.0.0.1:11111)",
+            help="HTTP/HTTPS proxy for model downloads (e.g., http://127.0.0.1:11111)",
         )
 
-        # Actions
-        self.parser.add_argument(
-            "action",
-            nargs="?",
-            choices=[
-                "up",
-                "down",
-                "stop",
-                "start",
-                "restart",
-                "ps",
-                "logs",
-                "generate",
-                "health",
-                "setup",
-            ],
+    def _setup_arguments(self):
+        """Setup all command-line arguments using subparsers."""
+        subparsers = self.parser.add_subparsers(
+            dest="action",
             help="Action to perform",
+            required=False,
         )
-        self.parser.add_argument(
+
+        # up: Start containers
+        parser_up = subparsers.add_parser(
+            "up",
+            help="Start TEI containers on specified GPUs",
+        )
+        self._add_common_arguments(parser_up)
+        self._add_deployment_arguments(parser_up)
+
+        # down: Stop and remove containers
+        parser_down = subparsers.add_parser(
+            "down",
+            help="Stop and remove TEI containers",
+        )
+        self._add_common_arguments(parser_down)
+
+        # stop: Stop containers (keep them)
+        parser_stop = subparsers.add_parser(
+            "stop",
+            help="Stop TEI containers (keep them)",
+        )
+        self._add_common_arguments(parser_stop)
+
+        # start: Start stopped containers
+        parser_start = subparsers.add_parser(
+            "start",
+            help="Start stopped TEI containers",
+        )
+        self._add_common_arguments(parser_start)
+
+        # restart: Restart containers
+        parser_restart = subparsers.add_parser(
+            "restart",
+            help="Restart TEI containers",
+        )
+        self._add_common_arguments(parser_restart)
+
+        # ps: Show container status
+        parser_ps = subparsers.add_parser(
+            "ps",
+            help="Show status of TEI containers",
+        )
+        self._add_common_arguments(parser_ps)
+
+        # logs: View container logs
+        parser_logs = subparsers.add_parser(
+            "logs",
+            help="View logs of TEI containers",
+        )
+        self._add_common_arguments(parser_logs)
+        parser_logs.add_argument(
             "-f",
             "--follow",
             action="store_true",
-            help="Follow logs (for 'logs' action)",
+            help="Follow logs in real-time",
         )
-        self.parser.add_argument(
+        parser_logs.add_argument(
             "--tail",
             type=int,
             default=100,
             help="Number of log lines to show (default: 100)",
         )
+
+        # generate: Generate compose file only
+        parser_generate = subparsers.add_parser(
+            "generate",
+            help="Generate docker-compose.yml file only",
+        )
+        self._add_common_arguments(parser_generate)
+        self._add_deployment_arguments(parser_generate)
+
+        # health: Check GPU health
+        parser_health = subparsers.add_parser(
+            "health",
+            help="Check GPU health status",
+        )
+        self._add_common_arguments(parser_health)
+
+        # setup: Setup model cache
+        parser_setup = subparsers.add_parser(
+            "setup",
+            help="Setup model cache (create config files)",
+        )
+        self._add_common_arguments(parser_setup)
+        self._add_deployment_arguments(parser_setup)
 
 
 def main():
@@ -1252,20 +1316,25 @@ def main():
         return
 
     # Use default MODEL_NAME if model_name is empty or whitespace
-    model_name = args.model_name.strip() if args.model_name else MODEL_NAME
-    if not model_name:
+    model_name = getattr(args, "model_name", MODEL_NAME)
+    if model_name:
+        model_name = model_name.strip() or MODEL_NAME
+    else:
         model_name = MODEL_NAME
 
-    composer = TEIComposer(
-        model_name=model_name,
-        port=args.port,
-        project_name=args.project_name,
-        gpu_ids=args.gpus,
-        hf_token=args.hf_token,
-        mount_mode=args.mount_mode,
-        http_proxy=args.proxy,
-    )
+    # Create composer with available parameters
+    composer_kwargs = {
+        "model_name": model_name,
+        "port": getattr(args, "port", SERVER_PORT),
+        "project_name": getattr(args, "project_name", None),
+        "gpu_ids": getattr(args, "gpus", None),
+        "hf_token": getattr(args, "hf_token", None),
+        "mount_mode": getattr(args, "mount_mode", DEVICE_MOUNT_MODE),
+        "http_proxy": getattr(args, "proxy", None),
+    }
+    composer = TEIComposer(**composer_kwargs)
 
+    # Execute action
     if args.action == "up":
         composer.up()
     elif args.action == "down":
@@ -1279,7 +1348,9 @@ def main():
     elif args.action == "ps":
         composer.ps()
     elif args.action == "logs":
-        composer.logs(follow=args.follow, tail=args.tail)
+        composer.logs(
+            follow=getattr(args, "follow", False), tail=getattr(args, "tail", 100)
+        )
     elif args.action == "generate":
         composer.generate_compose_file()
     elif args.action == "health":
