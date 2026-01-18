@@ -8,15 +8,16 @@ Examples:
   export MODEL="Qwen/Qwen3-Embedding-0.6B"
   
   # Basic operations
-  tei_compose up                    # Start on all GPUs (auto fallback on failure)
+  tei_compose up                    # Start on all GPUs
   tei_compose ps                    # Check container status
   tei_compose logs                  # View recent logs
   tei_compose stop                  # Stop containers (keep them)
   tei_compose start                 # Start stopped containers
   tei_compose restart               # Restart containers
-  tei_compose down                  # Stop and remove containers
+  tei_compose down                  # Stop and remove containers (no parameters needed)
   tei_compose generate              # Generate compose file only
   tei_compose health                # Check GPU health status
+  tei_compose setup                 # Setup model cache (run once before first 'up')
   
   # With specific model
   tei_compose -m "$MODEL" generate  # Generate compose file only
@@ -34,14 +35,47 @@ Examples:
   # With HuggingFace token for private models
   tei_compose -t hf_**** up         # Use HF token
   
+  # With HTTP proxy for downloading models (useful in restricted network environments)
+  tei_compose --proxy http://127.0.0.1:11111 up  # Use local proxy
+  
+  # Advanced: Manual device mount mode (bypasses nvidia-container-cli)
+  tei_compose --mount-mode manual up  # Use when nvidia-container-runtime fails due to GPU issues
+  
+  # Combined: Manual mode with proxy (recommended for GPU issues + network restrictions)
+  tei_compose --mount-mode manual --proxy http://127.0.0.1:11111 up
+  
   # Advanced log viewing
   tei_compose logs -f               # Follow logs in real-time
   tei_compose logs --tail 200       # Show last 200 lines
   tei_compose logs -f --tail 50     # Follow with 50 lines buffer
 
+Device Mount Modes:
+  nvidia-runtime: (default) Uses Docker GPU reservation via nvidia-container-runtime
+                  Fast and standard, but may fail if any GPU has NVML issues
+  
+  manual:         Manually mounts /dev/nvidia* device nodes and driver libraries
+                  Bypasses nvidia-container-cli NVML detection, useful when some GPUs
+                  have dropped or become inaccessible (e.g., "Unknown Error")
+                  Recommended when nvidia-container-runtime fails with NVML errors
+
+HTTP Proxy:
+  Use --proxy to set HTTP/HTTPS proxy for model downloads from HuggingFace Hub
+  Useful in restricted network environments or when direct access is limited
+  Example: --proxy http://127.0.0.1:11111
+
 Startup Strategy:
   The 'up' command detects healthy GPUs and starts all services together.
   Pre-checks GPU health to filter out unhealthy GPUs before deployment.
+
+Setup (First Time):
+  Run 'tei_compose setup' once before first 'up' to pre-create config files.
+  This creates empty sentence_*_config.json files in the model cache to skip
+  slow downloads from HuggingFace Hub. Only needed once per model.
+  
+  Example workflow:
+    1. huggingface-cli download Qwen/Qwen3-Embedding-0.6B  # Download model
+    2. tei_compose setup                                    # Create config files
+    3. tei_compose up                                       # Start containers
 
 Health Check:
   - Use 'tei_compose health' to diagnose GPU issues before deployment
@@ -78,6 +112,78 @@ TEI_IMAGE_BASE = "ghcr.io/huggingface/text-embeddings-inference"
 TEI_IMAGE_MIRROR = "m.daocloud.io"
 
 MAX_CLIENT_BATCH_SIZE = 300
+
+# Device mount mode: 'nvidia-runtime' uses docker GPU reservation, 'manual' uses explicit device mounts
+# Manual mode bypasses nvidia-container-cli NVML detection, useful when some GPUs have issues
+DEVICE_MOUNT_MODE = "manual"  # or "nvidia-runtime"
+
+# Sentence transformer config files that TEI tries to download
+# These files are usually empty {} but download is slow due to network restrictions
+# We pre-create them in the model cache directory to skip downloads
+SENTENCE_CONFIG_FILES = [
+    "sentence_bert_config.json",
+    "sentence_roberta_config.json",
+    "sentence_distilbert_config.json",
+    "sentence_camembert_config.json",
+    "sentence_albert_config.json",
+    "sentence_xlm-roberta_config.json",
+    "sentence_xlnet_config.json",
+]
+
+
+class NvidiaDriverLibs:
+    """Detect and manage NVIDIA driver library paths."""
+
+    @staticmethod
+    def detect_driver_lib_dir() -> Optional[str]:
+        """Detect NVIDIA driver library directory.
+
+        Returns:
+            Path to driver libraries, or None if not found
+        """
+        # Common locations to check
+        candidates = [
+            "/lib/x86_64-linux-gnu",
+            "/usr/lib/x86_64-linux-gnu",
+            "/usr/lib64",
+            "/usr/local/nvidia/lib64",
+        ]
+
+        for path in candidates:
+            if Path(path).exists():
+                # Check if libcuda.so exists
+                if list(Path(path).glob("libcuda.so*")):
+                    return path
+
+        # Fallback: use ldconfig to find libcuda.so
+        try:
+            result = subprocess.run(
+                "ldconfig -p | grep 'libcuda.so\\.' | grep x86-64 | head -1 | awk '{print $NF}'",
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            if result.returncode == 0 and result.stdout.strip():
+                lib_path = result.stdout.strip()
+                return str(Path(lib_path).parent)
+        except Exception:
+            pass
+
+        return None
+
+    @staticmethod
+    def get_required_devices() -> list[str]:
+        """Get list of required NVIDIA device nodes for manual mounting.
+
+        Returns:
+            List of device paths
+        """
+        return [
+            "/dev/nvidiactl",
+            "/dev/nvidia-uvm",
+            "/dev/nvidia-uvm-tools",
+            "/dev/nvidia-modeset",
+        ]
 
 
 class GPUInfo:
@@ -275,7 +381,11 @@ class ModelConfigManager:
         return None
 
     def patch_config_files(self, model_name: str) -> None:
-        """Patch config files to fix issues with some models."""
+        """Patch config files to fix issues with some models.
+
+        Note: For sentence_*_config.json files, use 'tei_compose setup' instead,
+        which runs in a Docker container with proper permissions.
+        """
         snapshot_dir = self.get_model_snapshot_dir(model_name)
         if not snapshot_dir:
             logger.mesg(f"[tfmx] Model cache not found, skipping patch")
@@ -283,25 +393,8 @@ class ModelConfigManager:
 
         tfmx_src = self.get_tfmx_src_dir()
 
-        # Patch config_sentence_transformers.json
-        self._patch_sentence_transformers_config(snapshot_dir, tfmx_src)
-
         # Patch config.json (check for corruption)
         self._patch_main_config(snapshot_dir, tfmx_src)
-
-    def _patch_sentence_transformers_config(
-        self, snapshot_dir: Path, tfmx_src: Path
-    ) -> None:
-        """Patch config_sentence_transformers.json if missing."""
-        config_name = "config_sentence_transformers.json"
-        target = snapshot_dir / config_name
-        source = tfmx_src / config_name
-
-        if target.exists():
-            logger.mesg(f"[tfmx] Skip existed: '{target}'")
-        elif source.exists():
-            shutil.copy(source, target)
-            logger.okay(f"[tfmx] Copied: '{target}'")
 
     def _patch_main_config(self, snapshot_dir: Path, tfmx_src: Path) -> None:
         """Patch config.json, fixing corruption if needed."""
@@ -311,18 +404,24 @@ class ModelConfigManager:
 
         if target.exists():
             # Check if file is corrupted (doesn't end with })
-            content = target.read_text().strip()
-            if not content.endswith("}"):
-                logger.warn(f"[tfmx] Corrupted: '{target}'")
-                target.unlink()
-                if source.exists():
-                    shutil.copy(source, target)
-                    logger.okay(f"[tfmx] Patched: '{target}'")
-            else:
-                logger.mesg(f"[tfmx] Skip existed: '{target}'")
+            try:
+                content = target.read_text().strip()
+                if not content.endswith("}"):
+                    logger.warn(f"[tfmx] Corrupted: '{target}'")
+                    target.unlink()
+                    if source.exists():
+                        shutil.copy(source, target)
+                        logger.okay(f"[tfmx] Patched: '{target}'")
+                else:
+                    logger.mesg(f"[tfmx] Skip existed: '{target}'")
+            except PermissionError:
+                logger.mesg(f"[tfmx] Skip (permission): '{target}'")
         elif source.exists():
-            shutil.copy(source, target)
-            logger.okay(f"[tfmx] Copied: '{target}'")
+            try:
+                shutil.copy(source, target)
+                logger.okay(f"[tfmx] Copied: '{target}'")
+            except PermissionError:
+                logger.warn(f"[tfmx] Permission denied: '{target}'")
 
 
 class DockerImageManager:
@@ -376,6 +475,9 @@ class ComposeFileGenerator:
         cache_hf: str = CACHE_HF,
         cache_hf_hub: str = CACHE_HF_HUB,
         hf_endpoint: str = HF_ENDPOINT,
+        mount_mode: str = "manual",
+        driver_lib_dir: Optional[str] = None,
+        http_proxy: Optional[str] = None,
     ):
         self.gpus = gpus
         self.model_name = model_name
@@ -386,6 +488,9 @@ class ComposeFileGenerator:
         self.cache_hf = cache_hf
         self.cache_hf_hub = cache_hf_hub
         self.hf_endpoint = hf_endpoint
+        self.mount_mode = mount_mode
+        self.driver_lib_dir = driver_lib_dir or NvidiaDriverLibs.detect_driver_lib_dir()
+        self.http_proxy = http_proxy
 
     def generate(self) -> str:
         """Generate docker-compose.yml content with YAML anchors for common config."""
@@ -416,59 +521,169 @@ class ComposeFileGenerator:
             f"  volumes:",
             f"    - ${{HOME}}/{self.cache_hf}:/root/{self.cache_hf}",
             f"    - {self.data_dir}:/data",
-            f"  environment:",
-            f"    - HF_ENDPOINT={self.hf_endpoint}",
-            f"    - HF_HOME=/root/{self.cache_hf}",
-            f"    - HF_HUB_CACHE=/root/{self.cache_hf_hub}",
-            f"    - HUGGINGFACE_HUB_CACHE=/root/{self.cache_hf_hub}",
-            f"  command:",
-            f"    - --huggingface-hub-cache",
-            f"    - /root/{self.cache_hf_hub}",
-            f"    - --model-id",
-            f"    - {self.model_name}",
         ]
-        if self.hf_token:
-            lines.extend([f"    - --hf-token", f"    - {self.hf_token}"])
+
+        # Add driver library volume for manual mode
+        if self.mount_mode == "manual" and self.driver_lib_dir:
+            lines.append(f"    - {self.driver_lib_dir}:/usr/local/nvidia/lib64:ro")
+
         lines.extend(
             [
-                f"    - --dtype",
-                f"    - float16",
-                f"    - --max-batch-tokens",
-                f'    - "32768"',
-                f"    - --max-client-batch-size",
-                f'    - "{MAX_CLIENT_BATCH_SIZE}"',
-                # f"  restart: unless-stopped",
-                f"  healthcheck:",
-                f'    test: ["CMD", "curl", "-f", "http://localhost:80/health"]',
-                f"    interval: 30s",
-                f"    timeout: 10s",
-                f"    retries: 3",
-                f"    start_period: 60s",
-                f"",
+                f"  environment:",
+                f"    - HF_ENDPOINT={self.hf_endpoint}",
+                f"    - HF_HOME=/root/{self.cache_hf}",
+                f"    - HF_HUB_CACHE=/root/{self.cache_hf_hub}",
+                f"    - HUGGINGFACE_HUB_CACHE=/root/{self.cache_hf_hub}",
             ]
         )
+
+        # Add HTTP proxy settings if specified
+        if self.http_proxy:
+            lines.extend(
+                [
+                    f"    - HTTP_PROXY={self.http_proxy}",
+                    f"    - HTTPS_PROXY={self.http_proxy}",
+                    f"    - http_proxy={self.http_proxy}",
+                    f"    - https_proxy={self.http_proxy}",
+                    # NO_PROXY for local services
+                    f"    - NO_PROXY=localhost,127.0.0.1",
+                    f"    - no_proxy=localhost,127.0.0.1",
+                ]
+            )
+
+        # Add LD_LIBRARY_PATH for manual mode
+        if self.mount_mode == "manual":
+            lines.append(f"    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64")
+
+        lines.append(f"")
         return lines
 
     def _generate_service(self, gpu: GPUInfo) -> list[str]:
-        """Generate service definition for a single GPU using YAML anchor."""
+        """Generate service definition for a single GPU.
+
+        Supports two modes:
+        - nvidia-runtime: Uses Docker GPU reservation (requires nvidia-container-runtime)
+        - manual: Manually mounts device nodes (bypasses nvidia-container-cli NVML detection)
+        """
         service_port = self.port + gpu.index
         container_name = f"{self.project_name}--gpu{gpu.index}"
+
         lines = [
             f"  tei-gpu{gpu.index}:",
             f"    <<: *common-config",
             f"    image: {gpu.image}",
             f"    container_name: {container_name}",
-            f"    ports:",
-            f'      - "{service_port}:80"',
-            f"    deploy:",
-            f"      resources:",
-            f"        reservations:",
-            f"          devices:",
-            f"            - driver: nvidia",
-            f'              device_ids: ["{gpu.index}"]',
-            f"              capabilities: [gpu]",
-            f"",
         ]
+
+        # Use host network when proxy is configured (to access host's proxy at 127.0.0.1)
+        if self.http_proxy:
+            lines.append(f"    network_mode: host")
+            # In host mode, container uses host's network stack directly
+            # No port mapping needed, service will be accessible at host:{service_port}
+        else:
+            # Bridge mode - need port mapping
+            lines.extend(
+                [
+                    f"    ports:",
+                    f'      - "{service_port}:80"',
+                ]
+            )
+
+        if self.mount_mode == "manual":
+            # Manual device mounting mode - bypasses nvidia-container-cli
+            lines.append(f"    devices:")
+            # Add GPU-specific device
+            lines.append(f"      - /dev/nvidia{gpu.index}:/dev/nvidia{gpu.index}")
+            # Add common NVIDIA devices
+            for device in NvidiaDriverLibs.get_required_devices():
+                if Path(device).exists():
+                    lines.append(f"      - {device}:{device}")
+
+            # CRITICAL: When mounting a single GPU device, always set CUDA_VISIBLE_DEVICES=0
+            # This tells CUDA that the single mounted GPU should be treated as device 0
+            # within the container, regardless of its actual index on the host.
+            # Without this, CUDA will try to enumerate all GPUs up to the host index
+            # and fail with CUDA_ERROR_NO_DEVICE when it can't find the intermediate devices.
+            lines.extend(
+                [
+                    f"    environment:",
+                    f"      - CUDA_VISIBLE_DEVICES=0",
+                ]
+            )
+        else:
+            # nvidia-runtime mode - uses docker GPU reservation
+            lines.extend(
+                [
+                    f"    deploy:",
+                    f"      resources:",
+                    f"        reservations:",
+                    f"          devices:",
+                    f"            - driver: nvidia",
+                    f'              device_ids: ["{gpu.index}"]',
+                    f"              capabilities: [gpu]",
+                ]
+            )
+
+        # Generate command arguments
+        lines.extend(
+            [
+                f"    command:",
+                f"      - --huggingface-hub-cache",
+                f"      - /root/{self.cache_hf_hub}",
+                f"      - --model-id",
+                f"      - {self.model_name}",
+            ]
+        )
+        if self.hf_token:
+            lines.extend(
+                [
+                    f"      - --hf-token",
+                    f"      - {self.hf_token}",
+                ]
+            )
+        lines.extend(
+            [
+                f"      - --dtype",
+                f"      - float16",
+                f"      - --max-batch-tokens",
+                f'      - "32768"',
+                f"      - --max-client-batch-size",
+                f'      - "{MAX_CLIENT_BATCH_SIZE}"',
+            ]
+        )
+
+        # In host network mode, specify the port for TEI to bind to
+        if self.http_proxy:
+            lines.extend(
+                [
+                    f"      - --port",
+                    f'      - "{service_port}"',
+                ]
+            )
+
+        # Generate healthcheck configuration
+        lines.append(f"    healthcheck:")
+        if self.http_proxy:
+            # In host network mode, check the specific port TEI binds to
+            lines.append(
+                f'      test: ["CMD", "curl", "-f", "http://localhost:{service_port}/health"]'
+            )
+        else:
+            # In bridge mode, always check port 80 (internal container port)
+            lines.append(
+                f'      test: ["CMD", "curl", "-f", "http://localhost:80/health"]'
+            )
+
+        lines.extend(
+            [
+                f"      interval: 30s",
+                f"      timeout: 10s",
+                f"      retries: 3",
+                f"      start_period: 60s",
+            ]
+        )
+
+        lines.append(f"")
         return lines
 
 
@@ -483,11 +698,15 @@ class TEIComposer:
         gpu_ids: Optional[str] = None,
         hf_token: Optional[str] = None,
         compose_dir: Optional[Path] = None,
+        mount_mode: str = DEVICE_MOUNT_MODE,
+        http_proxy: Optional[str] = None,
     ):
         self.model_name = model_name
         self.port = port
         self.gpu_ids = gpu_ids
         self.hf_token = hf_token
+        self.mount_mode = mount_mode
+        self.http_proxy = http_proxy
 
         # project name must match: '^[a-z0-9][a-z0-9_-]*$'
         project_dash = model_name.replace("/", "--").lower()
@@ -538,6 +757,8 @@ class TEIComposer:
             project_name=self.project_name,
             data_dir=data_dir,
             hf_token=self.hf_token,
+            mount_mode=self.mount_mode,
+            http_proxy=self.http_proxy,
         )
         content = compose_generator.generate()
         self.compose_file.write_text(content)
@@ -623,7 +844,7 @@ class TEIComposer:
             f"[tfmx] GPUs: {[f'{g.index}(cap={g.compute_cap})' for g in self.gpus]}"
         )
 
-        # Patch config files
+        # Patch config files (if cache exists and is accessible)
         self.model_config_manager.patch_config_files(self.model_name)
 
         # Ensure images are available
@@ -682,12 +903,57 @@ class TEIComposer:
         self.ps()
 
     def down(self) -> None:
-        """Stop and remove all TEI containers."""
-        if not self.compose_file.exists():
-            logger.warn(f"× Compose file not found: {self.compose_file}")
+        """Stop and remove all TEI containers.
+
+        This command works independently without requiring any parameters.
+        It finds containers by project name prefix and removes them directly.
+        """
+        # Try compose file method first if it exists
+        if self.compose_file.exists():
+            logger.mesg(f"[tfmx] Using compose file: {self.compose_file}")
+            self._run_compose_cmd("down --remove-orphans")
             return
-        # Use --remove-orphans to clean up any orphaned containers
-        self._run_compose_cmd("down --remove-orphans")
+
+        # Fallback: find and remove containers by name pattern
+        logger.mesg(
+            f"[tfmx] Compose file not found, searching for containers by pattern"
+        )
+
+        # Find all containers matching the project name pattern
+        # Pattern: tei--<model>--gpu<N>
+        pattern = f"{self.project_name}--gpu"
+        result = subprocess.run(
+            f'docker ps -a --filter "name={pattern}" --format "{{{{.Names}}}}"',
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+
+        if result.returncode != 0:
+            logger.warn(f"× Failed to query containers")
+            return
+
+        container_names = [
+            name.strip() for name in result.stdout.strip().split("\n") if name.strip()
+        ]
+
+        if not container_names:
+            logger.mesg(f"[tfmx] No containers found matching pattern: {pattern}*")
+            return
+
+        logger.mesg(f"[tfmx] Found {len(container_names)} container(s) to remove")
+        for name in container_names:
+            logger.mesg(f"[tfmx]   - {name}")
+
+        # Remove all matching containers
+        for name in container_names:
+            subprocess.run(
+                f"docker rm -f {name}",
+                shell=True,
+                capture_output=True,
+            )
+
+        logger.okay(f"[tfmx] Removed {len(container_names)} container(s)")
 
     def stop(self) -> None:
         """Stop all TEI containers (keep containers)."""
@@ -776,6 +1042,109 @@ class TEIComposer:
 
         print("=" * 70)
 
+    def setup(self) -> None:
+        """Setup model cache with required config files.
+
+        This creates sentence_*_config.json files in the model cache directory
+        to prevent TEI from trying to download them (which is slow due to network restrictions).
+
+        Uses a Docker container to write files with correct permissions (root).
+        Run this once before first 'up' to avoid slow downloads.
+        """
+        logger.mesg(f"[tfmx] Setting up model cache for: {self.model_name}")
+
+        # Build the model cache path pattern
+        model_name_dash = self.model_name.replace("/", "--")
+        cache_path = f"/root/{CACHE_HF_HUB}/models--{model_name_dash}/snapshots"
+
+        # Build list of config files for shell
+        config_files_str = " ".join(SENTENCE_CONFIG_FILES)
+
+        # Build the shell script to create config files
+        # Note: sentence_bert_config.json requires specific fields
+        create_files_script = f"""
+SNAPSHOT_DIR=$(find {cache_path} -maxdepth 1 -type d 2>/dev/null | tail -n 1)
+
+if [ -z "$SNAPSHOT_DIR" ] || [ "$SNAPSHOT_DIR" = "{cache_path}" ]; then
+    echo "[setup] Error: Model snapshot not found at {cache_path}"
+    echo "[setup] Please download the model first with: huggingface-cli download {self.model_name}"
+    exit 1
+fi
+
+echo "[setup] Found snapshot: $SNAPSHOT_DIR"
+
+# Create sentence_bert_config.json with required fields
+if [ ! -f "$SNAPSHOT_DIR/sentence_bert_config.json" ]; then
+    cat > "$SNAPSHOT_DIR/sentence_bert_config.json" << 'EOF'
+{{
+  "max_seq_length": 256,
+  "do_lower_case": false
+}}
+EOF
+    echo "[setup] Created: sentence_bert_config.json"
+else
+    echo "[setup] Skip existed: sentence_bert_config.json"
+fi
+
+# Create other sentence_*_config.json files (empty JSON is fine for these)
+for config_file in sentence_roberta_config.json sentence_distilbert_config.json sentence_camembert_config.json sentence_albert_config.json sentence_xlm-roberta_config.json sentence_xlnet_config.json; do
+    target="$SNAPSHOT_DIR/$config_file"
+    if [ -f "$target" ]; then
+        echo "[setup] Skip existed: $config_file"
+    else
+        echo "{{}}" > "$target"
+        echo "[setup] Created: $config_file"
+    fi
+done
+
+echo "[setup] Setup completed successfully!"
+"""
+
+        # Get any healthy GPU's image for running the setup container
+        if self.gpus:
+            image = self.gpus[0].image
+        else:
+            # Fallback to default image
+            image = f"{TEI_IMAGE_BASE}:{TEI_TAG}"
+
+        # Ensure image is available
+        self.image_manager.ensure_image(image)
+
+        # Run setup in a Docker container
+        # We need to mount the huggingface cache directory
+        docker_cmd = f"""docker run --rm \\
+            -v "${{HOME}}/{CACHE_HF}:/root/{CACHE_HF}" \\
+            --entrypoint /bin/sh \\
+            {image} \\
+            -c '{create_files_script}'
+"""
+
+        logger.mesg(f"[tfmx] Running setup container...")
+
+        result = subprocess.run(docker_cmd, shell=True, capture_output=True, text=True)
+
+        # Show output
+        if result.stdout:
+            for line in result.stdout.strip().split("\\n"):
+                if line.strip():
+                    if "Error" in line:
+                        logger.warn(line)
+                    elif "Skip" in line:
+                        logger.mesg(line)
+                    elif "Created" in line:
+                        logger.okay(line)
+                    else:
+                        logger.mesg(line)
+
+        if result.returncode != 0:
+            if result.stderr:
+                for line in result.stderr.strip().split("\\n"):
+                    if line.strip():
+                        logger.warn(f"  {line}")
+            logger.warn("[tfmx] Setup failed")
+        else:
+            logger.okay("[tfmx] Model cache setup completed")
+
 
 class TEIComposeArgParser:
     """Argument parser for TEI Compose CLI."""
@@ -827,6 +1196,19 @@ class TEIComposeArgParser:
             default=None,
             help="HuggingFace token for private models",
         )
+        self.parser.add_argument(
+            "--mount-mode",
+            type=str,
+            choices=["nvidia-runtime", "manual"],
+            default=DEVICE_MOUNT_MODE,
+            help=f"Device mount mode: 'nvidia-runtime' (default, requires nvidia-container-runtime) or 'manual' (bypasses NVML detection, useful when some GPUs have issues) (default: {DEVICE_MOUNT_MODE})",
+        )
+        self.parser.add_argument(
+            "--proxy",
+            type=str,
+            default=None,
+            help="HTTP/HTTPS proxy for downloading models (e.g., http://127.0.0.1:11111)",
+        )
 
         # Actions
         self.parser.add_argument(
@@ -842,6 +1224,7 @@ class TEIComposeArgParser:
                 "logs",
                 "generate",
                 "health",
+                "setup",
             ],
             help="Action to perform",
         )
@@ -879,6 +1262,8 @@ def main():
         project_name=args.project_name,
         gpu_ids=args.gpus,
         hf_token=args.hf_token,
+        mount_mode=args.mount_mode,
+        http_proxy=args.proxy,
     )
 
     if args.action == "up":
@@ -899,6 +1284,8 @@ def main():
         composer.generate_compose_file()
     elif args.action == "health":
         composer.health()
+    elif args.action == "setup":
+        composer.setup()
 
 
 if __name__ == "__main__":

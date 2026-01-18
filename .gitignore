@@ -5,6 +5,7 @@ docker_data/
 compose/
 weights/
 __pycache__
+*.chats
 *.log
 *.npy
 sync_*.sh

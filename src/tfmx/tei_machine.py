@@ -284,8 +284,10 @@ class TEIInstanceDiscovery:
                 if name_pattern and not re.search(name_pattern, container_name):
                     continue
 
-                # Extract host port from port mapping (e.g., "0.0.0.0:28880->80/tcp")
-                host_port = TEIInstanceDiscovery._extract_host_port(ports)
+                # Extract host port from port mapping or container inspect (for host network mode)
+                host_port = TEIInstanceDiscovery._extract_host_port(
+                    ports, container_name
+                )
                 if host_port is None:
                     continue
 
@@ -315,12 +317,35 @@ class TEIInstanceDiscovery:
             return []
 
     @staticmethod
-    def _extract_host_port(ports_str: str) -> Optional[int]:
-        """Extract host port from Docker port mapping string."""
-        # Match patterns like "0.0.0.0:28880->80/tcp" or ":::28880->80/tcp"
+    def _extract_host_port(ports_str: str, container_name: str = "") -> Optional[int]:
+        """Extract host port from Docker port mapping string or container inspect.
+
+        For bridge mode: Parse ports_str (e.g., "0.0.0.0:28880->80/tcp")
+        For host mode: Extract --port argument from container's command
+        """
+        # Try bridge mode first (port mapping exists)
         match = re.search(r"(?:0\.0\.0\.0|::):(\d+)->", ports_str)
         if match:
             return int(match.group(1))
+
+        # Fallback for host network mode (empty ports_str)
+        if not ports_str and container_name:
+            try:
+                # Get container's Args field and extract --port value
+                result = subprocess.run(
+                    ["docker", "inspect", container_name, "--format", "{{.Args}}"],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                )
+                if result.returncode == 0:
+                    args_str = result.stdout.strip()
+                    port_match = re.search(r"--port\s+(\d+)", args_str)
+                    if port_match:
+                        return int(port_match.group(1))
+            except Exception:
+                pass
+
         return None
 
     @staticmethod
