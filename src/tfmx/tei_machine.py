@@ -55,8 +55,6 @@ from .perf_tracker import PerfTracker
 from .tei_compose import MAX_CLIENT_BATCH_SIZE
 from .tei_scheduler import (
     IdleFillingScheduler,
-    distribute_with_scheduler,
-    distribute_with_pipeline,
     distribute_with_adaptive_pipeline,
 )
 
@@ -406,7 +404,6 @@ class TEIMachineServer:
         timeout: float = 60.0,
         use_gpu_lsh: bool = True,
         enable_perf_tracking: bool = False,
-        use_pipeline: bool = True,  # Use pipeline scheduling by default
         batch_wait_ms: float = 5.0,  # Time to wait for more requests before processing
     ):
         self.instances = instances
@@ -430,9 +427,6 @@ class TEIMachineServer:
         self._last_arrival_time: Optional[float] = None
         self._inter_request_gaps: list[float] = []  # in milliseconds
         self._gap_window_size: int = 100  # Keep last N gaps for rolling stats
-
-        # Pipeline mode (eliminates round barrier)
-        self.use_pipeline = use_pipeline
 
         # Shared scheduler for load balancing across requests
         self.scheduler = IdleFillingScheduler(
@@ -654,27 +648,17 @@ class TEIMachineServer:
             )
             return result
 
-        # Use adaptive pipeline, fixed pipeline, or round-based scheduling
-        if self.use_pipeline:
-            # Adaptive pipeline: dynamically adjusts batch size per worker
-            embeddings, details = await distribute_with_adaptive_pipeline(
-                scheduler=self.scheduler,
-                inputs=inputs,
-                process_func=process_on_instance,
-                enable_perf_tracking=self.enable_perf_tracking,
-                perf_tracker=self.perf_tracker,
-                min_batch_size=MIN_BATCH_SIZE,
-                max_batch_size=MAX_BATCH_SIZE,
-                probe_batch_size=self.micro_batch_size,
-            )
-        else:
-            embeddings, details = await distribute_with_scheduler(
-                scheduler=self.scheduler,
-                inputs=inputs,
-                process_func=process_on_instance,
-                enable_perf_tracking=self.enable_perf_tracking,
-                perf_tracker=self.perf_tracker,
-            )
+        # Use adaptive pipeline scheduling (optimal for heterogeneous GPUs)
+        embeddings, details = await distribute_with_adaptive_pipeline(
+            scheduler=self.scheduler,
+            inputs=inputs,
+            process_func=process_on_instance,
+            enable_perf_tracking=self.enable_perf_tracking,
+            perf_tracker=self.perf_tracker,
+            min_batch_size=MIN_BATCH_SIZE,
+            max_batch_size=MAX_BATCH_SIZE,
+            probe_batch_size=self.micro_batch_size,
+        )
 
         # Print performance analysis periodically
         if self.enable_perf_tracking:
@@ -936,11 +920,6 @@ class TEIMachineArgParser:
             help="Enable detailed performance tracking to identify bottlenecks",
         )
         self.parser.add_argument(
-            "--no-pipeline",
-            action="store_true",
-            help="Disable pipeline scheduling (use round-based scheduling instead)",
-        )
-        self.parser.add_argument(
             "action",
             nargs="?",
             choices=["run", "discover", "health"],
@@ -1043,20 +1022,15 @@ def main():
             )
             return
 
-        use_pipeline = not args.no_pipeline
-
         if args.perf_track:
             logger.note("[tei_machine] Performance tracking ENABLED")
             logger.note(
                 "[tei_machine] Detailed metrics will be logged for each request"
             )
 
-        if use_pipeline:
-            logger.note(
-                f"[tei_machine] Pipeline mode ENABLED (micro_batch_size={args.micro_batch_size})"
-            )
-        else:
-            logger.note("[tei_machine] Round-based scheduling (pipeline disabled)")
+        logger.note(
+            f"[tei_machine] Adaptive pipeline scheduling (probe_batch_size={args.micro_batch_size})"
+        )
 
         server = TEIMachineServer(
             instances=instances,
@@ -1066,7 +1040,6 @@ def main():
             timeout=args.timeout,
             use_gpu_lsh=not args.no_gpu_lsh,
             enable_perf_tracking=args.perf_track,
-            use_pipeline=use_pipeline,
         )
         server.run()
 

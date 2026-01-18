@@ -30,10 +30,7 @@ from .tei_scheduler import (
     WorkerState,
     IdleFillingScheduler,
     DistributionResult,
-    distribute_with_scheduler,
-    distribute_with_pipeline,
     distribute_with_adaptive_pipeline,
-    distribute_to_workers,
     MAX_CLIENT_BATCH_SIZE,
 )
 from .perf_tracker import (
