@@ -40,6 +40,7 @@ import re
 
 import httpx
 import numpy as np
+import orjson
 import uvicorn
 
 from contextlib import asynccontextmanager
@@ -638,7 +639,37 @@ class TEIMachineServer:
         resp = await self._client.post(instance.embed_url, json=payload)
         if resp.status_code != 200:
             raise ValueError(f"Instance {instance.port} error: {resp.text}")
-        return resp.json()
+
+        # Use orjson for faster JSON parsing (10x faster than json)
+        return orjson.loads(resp.content)
+
+    async def _send_embed_request_np(
+        self,
+        instance: TEIInstance,
+        inputs: list[str],
+        normalize: bool,
+        truncate: bool,
+    ) -> np.ndarray:
+        """Send embedding request and return numpy array directly.
+
+        This is optimized for LSH: uses orjson and converts to numpy in one step,
+        avoiding the intermediate Python list representation.
+        """
+        payload = {
+            "inputs": inputs,
+            "normalize": normalize,
+            "truncate": truncate,
+        }
+
+        resp = await self._client.post(instance.embed_url, json=payload)
+        if resp.status_code != 200:
+            raise ValueError(f"Instance {instance.port} error: {resp.text}")
+
+        # Parse JSON with orjson (10x faster) and convert to numpy array directly
+        # orjson.loads returns Python list, which we convert to numpy
+        # We do this per-chunk so it can overlap with network I/O of other chunks
+        data = orjson.loads(resp.content)
+        return np.array(data, dtype=np.float32)
 
     async def _distribute_with_scheduler(
         self,
@@ -690,6 +721,61 @@ class TEIMachineServer:
             self._request_counter += 1
 
         return embeddings
+
+    async def _distribute_with_scheduler_lsh(
+        self,
+        inputs: list[str],
+        instances: list[TEIInstance],
+        normalize: bool,
+        truncate: bool,
+    ) -> np.ndarray:
+        """
+        Distribute inputs using scheduler, optimized for LSH.
+
+        Returns numpy array directly instead of list[list[float]].
+        Each chunk is converted to numpy immediately after receiving,
+        avoiding the expensive nested-list-to-array conversion.
+        """
+        # Update scheduler with current healthy instances
+        self.scheduler.update_workers(instances)
+
+        # Define the async process function that returns numpy arrays
+        async def process_on_instance_np(
+            instance: TEIInstance, chunk: list[str]
+        ) -> np.ndarray:
+            result = await self._send_embed_request_np(
+                instance, chunk, normalize, truncate
+            )
+            # Update stats
+            instance_name = instance.container_name
+            self.stats.requests_per_instance[instance_name] = (
+                self.stats.requests_per_instance.get(instance_name, 0) + 1
+            )
+            return result
+
+        # Use adaptive pipeline scheduling (optimal for heterogeneous GPUs)
+        embeddings_list, details = await distribute_with_adaptive_pipeline(
+            scheduler=self.scheduler,
+            inputs=inputs,
+            process_func=process_on_instance_np,
+            enable_perf_tracking=self.enable_perf_tracking,
+            perf_tracker=self.perf_tracker,
+            min_batch_size=MIN_BATCH_SIZE,
+            max_batch_size=MAX_BATCH_SIZE,
+            probe_batch_size=self.micro_batch_size,
+        )
+
+        # Print performance analysis periodically
+        if self.enable_perf_tracking:
+            self._request_counter += 1
+
+        # Combine numpy arrays efficiently using vstack
+        # embeddings_list is a list of numpy arrays (one per chunk)
+        # np.vstack is much faster than np.array(nested_list)
+        if len(embeddings_list) == 1:
+            return embeddings_list[0]
+        else:
+            return np.vstack(embeddings_list)
 
     async def health(self) -> HealthResponse:
         """Handle health check requests."""
@@ -801,14 +887,15 @@ class TEIMachineServer:
             async with self._scheduler_lock:
                 t1 = _time.perf_counter()
 
-                embeddings = await self._distribute_with_scheduler(
+                # Use optimized LSH distribution that returns numpy array directly
+                # This avoids the expensive nested-list-to-array conversion
+                embs_array = await self._distribute_with_scheduler_lsh(
                     inputs, healthy, request.normalize, request.truncate
                 )
 
                 t2 = _time.perf_counter()
 
-            # Convert to numpy array for vectorized LSH (outside lock)
-            embs_array = np.array(embeddings, dtype=np.float32)
+            # embs_array is already numpy array, just get dims
             dims = embs_array.shape[1]
 
             t3 = _time.perf_counter()
@@ -828,7 +915,8 @@ class TEIMachineServer:
             if self.enable_perf_tracking:
                 total = (t4 - t0) * 1000
                 embed_time = (t2 - t1) * 1000
-                array_conv = (t3 - t2) * 1000
+                # t3 - t2 is now minimal (just extracting dims from existing array)
+                np_overhead = (t3 - t2) * 1000
                 lsh_time = (t4 - t3) * 1000
 
                 # Build gap info string - this is now ARRIVAL gap
@@ -844,8 +932,7 @@ class TEIMachineServer:
 
                 logger.mesg(
                     f"[LSH timing] n={len(inputs)}, total={total:.1f}ms | "
-                    f"embed={embed_time:.1f}ms, np.array={array_conv:.1f}ms, "
-                    f"lsh={lsh_time:.1f}ms{gap_info}"
+                    f"embed+np={embed_time:.1f}ms, lsh={lsh_time:.1f}ms{gap_info}"
                 )
 
             self._pending_requests -= 1
