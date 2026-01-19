@@ -6,7 +6,8 @@ For production use without overhead, use TEIClients.
 
 from tclogger import logger, logstr
 
-from .tei_clients_core import _TEIClientsBase, _TEIClientsPipeline
+from .tei_clients_core import _TEIClientsBase, _TEIClientsPipeline, MachineState
+from .tei_performance import ExplorationConfig
 
 
 # ANCHOR[id=clients-stats-clis]
@@ -45,17 +46,48 @@ class TEIClientsWithStats(_TEIClientsBase):
 
     def _load_config(self) -> None:
         """Load optimal configurations from saved config file with verbose logging."""
-        super()._load_config()
-
-        # Add verbose logging
         if self.verbose:
-            for machine in self.machines:
-                short_name = machine.endpoint.split("//")[-1].split(":")[0]
-                logger.note(
-                    f"[{short_name}] Loaded config: "
-                    f"batch_size={machine.batch_size}, "
-                    f"max_concurrent={machine._max_concurrent}"
+            logger.note("Loading machine configurations...")
+
+        config = ExplorationConfig()
+        for machine in self.machines:
+            saved = config.get_machine_config(self.endpoints, machine.endpoint)
+            if saved:
+                scaled, config_instances, optimal_batch_size, optimal_max_concurrent = (
+                    self._apply_machine_config(machine, saved)
                 )
+
+                if self.verbose:
+                    self._log_config_load(
+                        machine,
+                        scaled,
+                        config_instances,
+                        optimal_batch_size,
+                        optimal_max_concurrent,
+                    )
+
+    def _log_config_load(
+        self,
+        machine: MachineState,
+        scaled: bool,
+        config_instances: int,
+        optimal_batch_size: int,
+        optimal_max_concurrent: int,
+    ) -> None:
+        """Log config loading info for a machine."""
+        short_name = machine.endpoint.split("//")[-1].split(":")[0]
+        if scaled:
+            logger.note(
+                f"[{short_name}] Config scaled: instances {config_instances}→{machine.healthy_instances}, "
+                f"batch_size {optimal_batch_size}→{machine.batch_size}, "
+                f"max_concurrent {optimal_max_concurrent}→{machine._max_concurrent}"
+            )
+        else:
+            logger.note(
+                f"[{short_name}] Config loaded: "
+                f"batch_size={machine.batch_size}, "
+                f"max_concurrent={machine._max_concurrent}"
+            )
 
     def _log_progress(
         self, processed: int, total: int, elapsed: float, machine_stats: dict
@@ -88,7 +120,7 @@ class TEIClientsWithStats(_TEIClientsBase):
         throughput = total_items / total_time if total_time > 0 else 0
         logger.okay(
             f"[Pipeline] Complete: {total_items} items, {batch_count} batches, "
-            f"{total_time:.2f}s, {throughput:.0f}/s"
+            f"{total_time:.1f}s, {throughput:.0f}/s"
         )
 
 

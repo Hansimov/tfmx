@@ -145,30 +145,6 @@ class BenchmarkMetrics:
             },
         }
 
-    def print_summary(self) -> None:
-        """Print a formatted summary of the benchmark results."""
-        logger.note("=" * 60)
-        logger.note("BENCHMARK RESULTS")
-        logger.note("=" * 60)
-
-        # Configuration
-        logger.mesg(f"\n[Configuration]")
-        logger.mesg(f"  Samples:    {self.n_samples:,}")
-        # logger.mesg(f"  Batches:    {self.n_batches:,}")
-        # logger.mesg(f"  Batch size: {self.batch_size:,}")
-        logger.mesg(f"  LSH bits:   {self.bitn}")
-        logger.mesg(f"  Endpoints:  {len(self.endpoints)}")
-        for ep in self.endpoints:
-            logger.mesg(f"  - {ep}")
-
-        # Timing
-        logger.mesg(f"\n[Timing]")
-        logger.mesg(f"  Total time: {self.total_time:.2f} sec")
-
-        # Throughput
-        logger.mesg(f"\n[Throughput]")
-        logger.mesg(f"  Samples/sec: {logstr.mesg(f'{self.samples_per_second:,.0f}')}")
-
 
 class TEIBenchmark:
     """Benchmark runner for TEI services.
@@ -208,7 +184,7 @@ class TEIBenchmark:
         for machine in self.clients.machines:
             short_name = machine.endpoint.split("//")[-1]
             logger.file(
-                f"    - {short_name:<15} : batch_size={machine.batch_size}, "
+                f"  - {short_name:<15} : batch_size={machine.batch_size}, "
                 f"max_concurrent={machine._max_concurrent}"
             )
 
@@ -307,7 +283,12 @@ class TEIBenchmark:
             metrics.samples_per_second = total_processed / metrics.total_time
             metrics.chars_per_second = metrics.total_chars / metrics.total_time
 
-        logger.okay(f"  Benchmark completed in {metrics.total_time:.2f} sec")
+        total_time_str = logstr.okay(f"{metrics.total_time:.1f}s")
+        samples_per_sec_str = logstr.okay(f"{metrics.samples_per_second:.0f}/s")
+
+        logger.okay(
+            f"Benchmark completed in {total_time_str} with {samples_per_sec_str}"
+        )
 
         return metrics
 
@@ -678,9 +659,6 @@ def main():
             metrics = benchmark.run(
                 samples=samples,
             )
-
-            # Print results
-            metrics.print_summary()
 
             # Save results if output specified
             if args.output:

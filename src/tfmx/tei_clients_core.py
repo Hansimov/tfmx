@@ -22,6 +22,7 @@ from typing import Optional, Iterator, Callable, Any, Union, Iterable
 
 from .tei_client import TEIClient, AsyncTEIClient, InfoResponse
 from .tei_compose import MAX_CLIENT_BATCH_SIZE
+from .tei_performance import ExplorationConfig
 
 
 @dataclass
@@ -464,7 +465,11 @@ class _TEIClientsBase(ABC):
             )
         ]
 
-        # Load optimal batch sizes from config
+        # Refresh health to get actual healthy instances before loading config
+        for machine in self.machines:
+            self._refresh_machine_health(machine)
+
+        # Load optimal batch sizes from config (with instance-based scaling)
         self._load_config()
 
         # Pipeline scheduler
@@ -476,21 +481,55 @@ class _TEIClientsBase(ABC):
         # Round-robin index for small batches
         self._rr_index = 0
 
+    def _apply_machine_config(
+        self, machine: MachineState, saved: dict
+    ) -> tuple[bool, int, int, int]:
+        """Apply saved config to machine with instance-based scaling.
+
+        Args:
+            machine: Machine state to configure
+            saved: Saved config dict from ExplorationConfig
+
+        Returns:
+            Tuple of (scaled, config_instances, optimal_batch_size, optimal_max_concurrent)
+        """
+        config_instances = saved.get("instances", 0)
+        actual_instances = machine.healthy_instances
+        optimal_batch_size = saved.get("optimal_batch_size", machine.batch_size)
+        optimal_max_concurrent = saved.get(
+            "optimal_max_concurrent", machine._max_concurrent
+        )
+
+        # Scale both batch_size and max_concurrent if instances differ
+        scaled = False
+        if (
+            config_instances > 0
+            and actual_instances > 0
+            and actual_instances != config_instances
+        ):
+            scale_ratio = actual_instances / config_instances
+            machine.batch_size = int(optimal_batch_size * scale_ratio)
+            machine._max_concurrent = int(optimal_max_concurrent * scale_ratio)
+            scaled = True
+        else:
+            machine.batch_size = optimal_batch_size
+            machine._max_concurrent = optimal_max_concurrent
+
+        return scaled, config_instances, optimal_batch_size, optimal_max_concurrent
+
     def _load_config(self) -> None:
         """Load optimal configurations from saved config file.
 
+        Scales batch_size proportionally if actual healthy instances
+        differs from config's saved instances. max_concurrent stays unchanged.
+
         Subclasses can override to add verbose logging.
         """
-        from .tei_performance import ExplorationConfig
-
         config = ExplorationConfig()
         for machine in self.machines:
             saved = config.get_machine_config(self.endpoints, machine.endpoint)
             if saved:
-                machine.batch_size = saved.get("optimal_batch_size", machine.batch_size)
-                machine._max_concurrent = saved.get(
-                    "optimal_max_concurrent", machine._max_concurrent
-                )
+                self._apply_machine_config(machine, saved)
 
     def close(self) -> None:
         """Close all HTTP clients."""
