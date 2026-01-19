@@ -276,6 +276,12 @@ class _TEIClientsPipeline:
         Returns:
             Combined results in input order
         """
+        # Reset all async clients for use in new event loop
+        # (Previous asyncio.run() may have closed the old event loop)
+        for m in healthy:
+            if m.async_client:
+                m.async_client.reset()
+
         # Determine if inputs is a list or iterator
         if isinstance(inputs, list):
             buffer = IteratorBuffer(iter(inputs), len(inputs))
@@ -330,7 +336,6 @@ class _TEIClientsPipeline:
             batch_count += 1
             machine.mark_busy()
             task = asyncio.create_task(process_batch(machine, chunk, start_idx))
-            task._start_idx = start_idx  # type: ignore
             return task
 
         def handle_result(machine, start_idx, results, latency, error):
@@ -405,6 +410,11 @@ class _TEIClientsPipeline:
                             total_processed, buffer.total_hint, elapsed, machine_stats
                         )
                         last_log_time = elapsed
+
+            # Close all async clients before exiting the event loop
+            for m in healthy:
+                if m.async_client and m.async_client._client:
+                    await m.async_client.close()
 
             return time.perf_counter() - session_start
 

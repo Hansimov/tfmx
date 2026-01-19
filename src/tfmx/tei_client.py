@@ -437,6 +437,16 @@ class AsyncTEIClient:
             await self._client.aclose()
             self._client = None
 
+    def reset(self) -> None:
+        """Reset the client state for use in a new event loop.
+
+        Call this before using the client in a new asyncio.run() context.
+        The old client (if any) is discarded; a new one will be created lazily.
+        """
+        # Simply discard the old client reference without closing
+        # (closing requires the old event loop which may be closed)
+        self._client = None
+
     async def __aenter__(self) -> "AsyncTEIClient":
         return self
 
