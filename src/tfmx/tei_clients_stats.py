@@ -76,17 +76,20 @@ class TEIClientsWithStats(_TEIClientsBase):
     ) -> None:
         """Log config loading info for a machine."""
         short_name = machine.endpoint.split("//")[-1].split(":")[0]
+        capacity_info = f"capacity={machine.capacity:.0f}"
         if scaled:
             logger.note(
                 f"[{short_name}] Config scaled: instances {config_instances}→{machine.healthy_instances}, "
                 f"batch_size {optimal_batch_size}→{machine.batch_size}, "
-                f"max_concurrent {optimal_max_concurrent}→{machine._max_concurrent}"
+                f"max_concurrent {optimal_max_concurrent}→{machine._max_concurrent}, "
+                f"{capacity_info}"
             )
         else:
             logger.note(
                 f"[{short_name}] Config loaded: "
                 f"batch_size={machine.batch_size}, "
-                f"max_concurrent={machine._max_concurrent}"
+                f"max_concurrent={machine._max_concurrent}, "
+                f"{capacity_info}"
             )
 
     def _log_progress(

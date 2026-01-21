@@ -50,6 +50,11 @@ class MachineState:
     # Batch size configuration
     batch_size: int = MAX_CLIENT_BATCH_SIZE
 
+    # Capacity configuration (for proportional scheduling)
+    # Base capacity from config (throughput per second)
+    _config_throughput: float = 0.0
+    _config_instances: int = 0
+
     @property
     def is_idle(self) -> bool:
         """Check if machine can accept more requests."""
@@ -69,6 +74,19 @@ class MachineState:
     def weight(self) -> int:
         """Weight for load balancing based on healthy instances."""
         return self.healthy_instances if self.healthy else 0
+
+    @property
+    def capacity(self) -> float:
+        """Effective capacity for proportional scheduling.
+
+        Returns throughput scaled by healthy/config instances ratio.
+        If no config, falls back to batch_size as capacity proxy.
+        """
+        if self._config_throughput > 0 and self._config_instances > 0:
+            scale = self.healthy_instances / self._config_instances
+            return self._config_throughput * scale
+        # Fallback: use batch_size * max_concurrent as capacity proxy
+        return float(self.batch_size * self._max_concurrent) if self.healthy else 0.0
 
     def mark_busy(self) -> None:
         """Increment active request count."""
@@ -164,6 +182,7 @@ class MachineScheduler:
     3. Idle machines immediately get new work
     4. Fast machines naturally process more batches
     5. Allows multiple concurrent requests per machine to keep GPUs fed
+    6. Proportional batch allocation based on capacity
     """
 
     def __init__(self, machines: list[MachineState]):
@@ -187,6 +206,43 @@ class MachineScheduler:
     def signal_idle(self) -> None:
         """Signal that a machine has become idle."""
         self._idle_event.set()
+
+    def get_total_capacity(self, healthy: list[MachineState] = None) -> float:
+        """Get total capacity of all healthy machines."""
+        if healthy is None:
+            healthy = self.get_healthy_machines()
+        return sum(m.capacity for m in healthy)
+
+    def calc_proportional_batch_size(
+        self, machine: MachineState, total_remaining: int, healthy: list[MachineState]
+    ) -> int:
+        """Calculate batch size for a machine based on capacity proportion.
+
+        Distributes work proportionally to each machine's capacity, while
+        respecting the machine's max batch_size limit.
+
+        Args:
+            machine: The machine to calculate batch size for
+            total_remaining: Total number of items remaining to process
+            healthy: List of healthy machines
+
+        Returns:
+            Batch size to assign to this machine
+        """
+        total_capacity = self.get_total_capacity(healthy)
+        if total_capacity <= 0:
+            return min(machine.batch_size, total_remaining)
+
+        # Calculate proportion of work this machine should handle
+        proportion = machine.capacity / total_capacity
+
+        # Calculate proportional batch size
+        proportional_size = int(total_remaining * proportion)
+
+        # Clamp to machine's batch_size limit and at least 1 (if remaining > 0)
+        batch_size = max(1, min(proportional_size, machine.batch_size))
+
+        return batch_size
 
     def calc_tail_batch_size(
         self, base_size: int, remaining: int | None, total_capacity: int
@@ -300,7 +356,7 @@ class _TEIClientsPipeline:
         }
 
         # Calculate total capacity for tail optimization
-        total_capacity = sum(m.batch_size * m._max_concurrent for m in healthy)
+        total_capacity = self.scheduler.get_total_capacity(healthy)
 
         async def process_batch(
             machine: MachineState, chunk: list[str], start_idx: int
@@ -320,16 +376,72 @@ class _TEIClientsPipeline:
                 return (machine, start_idx, None, time.perf_counter() - task_start, e)
 
         def get_batch_size(machine: MachineState) -> int:
-            """Get batch size with tail optimization."""
-            base = machine.batch_size
-            return self.scheduler.calc_tail_batch_size(
-                base, buffer.remaining_hint, total_capacity
-            )
+            """Get batch size using proportional allocation based on capacity.
 
-        def dispatch_batch(machine: MachineState) -> asyncio.Task | None:
-            """Try to dispatch a batch to machine. Returns task or None."""
+            Uses capacity-based proportional sizing when remaining items are known,
+            otherwise falls back to machine's configured batch_size.
+            """
+            remaining = buffer.remaining_hint
+
+            # If we have remaining hint, use proportional allocation
+            if remaining is not None and remaining > 0:
+                return self.scheduler.calc_proportional_batch_size(
+                    machine, remaining, healthy
+                )
+
+            # Fallback to configured batch_size
+            return machine.batch_size
+
+        def calc_proportional_shares(
+            idle_machines: list[MachineState], remaining: int
+        ) -> dict[str, int]:
+            """Calculate proportional batch sizes for all idle machines at once.
+
+            This ensures fair distribution based on capacity ratios,
+            calculated atomically before any batches are taken.
+            """
+            if not idle_machines or remaining <= 0:
+                return {}
+
+            # Calculate total capacity of idle machines
+            total_idle_capacity = sum(m.capacity for m in idle_machines)
+            if total_idle_capacity <= 0:
+                # Fallback: equal split
+                equal_share = remaining // len(idle_machines)
+                return {
+                    m.endpoint: min(equal_share, m.batch_size) for m in idle_machines
+                }
+
+            shares = {}
+            allocated = 0
+            for i, m in enumerate(idle_machines):
+                proportion = m.capacity / total_idle_capacity
+                # For the last machine, give it all remaining to avoid rounding loss
+                if i == len(idle_machines) - 1:
+                    share = remaining - allocated
+                else:
+                    share = int(remaining * proportion)
+
+                # Clamp to machine's batch_size limit
+                share = min(share, m.batch_size)
+                share = max(1, share) if remaining > allocated else 0
+                shares[m.endpoint] = share
+                allocated += share
+
+            return shares
+
+        def dispatch_batch(
+            machine: MachineState, batch_size: int = None
+        ) -> asyncio.Task | None:
+            """Try to dispatch a batch to machine. Returns task or None.
+
+            Args:
+                machine: Machine to dispatch to
+                batch_size: Optional pre-calculated batch size (for proportional allocation)
+            """
             nonlocal batch_count
-            batch_size = get_batch_size(machine)
+            if batch_size is None:
+                batch_size = get_batch_size(machine)
             start_idx, chunk = buffer.get_batch(batch_size)
             if not chunk:
                 return None
@@ -337,6 +449,39 @@ class _TEIClientsPipeline:
             machine.mark_busy()
             task = asyncio.create_task(process_batch(machine, chunk, start_idx))
             return task
+
+        def dispatch_to_idle_machines_proportionally() -> list[asyncio.Task]:
+            """Dispatch batches to all idle machines using proportional allocation.
+
+            Calculates shares atomically before taking any batches.
+            """
+            idle = [m for m in healthy if m.is_idle]
+            if not idle:
+                return []
+
+            remaining = buffer.remaining_hint
+            if remaining is None:
+                # Fallback: dispatch one by one with default batch sizes
+                tasks = []
+                for machine in idle:
+                    task = dispatch_batch(machine)
+                    if task:
+                        tasks.append(task)
+                    else:
+                        break
+                return tasks
+
+            # Calculate proportional shares for all idle machines at once
+            shares = calc_proportional_shares(idle, remaining)
+
+            tasks = []
+            for machine in idle:
+                batch_size = shares.get(machine.endpoint, 0)
+                if batch_size > 0:
+                    task = dispatch_batch(machine, batch_size)
+                    if task:
+                        tasks.append(task)
+            return tasks
 
         def handle_result(machine, start_idx, results, latency, error):
             """Process a completed task result."""
@@ -356,16 +501,10 @@ class _TEIClientsPipeline:
             last_log_time = 0.0  # Last progress log time
 
             while not buffer.exhausted or pending_tasks:
-                # Dispatch work to all idle machines
-                while not buffer.exhausted:
-                    machine = self.scheduler.get_idle_machine()
-                    if not machine:
-                        break
-                    task = dispatch_batch(machine)
-                    if task:
-                        pending_tasks.add(task)
-                    else:
-                        break
+                # Dispatch work to all idle machines using proportional allocation
+                if not buffer.exhausted:
+                    new_dispatch_tasks = dispatch_to_idle_machines_proportionally()
+                    pending_tasks.update(new_dispatch_tasks)
 
                 if pending_tasks:
                     await asyncio.sleep(0)  # Let tasks start
@@ -378,23 +517,20 @@ class _TEIClientsPipeline:
                     pending_tasks, return_when=asyncio.FIRST_COMPLETED
                 )
 
-                # First: mark idle and prepare new batches (minimize dispatch gap)
-                new_tasks = []
+                # First: mark idle and collect completed tasks
                 completed = []
                 for task in done:
                     machine, start_idx, results, latency, error = task.result()
                     completed.append((machine, start_idx, results, latency, error))
                     machine.mark_idle()
                     self.scheduler.signal_idle()
-                    # Try to dispatch new work immediately
-                    if not buffer.exhausted and machine.is_idle:
-                        new_task = dispatch_batch(machine)
-                        if new_task:
-                            new_tasks.append(new_task)
 
-                pending_tasks.update(new_tasks)
-                if new_tasks:
-                    await asyncio.sleep(0)
+                # Dispatch new work to all newly idle machines proportionally
+                if not buffer.exhausted:
+                    new_tasks = dispatch_to_idle_machines_proportionally()
+                    pending_tasks.update(new_tasks)
+                    if new_tasks:
+                        await asyncio.sleep(0)
 
                 # Then: process results
                 for machine, start_idx, results, latency, error in completed:
@@ -509,6 +645,11 @@ class _TEIClientsBase(ABC):
         optimal_max_concurrent = saved.get(
             "optimal_max_concurrent", machine._max_concurrent
         )
+        config_throughput = saved.get("throughput", 0.0)
+
+        # Store config values for capacity calculation
+        machine._config_throughput = config_throughput
+        machine._config_instances = config_instances
 
         # Scale both batch_size and max_concurrent if instances differ
         scaled = False
