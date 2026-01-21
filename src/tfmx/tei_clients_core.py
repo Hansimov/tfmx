@@ -319,6 +319,7 @@ class _TEIClientsPipeline:
         request_fn: Callable[[MachineState, list[str]], Any],
         action_name: str = "pipeline",
         total_hint: int | None = None,
+        close_clients: bool = True,
     ) -> list:
         """Execute async pipeline distributing work across machines.
 
@@ -328,6 +329,7 @@ class _TEIClientsPipeline:
             request_fn: Async function (machine, chunk) -> results
             action_name: Name for logging (e.g., "embed", "lsh")
             total_hint: Optional total count hint for iterator inputs
+            close_clients: Whether to close async clients after completion (default: True)
 
         Returns:
             Combined results in input order
@@ -338,6 +340,75 @@ class _TEIClientsPipeline:
             if m.async_client:
                 m.async_client.reset()
 
+        total_time = asyncio.run(
+            self._run_pipeline_async(
+                inputs=inputs,
+                healthy=healthy,
+                request_fn=request_fn,
+                action_name=action_name,
+                total_hint=total_hint,
+                close_clients=close_clients,
+            )
+        )
+        return total_time
+
+    async def run_pipeline_async(
+        self,
+        inputs: list[str] | Iterator[str],
+        healthy: list[MachineState],
+        request_fn: Callable[[MachineState, list[str]], Any],
+        action_name: str = "pipeline",
+        total_hint: int | None = None,
+        close_clients: bool = False,
+    ) -> list:
+        """Async version of run_pipeline for use in existing event loops.
+
+        This method is designed to be called from within an async context,
+        allowing connection reuse across multiple calls without the overhead
+        of creating new event loops or reconnecting HTTP clients.
+
+        Args:
+            inputs: List or iterator of input texts
+            healthy: List of healthy machines to use
+            request_fn: Async function (machine, chunk) -> results
+            action_name: Name for logging (e.g., "embed", "lsh")
+            total_hint: Optional total count hint for iterator inputs
+            close_clients: Whether to close async clients after completion (default: False)
+
+        Returns:
+            Combined results in input order
+        """
+        return await self._run_pipeline_async(
+            inputs=inputs,
+            healthy=healthy,
+            request_fn=request_fn,
+            action_name=action_name,
+            total_hint=total_hint,
+            close_clients=close_clients,
+        )
+
+    async def _run_pipeline_async(
+        self,
+        inputs: list[str] | Iterator[str],
+        healthy: list[MachineState],
+        request_fn: Callable[[MachineState, list[str]], Any],
+        action_name: str = "pipeline",
+        total_hint: int | None = None,
+        close_clients: bool = True,
+    ) -> list:
+        """Internal async implementation of the pipeline.
+
+        Args:
+            inputs: List or iterator of input texts
+            healthy: List of healthy machines to use
+            request_fn: Async function (machine, chunk) -> results
+            action_name: Name for logging (e.g., "embed", "lsh")
+            total_hint: Optional total count hint for iterator inputs
+            close_clients: Whether to close async clients after completion
+
+        Returns:
+            Combined results in input order
+        """
         # Determine if inputs is a list or iterator
         if isinstance(inputs, list):
             buffer = IteratorBuffer(iter(inputs), len(inputs))
@@ -494,67 +565,64 @@ class _TEIClientsPipeline:
                 machine.healthy = False
                 errors.append((machine.endpoint, error or Exception("Unknown error")))
 
-        async def run():
-            nonlocal pending_tasks
-            session_start = time.perf_counter()
-            total_processed = 0
-            last_log_time = 0.0  # Last progress log time
+        session_start = time.perf_counter()
+        total_processed = 0
+        last_log_time = 0.0  # Last progress log time
 
-            while not buffer.exhausted or pending_tasks:
-                # Dispatch work to all idle machines using proportional allocation
-                if not buffer.exhausted:
-                    new_dispatch_tasks = dispatch_to_idle_machines_proportionally()
-                    pending_tasks.update(new_dispatch_tasks)
+        while not buffer.exhausted or pending_tasks:
+            # Dispatch work to all idle machines using proportional allocation
+            if not buffer.exhausted:
+                new_dispatch_tasks = dispatch_to_idle_machines_proportionally()
+                pending_tasks.update(new_dispatch_tasks)
 
-                if pending_tasks:
-                    await asyncio.sleep(0)  # Let tasks start
+            if pending_tasks:
+                await asyncio.sleep(0)  # Let tasks start
 
-                if not pending_tasks:
-                    break
+            if not pending_tasks:
+                break
 
-                # Wait for completion
-                done, pending_tasks = await asyncio.wait(
-                    pending_tasks, return_when=asyncio.FIRST_COMPLETED
-                )
+            # Wait for completion
+            done, pending_tasks = await asyncio.wait(
+                pending_tasks, return_when=asyncio.FIRST_COMPLETED
+            )
 
-                # First: mark idle and collect completed tasks
-                completed = []
-                for task in done:
-                    machine, start_idx, results, latency, error = task.result()
-                    completed.append((machine, start_idx, results, latency, error))
-                    machine.mark_idle()
-                    self.scheduler.signal_idle()
+            # First: mark idle and collect completed tasks
+            completed = []
+            for task in done:
+                machine, start_idx, results, latency, error = task.result()
+                completed.append((machine, start_idx, results, latency, error))
+                machine.mark_idle()
+                self.scheduler.signal_idle()
 
-                # Dispatch new work to all newly idle machines proportionally
-                if not buffer.exhausted:
-                    new_tasks = dispatch_to_idle_machines_proportionally()
-                    pending_tasks.update(new_tasks)
-                    if new_tasks:
-                        await asyncio.sleep(0)
+            # Dispatch new work to all newly idle machines proportionally
+            if not buffer.exhausted:
+                new_tasks = dispatch_to_idle_machines_proportionally()
+                pending_tasks.update(new_tasks)
+                if new_tasks:
+                    await asyncio.sleep(0)
 
-                # Then: process results
-                for machine, start_idx, results, latency, error in completed:
-                    handle_result(machine, start_idx, results, latency, error)
-                    if results:
-                        total_processed += len(results)
+            # Then: process results
+            for machine, start_idx, results, latency, error in completed:
+                handle_result(machine, start_idx, results, latency, error)
+                if results:
+                    total_processed += len(results)
 
-                # Progress callback: trigger every 5 seconds
-                if self.on_progress and buffer.total_hint and buffer.total_hint >= 1000:
-                    elapsed = time.perf_counter() - session_start
-                    if elapsed - last_log_time >= 5.0:  # Every 5 seconds
-                        self.on_progress(
-                            total_processed, buffer.total_hint, elapsed, machine_stats
-                        )
-                        last_log_time = elapsed
+            # Progress callback: trigger every 5 seconds
+            if self.on_progress and buffer.total_hint and buffer.total_hint >= 1000:
+                elapsed = time.perf_counter() - session_start
+                if elapsed - last_log_time >= 5.0:  # Every 5 seconds
+                    self.on_progress(
+                        total_processed, buffer.total_hint, elapsed, machine_stats
+                    )
+                    last_log_time = elapsed
 
-            # Close all async clients before exiting the event loop
+        # Close all async clients if requested (typically when using asyncio.run)
+        if close_clients:
             for m in healthy:
                 if m.async_client and m.async_client._client:
                     await m.async_client.close()
 
-            return time.perf_counter() - session_start
-
-        total_time = asyncio.run(run())
+        total_time = time.perf_counter() - session_start
 
         if not results_map:
             raise ValueError(f"All requests failed: {errors}")
@@ -869,6 +937,42 @@ class _TEIClientsBase(ABC):
             ),
             action_name="lsh",
             total_hint=total_hint,
+        )
+
+    async def lsh_iter_async(
+        self,
+        inputs: Iterable[str],
+        total_hint: int | None = None,
+        bitn: int = 2048,
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[str]:
+        """Async version of lsh_iter for use in existing event loops.
+
+        This method allows connection reuse across multiple calls, avoiding
+        the overhead of creating new event loops and reconnecting HTTP clients.
+        Ideal for high-throughput pipeline scenarios.
+
+        Args:
+            inputs: Iterable of texts (can be generator, iterator, or list)
+            total_hint: Optional hint for total number of items (for progress logging)
+            bitn: Number of LSH hash bits (default: 2048)
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of hex strings representing LSH hashes, in input order.
+        """
+        healthy = self._ensure_healthy()
+        return await self._pipeline.run_pipeline_async(
+            inputs=iter(inputs),
+            healthy=healthy,
+            request_fn=lambda m, chunk: m.async_client.lsh(
+                chunk, bitn=bitn, normalize=normalize, truncate=truncate
+            ),
+            action_name="lsh",
+            total_hint=total_hint,
+            close_clients=False,  # Keep connections alive for reuse
         )
 
     def info(self) -> list[InfoResponse]:
