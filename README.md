@@ -20,7 +20,7 @@ Set GPU power limit:
 
 ```sh
 # M-X GPU-0/1
-gpu_pow -pm a:1 && gpu_pow -pl "0:160;1:240"
+gpu_pow -pm a:1 && gpu_pow -pl "0:160;1:200"
 
 # M-A GPU-0/1
 gpu_pow -pm a:1 && gpu_pow -pl "0,1:160"

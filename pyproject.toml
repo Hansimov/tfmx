@@ -4,11 +4,11 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "tfmx"
-version = "0.7"
+version = "0.8"
 authors = [
     { name="Hansimov" },
 ]
-description = "Serve Transformers in one line"
+description = "Serve Transformers and Manage GPUs"
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.6"
