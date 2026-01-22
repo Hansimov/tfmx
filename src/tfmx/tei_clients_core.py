@@ -55,6 +55,11 @@ class MachineState:
     _config_throughput: float = 0.0
     _config_instances: int = 0
 
+    # Health recovery tracking
+    _consecutive_failures: int = 0
+    _last_failure_time: float = 0.0
+    _recovery_in_progress: bool = False
+
     @property
     def is_idle(self) -> bool:
         """Check if machine can accept more requests."""
@@ -95,6 +100,125 @@ class MachineState:
     def mark_idle(self) -> None:
         """Decrement active request count."""
         self._active_requests = max(0, self._active_requests - 1)
+
+    def record_failure(self) -> None:
+        """Record a request failure for health tracking."""
+        self._consecutive_failures += 1
+        self._last_failure_time = time.time()
+
+    def record_success(self) -> None:
+        """Record a successful request, resetting failure count."""
+        self._consecutive_failures = 0
+
+
+class HealthRecoveryManager:
+    """Manages background health recovery for unhealthy machines.
+
+    When a machine fails, it's marked unhealthy and added to recovery queue.
+    A background task periodically checks unhealthy machines and restores
+    them when they become healthy again.
+
+    Design:
+    - Non-blocking: recovery runs in background, doesn't slow down main pipeline
+    - Exponential backoff: failed machines are checked less frequently
+    - Automatic restoration: healthy machines rejoin the active pool
+    """
+
+    # Recovery check interval (seconds)
+    RECOVERY_CHECK_INTERVAL = 5.0
+    # Max consecutive failures before longer backoff
+    MAX_FAILURES_BEFORE_BACKOFF = 3
+    # Backoff multiplier for frequently failing machines
+    BACKOFF_MULTIPLIER = 2.0
+
+    def __init__(
+        self,
+        machines: list[MachineState],
+        health_check_fn: Callable[[MachineState], None],
+    ):
+        """Initialize recovery manager.
+
+        Args:
+            machines: All machines to monitor
+            health_check_fn: Function to refresh a machine's health status
+        """
+        self.machines = machines
+        self.health_check_fn = health_check_fn
+        self._recovery_task: Optional[asyncio.Task] = None
+        self._stop_event = asyncio.Event()
+
+    def get_unhealthy_machines(self) -> list[MachineState]:
+        """Get list of unhealthy machines that need recovery."""
+        return [m for m in self.machines if not m.healthy]
+
+    async def start(self) -> None:
+        """Start background recovery task."""
+        if self._recovery_task is None or self._recovery_task.done():
+            self._stop_event.clear()
+            self._recovery_task = asyncio.create_task(self._recovery_loop())
+
+    async def stop(self) -> None:
+        """Stop background recovery task."""
+        self._stop_event.set()
+        if self._recovery_task:
+            try:
+                await asyncio.wait_for(self._recovery_task, timeout=1.0)
+            except asyncio.TimeoutError:
+                self._recovery_task.cancel()
+            self._recovery_task = None
+
+    async def _recovery_loop(self) -> None:
+        """Background loop that periodically checks unhealthy machines."""
+        while not self._stop_event.is_set():
+            try:
+                await asyncio.sleep(self.RECOVERY_CHECK_INTERVAL)
+
+                unhealthy = self.get_unhealthy_machines()
+                if not unhealthy:
+                    continue
+
+                # Check each unhealthy machine
+                for machine in unhealthy:
+                    if self._stop_event.is_set():
+                        break
+
+                    # Apply backoff for frequently failing machines
+                    if (
+                        machine._consecutive_failures
+                        >= self.MAX_FAILURES_BEFORE_BACKOFF
+                    ):
+                        time_since_failure = time.time() - machine._last_failure_time
+                        backoff_time = (
+                            self.RECOVERY_CHECK_INTERVAL
+                            * self.BACKOFF_MULTIPLIER
+                            * (
+                                machine._consecutive_failures
+                                - self.MAX_FAILURES_BEFORE_BACKOFF
+                                + 1
+                            )
+                        )
+                        if time_since_failure < backoff_time:
+                            continue
+
+                    # Try to recover
+                    machine._recovery_in_progress = True
+                    try:
+                        # Run health check in thread pool to avoid blocking
+                        await asyncio.to_thread(self.health_check_fn, machine)
+                        if machine.healthy:
+                            machine._consecutive_failures = 0
+                            machine._recovery_in_progress = False
+                    except Exception:
+                        machine._consecutive_failures += 1
+                        machine._last_failure_time = time.time()
+                    finally:
+                        machine._recovery_in_progress = False
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                # Don't let recovery loop crash
+                pass
 
 
 class SessionSlotManager:
@@ -649,7 +773,11 @@ class _TEIClientsPipeline:
                 # Track per-machine stats
                 stats = machine_stats[machine.endpoint]
                 stats["items"] += len(results)
+                # Record success for health tracking
+                machine.record_success()
             else:
+                # Record failure and mark unhealthy for this session
+                machine.record_failure()
                 machine.healthy = False
                 errors.append((machine.endpoint, error or Exception("Unknown error")))
 
@@ -777,6 +905,11 @@ class _TEIClientsBase(ABC):
         # Pipeline scheduler
         self.machine_scheduler = MachineScheduler(self.machines)
 
+        # Health recovery manager for automatic reconnection
+        self._health_recovery = HealthRecoveryManager(
+            self.machines, self._refresh_machine_health
+        )
+
         # Pipeline executor - subclass must set this
         self._pipeline: Optional[_TEIClientsPipeline] = None
 
@@ -844,7 +977,8 @@ class _TEIClientsBase(ABC):
             client.close()
 
     async def aclose(self) -> None:
-        """Close all async HTTP clients."""
+        """Close all async HTTP clients and stop health recovery."""
+        await self._health_recovery.stop()
         for async_client in self.async_clients:
             await async_client.close()
 
@@ -1041,6 +1175,9 @@ class _TEIClientsBase(ABC):
         the overhead of creating new event loops and reconnecting HTTP clients.
         Ideal for high-throughput pipeline scenarios.
 
+        Includes automatic health recovery: unhealthy machines are periodically
+        checked in the background and restored when they become available again.
+
         Args:
             inputs: Iterable of texts (can be generator, iterator, or list)
             total_hint: Optional hint for total number of items (for progress logging)
@@ -1051,6 +1188,10 @@ class _TEIClientsBase(ABC):
         Returns:
             List of hex strings representing LSH hashes, in input order.
         """
+        # Start health recovery if there are unhealthy machines
+        if self._health_recovery.get_unhealthy_machines():
+            await self._health_recovery.start()
+
         healthy = self._ensure_healthy()
         return await self._pipeline.run_pipeline_async(
             inputs=iter(inputs),
