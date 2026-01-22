@@ -218,8 +218,11 @@ class MachineScheduler:
     ) -> int:
         """Calculate batch size for a machine based on capacity proportion.
 
-        Distributes work proportionally to each machine's capacity, while
-        respecting the machine's max batch_size limit.
+        Uses a target cycle time (e.g., 0.5s) to determine batch size, rather than
+        giving each machine its full share of remaining work. This ensures:
+        1. Multiple dispatch cycles, keeping all machines continuously busy
+        2. Fast machines get more batches, not just larger batches
+        3. Better overlap between machine processing and client-side work
 
         Args:
             machine: The machine to calculate batch size for
@@ -229,20 +232,33 @@ class MachineScheduler:
         Returns:
             Batch size to assign to this machine
         """
-        total_capacity = self.get_total_capacity(healthy)
-        if total_capacity <= 0:
-            return min(machine.batch_size, total_remaining)
+        # Target cycle time in seconds - how much work to dispatch per round
+        # Smaller = more frequent dispatches = better overlap, but more overhead
+        # 0.5s is a good balance: allows 2-3 dispatch cycles during a typical batch
+        TARGET_CYCLE_TIME = 0.5
 
-        # Calculate proportion of work this machine should handle
-        proportion = machine.capacity / total_capacity
+        # Calculate batch size based on throughput * cycle time
+        if machine._config_throughput > 0:
+            # Use configured throughput to estimate one cycle's worth of data
+            # Scale by actual instances vs config instances
+            if machine._config_instances > 0:
+                scale = machine.healthy_instances / machine._config_instances
+            else:
+                scale = 1.0
+            effective_throughput = machine._config_throughput * scale
+            cycle_batch_size = int(effective_throughput * TARGET_CYCLE_TIME)
+        else:
+            # Fallback: use batch_size / max_concurrent as one cycle's worth
+            cycle_batch_size = machine.batch_size // max(machine._max_concurrent, 1)
 
-        # Calculate proportional batch size
-        proportional_size = int(total_remaining * proportion)
+        # Ensure minimum batch size for efficiency
+        MIN_BATCH_SIZE = 200
+        cycle_batch_size = max(cycle_batch_size, MIN_BATCH_SIZE)
 
-        # Clamp to machine's batch_size limit and at least 1 (if remaining > 0)
-        batch_size = max(1, min(proportional_size, machine.batch_size))
+        # Clamp to machine's batch_size limit and remaining
+        batch_size = min(cycle_batch_size, machine.batch_size, total_remaining)
 
-        return batch_size
+        return max(1, batch_size)
 
     def calc_tail_batch_size(
         self, base_size: int, remaining: int | None, total_capacity: int
@@ -466,36 +482,43 @@ class _TEIClientsPipeline:
         def calc_proportional_shares(
             idle_machines: list[MachineState], remaining: int
         ) -> dict[str, int]:
-            """Calculate proportional batch sizes for all idle machines at once.
+            """Calculate batch sizes for all idle machines using cycle-based allocation.
 
-            This ensures fair distribution based on capacity ratios,
-            calculated atomically before any batches are taken.
+            Uses target cycle time to determine batch size per machine, rather than
+            splitting remaining work proportionally. This ensures multiple dispatch
+            cycles, keeping all machines continuously busy.
             """
             if not idle_machines or remaining <= 0:
                 return {}
 
-            # Calculate total capacity of idle machines
-            total_idle_capacity = sum(m.capacity for m in idle_machines)
-            if total_idle_capacity <= 0:
-                # Fallback: equal split
-                equal_share = remaining // len(idle_machines)
-                return {
-                    m.endpoint: min(equal_share, m.batch_size) for m in idle_machines
-                }
+            # Target cycle time - same as in calc_proportional_batch_size
+            TARGET_CYCLE_TIME = 0.5
+            MIN_BATCH_SIZE = 200
 
             shares = {}
             allocated = 0
-            for i, m in enumerate(idle_machines):
-                proportion = m.capacity / total_idle_capacity
-                # For the last machine, give it all remaining to avoid rounding loss
-                if i == len(idle_machines) - 1:
-                    share = remaining - allocated
-                else:
-                    share = int(remaining * proportion)
 
-                # Clamp to machine's batch_size limit
-                share = min(share, m.batch_size)
-                share = max(1, share) if remaining > allocated else 0
+            for m in idle_machines:
+                if remaining - allocated <= 0:
+                    shares[m.endpoint] = 0
+                    continue
+
+                # Calculate cycle-based batch size
+                if m._config_throughput > 0:
+                    if m._config_instances > 0:
+                        scale = m.healthy_instances / m._config_instances
+                    else:
+                        scale = 1.0
+                    effective_throughput = m._config_throughput * scale
+                    cycle_batch_size = int(effective_throughput * TARGET_CYCLE_TIME)
+                else:
+                    cycle_batch_size = m.batch_size // max(m._max_concurrent, 1)
+
+                cycle_batch_size = max(cycle_batch_size, MIN_BATCH_SIZE)
+
+                # Clamp to machine's batch_size limit and remaining
+                share = min(cycle_batch_size, m.batch_size, remaining - allocated)
+                share = max(1, share) if share > 0 else 0
                 shares[m.endpoint] = share
                 allocated += share
 
