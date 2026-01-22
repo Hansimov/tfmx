@@ -97,6 +97,66 @@ class MachineState:
         self._active_requests = max(0, self._active_requests - 1)
 
 
+class SessionSlotManager:
+    """Manages slot allocation for a single pipeline session.
+
+    Each pipeline session gets its own slot manager with pre-allocated quota.
+    This prevents concurrent sessions from interfering with each other's
+    slot counting, which was causing deadlocks in the previous implementation.
+
+    Design:
+    - Each session tracks its own active_requests per machine
+    - Session quota is based on machine's max_concurrent at session start
+    - Multiple concurrent sessions can safely run without shared state conflicts
+    """
+
+    def __init__(self, machines: list[MachineState]):
+        """Initialize slot manager for a session.
+
+        Args:
+            machines: List of machines to manage slots for
+        """
+        # Per-machine slot tracking for THIS session only
+        self._slots: dict[str, dict] = {
+            m.endpoint: {
+                "active": 0,
+                "max": m._max_concurrent,
+                "machine": m,
+            }
+            for m in machines
+        }
+
+    def is_idle(self, machine: MachineState) -> bool:
+        """Check if machine has available slots in this session."""
+        slot = self._slots.get(machine.endpoint)
+        if not slot:
+            return False
+        return slot["active"] < slot["max"]
+
+    def available_slots(self, machine: MachineState) -> int:
+        """Get number of available slots for machine in this session."""
+        slot = self._slots.get(machine.endpoint)
+        if not slot:
+            return 0
+        return max(0, slot["max"] - slot["active"])
+
+    def mark_busy(self, machine: MachineState) -> None:
+        """Mark a slot as busy for this session."""
+        slot = self._slots.get(machine.endpoint)
+        if slot:
+            slot["active"] += 1
+
+    def mark_idle(self, machine: MachineState) -> None:
+        """Release a slot for this session."""
+        slot = self._slots.get(machine.endpoint)
+        if slot:
+            slot["active"] = max(0, slot["active"] - 1)
+
+    def get_idle_machines(self, healthy: list[MachineState]) -> list[MachineState]:
+        """Get list of healthy machines with available slots."""
+        return [m for m in healthy if m.healthy and self.is_idle(m)]
+
+
 class IteratorBuffer:
     """Thread-safe buffer for pulling items from an iterator on demand.
 
@@ -436,6 +496,10 @@ class _TEIClientsPipeline:
         errors: list[tuple[str, Exception]] = []
         batch_count = 0
 
+        # Session-local slot manager: prevents concurrent pipeline calls from
+        # interfering with each other's slot tracking
+        slot_manager = SessionSlotManager(healthy)
+
         # Per-machine tracking for progress stats
         machine_stats: dict[str, dict] = {
             m.endpoint: {"items": 0, "host": m.endpoint.split("//")[-1].split(":")[0]}
@@ -540,7 +604,7 @@ class _TEIClientsPipeline:
             if not chunk:
                 return None
             batch_count += 1
-            machine.mark_busy()
+            slot_manager.mark_busy(machine)
             task = asyncio.create_task(process_batch(machine, chunk, start_idx))
             return task
 
@@ -548,8 +612,9 @@ class _TEIClientsPipeline:
             """Dispatch batches to all idle machines using proportional allocation.
 
             Calculates shares atomically before taking any batches.
+            Uses session-local slot manager to avoid concurrent session conflicts.
             """
-            idle = [m for m in healthy if m.is_idle]
+            idle = slot_manager.get_idle_machines(healthy)
             if not idle:
                 return []
 
@@ -614,7 +679,7 @@ class _TEIClientsPipeline:
             for task in done:
                 machine, start_idx, results, latency, error = task.result()
                 completed.append((machine, start_idx, results, latency, error))
-                machine.mark_idle()
+                slot_manager.mark_idle(machine)
                 self.scheduler.signal_idle()
 
             # Dispatch new work to all newly idle machines proportionally
