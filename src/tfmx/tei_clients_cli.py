@@ -22,6 +22,10 @@ class TEIClientsProtocol(Protocol):
 
     def lsh(self, inputs, bitn=2048) -> list[str]: ...
 
+    def rerank(
+        self, queries, passages, normalize=True, truncate=True
+    ) -> list[list[tuple[int, float]]]: ...
+
     def close(self) -> None: ...
 
 
@@ -124,6 +128,27 @@ class TEIClientsArgParserBase:
             help="Number of LSH bits (default: 2048)",
         )
 
+        # rerank - rerank passages for queries
+        rerank_parser = subparsers.add_parser(
+            "rerank",
+            help="Rerank passages for queries",
+            parents=[parent_parser],
+        )
+        rerank_parser.add_argument(
+            "-q",
+            "--queries",
+            nargs="+",
+            required=True,
+            help="Query texts to rank passages against",
+        )
+        rerank_parser.add_argument(
+            "-p",
+            "--passages",
+            nargs="+",
+            required=True,
+            help="Passage texts to be ranked",
+        )
+
 
 class TEIClientsCLIBase:
     """Base CLI interface for TEI Clients operations.
@@ -193,6 +218,36 @@ class TEIClientsCLIBase:
             logger.mesg(f"'{text_preview}'")
             logger.file(f"  → {hash_preview}")
 
+    def run_rerank(self, queries: list[str], passages: list[str]) -> None:
+        """Rerank passages for queries and display results.
+
+        Args:
+            queries: List of query texts
+            passages: List of passage texts to rank
+        """
+        if not queries:
+            logger.warn("× No queries provided")
+            return
+        if not passages:
+            logger.warn("× No passages provided")
+            return
+
+        results = self.clients.rerank(queries, passages)
+        for i, (query, rankings) in enumerate(zip(queries, results)):
+            query_preview = query[:50] + "..." if len(query) > 50 else query
+            logger.note(f"Query {i+1}: '{query_preview}'")
+            # rankings is [(rank, score), ...] in passage input order
+            # Display sorted by rank for readability
+            sorted_by_rank = sorted(enumerate(rankings), key=lambda x: x[1][0])
+            for p_idx, (rank_pos, score) in sorted_by_rank:
+                passage_preview = passages[p_idx][:50]
+                if len(passages[p_idx]) > 50:
+                    passage_preview += "..."
+                logger.mesg(
+                    f"  [{rank_pos+1}] (p_idx={p_idx}, score={score:.4f}) {passage_preview}"
+                )
+            print()
+
 
 def run_cli_main(
     parser_class: type,
@@ -238,6 +293,8 @@ def run_cli_main(
             cli.run_embed(args.texts)
         elif args.action == "lsh":
             cli.run_lsh(args.texts, args.bitn)
+        elif args.action == "rerank":
+            cli.run_rerank(args.queries, args.passages)
     except httpx.ConnectError as e:
         logger.warn(f"× Connection failed: {e}")
         logger.hint(f"  Check if all TEI machines are running")

@@ -1204,6 +1204,46 @@ class _TEIClientsBase(ABC):
             close_clients=False,  # Keep connections alive for reuse
         )
 
+    def rerank(
+        self,
+        queries: list[str],
+        passages: list[str],
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[list[tuple[int, float]]]:
+        """Rerank passages for each query using multiple machines.
+
+        Distributes rerank requests across multiple machines. For small
+        inputs, uses single machine with round-robin selection.
+
+        Args:
+            queries: List of query texts to rank passages against.
+            passages: List of passage texts to be ranked for each query.
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of rankings for each query. Each ranking is a list of
+            (rank_position, similarity_score) tuples in passage input order.
+            rank_position: 0 = best match (highest similarity).
+
+        Raises:
+            ValueError: When no healthy machines available or all requests fail
+        """
+        if not queries or not passages:
+            return []
+
+        healthy = self._ensure_healthy()
+
+        # Rerank typically has relatively few queries but many passages
+        # Use single machine with round-robin for simplicity
+        # (rerank already batches passages internally on the server)
+        machine = healthy[self._rr_index % len(healthy)]
+        self._rr_index += 1
+        return machine.client.rerank(
+            queries, passages, normalize=normalize, truncate=truncate
+        )
+
     def info(self) -> list[InfoResponse]:
         """Get info from all machines.
 

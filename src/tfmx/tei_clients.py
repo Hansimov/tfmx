@@ -18,6 +18,7 @@ Examples:
   tei_clients embed -E $TEI_EPS "Hello" "World"
   tei_clients lsh -E $TEI_EPS "Hello"
   tei_clients lsh -E $TEI_EPS -b 2048 "Hello, world"
+  tei_clients rerank -E $TEI_EPS -q "hello" -p "hi" "good" "你好"
 """
 
 

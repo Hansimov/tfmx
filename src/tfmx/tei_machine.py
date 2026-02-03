@@ -98,6 +98,34 @@ class LSHRequest(EmbedRequest):
     )
 
 
+class RerankRequest(BaseModel):
+    """Request model for rerank endpoint."""
+
+    queries: list[str] = Field(
+        ...,
+        description="List of query texts to rank passages against",
+        examples=[["What is machine learning?", "How does AI work?"]],
+    )
+    passages: list[str] = Field(
+        ...,
+        description="List of passage texts to be ranked for each query",
+        examples=[
+            [
+                "Machine learning is a subset of AI.",
+                "Deep learning uses neural networks.",
+            ]
+        ],
+    )
+    normalize: bool = Field(
+        default=True,
+        description="Whether to normalize embeddings to unit length",
+    )
+    truncate: bool = Field(
+        default=True,
+        description="Whether to truncate inputs that exceed max length",
+    )
+
+
 class HealthResponse(BaseModel):
     """Response model for health endpoint."""
 
@@ -522,6 +550,13 @@ class TEIMachineServer:
             description="Generate LSH hash hex strings for input texts (embed + LSH)",
         )(self.lsh)
 
+        app.post(
+            "/rerank",
+            response_model=list[list[tuple[int, float]]],
+            summary="Rerank passages for queries",
+            description="Compute cosine similarity between queries and passages, return sorted rankings",
+        )(self.rerank)
+
         return app
 
     @asynccontextmanager
@@ -846,6 +881,99 @@ class TEIMachineServer:
             self._pending_requests -= 1
             self.stats.total_errors += 1
             logger.warn(f"× LSH error: {e}")
+            raise HTTPException(status_code=500, detail=str(e))
+
+    async def rerank(self, request: RerankRequest) -> list[list[tuple[int, float]]]:
+        """Rerank passages for each query based on cosine similarity.
+
+        Computes embeddings for all passages and queries, then calculates
+        cosine similarity between each query and all passages. Returns
+        rankings for each query, preserving the original passage order.
+
+        Args:
+            request: RerankRequest with queries and passages
+
+        Returns:
+            List of rankings for each query. Each ranking is a list of
+            (rank_position, similarity_score) tuples in passage input order.
+            rank_position: 0 = best match (highest similarity).
+        """
+        queries = request.queries
+        passages = request.passages
+
+        if not queries:
+            raise HTTPException(status_code=400, detail="No queries provided")
+        if not passages:
+            raise HTTPException(status_code=400, detail="No passages provided")
+
+        self.stats.total_requests += 1
+        self.stats.total_inputs += len(queries) + len(passages)
+
+        # Get healthy instances
+        healthy = self.get_healthy_instances()
+        if not healthy:
+            self.stats.total_errors += 1
+            raise HTTPException(
+                status_code=503, detail="No healthy instances available"
+            )
+
+        try:
+            async with self._scheduler_lock:
+                # Embed all texts together for efficiency
+                # Combine queries and passages: [queries..., passages...]
+                all_texts = queries + passages
+                all_embs = await self._distribute_with_scheduler_np(
+                    all_texts, healthy, request.normalize, request.truncate
+                )
+
+                # Split embeddings back into queries and passages
+                n_queries = len(queries)
+                query_embs = all_embs[:n_queries]  # shape: (n_queries, dims)
+                passage_embs = all_embs[n_queries:]  # shape: (n_passages, dims)
+
+                # Compute cosine similarity matrix: (n_queries, n_passages)
+                # Since embeddings are already normalized (normalize=True by default),
+                # cosine similarity is just the dot product
+                # For non-normalized case, we normalize here
+                if not request.normalize:
+                    # Normalize for cosine similarity
+                    query_norms = np.linalg.norm(query_embs, axis=1, keepdims=True)
+                    passage_norms = np.linalg.norm(passage_embs, axis=1, keepdims=True)
+                    query_embs = query_embs / np.maximum(query_norms, 1e-8)
+                    passage_embs = passage_embs / np.maximum(passage_norms, 1e-8)
+
+                # Compute similarity matrix: (n_queries, n_passages)
+                sim_matrix = np.dot(query_embs, passage_embs.T)
+
+                # For each query, create rankings preserving passage order
+                # Sort indices by similarity (descending) to get rank positions
+                sorted_indices = np.argsort(-sim_matrix, axis=1)
+
+                # Build result: list[list[tuple[int, float]]]
+                # Each inner list preserves passage input order
+                # tuple is (rank_position, similarity_score)
+                # rank_position: where this passage ranks (0=best match)
+                results = []
+                n_passages = len(passages)
+                for q_idx in range(n_queries):
+                    # Create rank lookup: passage_idx -> rank_position
+                    rank_lookup = np.empty(n_passages, dtype=np.int32)
+                    for rank, p_idx in enumerate(sorted_indices[q_idx]):
+                        rank_lookup[p_idx] = rank
+
+                    # Build ranking list in passage input order
+                    query_rankings = []
+                    for p_idx in range(n_passages):
+                        rank_pos = int(rank_lookup[p_idx])
+                        sim_score = float(sim_matrix[q_idx, p_idx])
+                        query_rankings.append((rank_pos, sim_score))
+                    results.append(query_rankings)
+
+            return results
+
+        except Exception as e:
+            self.stats.total_errors += 1
+            logger.warn(f"× Rerank error: {e}")
             raise HTTPException(status_code=500, detail=str(e))
 
     def run(self) -> None:

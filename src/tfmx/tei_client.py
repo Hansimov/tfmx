@@ -13,6 +13,7 @@ Examples:
   tei_client embed "Hello, world"          # Embed single text
   tei_client embed "Hello" "World"         # Embed multiple texts
   tei_client lsh "Hello, world"            # Get LSH hash
+  tei_client rerank -q "query" -p "doc1" "doc2"  # Rerank passages
   
   # Connect to specific endpoint
   tei_client -e "http://localhost:28800" health
@@ -385,6 +386,62 @@ class TEIClient:
             self._log_fail("lsh", e)
             raise
 
+    def rerank(
+        self,
+        queries: list[str],
+        passages: list[str],
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[list[tuple[int, float]]]:
+        """Rerank passages for each query based on cosine similarity.
+
+        Computes embeddings for all passages and queries, then calculates
+        cosine similarity between each query and all passages. Returns
+        rankings for each query, preserving the original passage order.
+
+        Note: This endpoint is only available on tei_machine, not on
+        individual TEI containers.
+
+        Args:
+            queries: List of query texts to rank passages against.
+            passages: List of passage texts to be ranked for each query.
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of rankings for each query. Each ranking is a list of
+            (rank_position, similarity_score) tuples in passage input order.
+            rank_position: 0 = best match (highest similarity).
+
+        Raises:
+            httpx.HTTPError: On connection or request error
+            ValueError: On server-side errors
+        """
+        payload = {
+            "queries": queries,
+            "passages": passages,
+            "normalize": normalize,
+            "truncate": truncate,
+        }
+
+        try:
+            resp = self.client.post(f"{self.endpoint}/rerank", json=payload)
+            resp.raise_for_status()
+            # Parse with orjson for speed
+            results = orjson.loads(resp.content)
+            n_queries = len(queries)
+            n_passages = len(passages)
+            self._log_okay("rerank", f"queries={n_queries}, passages={n_passages}")
+            # Convert nested lists to list of list of tuples
+            return [[tuple(item) for item in ranking] for ranking in results]
+        except httpx.HTTPStatusError as e:
+            error_detail = self._extract_error_detail(e)
+            self._log_fail("rerank", error_detail)
+            raise ValueError(f"Rerank failed: {error_detail}") from e
+        except Exception as e:
+            self._log_fail("rerank", e)
+            raise
+
 
 class AsyncTEIClient:
     """Asynchronous client for TEI services.
@@ -595,6 +652,62 @@ class AsyncTEIClient:
             self._log_fail("lsh", e)
             raise
 
+    async def rerank(
+        self,
+        queries: list[str],
+        passages: list[str],
+        normalize: bool = True,
+        truncate: bool = True,
+    ) -> list[list[tuple[int, float]]]:
+        """Rerank passages for each query based on cosine similarity.
+
+        Computes embeddings for all passages and queries, then calculates
+        cosine similarity between each query and all passages. Returns
+        rankings for each query, preserving the original passage order.
+
+        Args:
+            queries: List of query texts to rank passages against.
+            passages: List of passage texts to be ranked for each query.
+            normalize: Whether to normalize embeddings (default: True)
+            truncate: Whether to truncate long inputs (default: True)
+
+        Returns:
+            List of rankings for each query. Each ranking is a list of
+            (rank_position, similarity_score) tuples in passage input order.
+            rank_position: 0 = best match (highest similarity).
+        """
+        payload = {
+            "queries": queries,
+            "passages": passages,
+            "normalize": normalize,
+            "truncate": truncate,
+        }
+
+        client = await self._get_client()
+        try:
+            # Use orjson for fast pre-serialization to avoid blocking
+            content = orjson.dumps(payload)
+            resp = await client.post(
+                f"{self.endpoint}/rerank",
+                content=content,
+                headers={"Content-Type": "application/json"},
+            )
+            resp.raise_for_status()
+            # Parse with orjson for speed
+            results = orjson.loads(resp.content)
+            n_queries = len(queries)
+            n_passages = len(passages)
+            self._log_okay("rerank", f"queries={n_queries}, passages={n_passages}")
+            # Convert nested lists to list of list of tuples
+            return [[tuple(item) for item in ranking] for ranking in results]
+        except httpx.HTTPStatusError as e:
+            error_detail = self._extract_error_detail(e)
+            self._log_fail("rerank", error_detail)
+            raise ValueError(f"Rerank failed: {error_detail}") from e
+        except Exception as e:
+            self._log_fail("rerank", e)
+            raise
+
 
 class TEIClientArgParser:
     """Argument parser for TEI Client CLI."""
@@ -673,6 +786,25 @@ class TEIClientArgParser:
             help="Number of LSH bits (default: 2048)",
         )
 
+        # rerank
+        rerank_parser = subparsers.add_parser(
+            "rerank", help="Rerank passages for queries (tei_machine only)"
+        )
+        rerank_parser.add_argument(
+            "-q",
+            "--queries",
+            nargs="+",
+            required=True,
+            help="Query texts to rank passages against",
+        )
+        rerank_parser.add_argument(
+            "-p",
+            "--passages",
+            nargs="+",
+            required=True,
+            help="Passage texts to be ranked",
+        )
+
 
 class TEIClientCLI:
     """CLI interface for TEI Client operations."""
@@ -724,6 +856,34 @@ class TEIClientCLI:
             logger.mesg(f"'{text_preview}'")
             logger.file(f"  → {hash_preview}")
 
+    def run_rerank(self, queries: list[str], passages: list[str]) -> None:
+        """Rerank passages for queries and display results.
+
+        Args:
+            queries: List of query texts
+            passages: List of passage texts to rank
+        """
+        if not queries:
+            logger.warn("× No queries provided")
+            return
+        if not passages:
+            logger.warn("× No passages provided")
+            return
+
+        results = self.client.rerank(queries, passages)
+        for i, (query, rankings) in enumerate(zip(queries, results)):
+            query_preview = query[:50] + "..." if len(query) > 50 else query
+            logger.note(f"Query {i+1}: '{query_preview}'")
+            # rankings is [(rank, score), ...] in passage input order
+            # Display sorted by rank for readability
+            sorted_by_rank = sorted(enumerate(rankings), key=lambda x: x[1][0])
+            for p_idx, (rank_pos, score) in sorted_by_rank:
+                passage_preview = passages[p_idx][:50]
+                if len(passages[p_idx]) > 50:
+                    passage_preview += "..."
+                logger.mesg(f"  [{rank_pos+1}] (p_idx={p_idx}, score={score:.4f}) {passage_preview}")
+            print()
+
 
 def main():
     """Main entry point for CLI."""
@@ -752,6 +912,8 @@ def main():
             cli.run_embed(args.texts)
         elif args.action == "lsh":
             cli.run_lsh(args.texts, args.bitn)
+        elif args.action == "rerank":
+            cli.run_rerank(args.queries, args.passages)
 
     except httpx.ConnectError as e:
         logger.warn(f"× Connection failed: {e}")
