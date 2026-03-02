@@ -163,6 +163,10 @@ class InstanceInfo:
     endpoint: str
     gpu_id: Optional[int]
     healthy: bool
+    model_name: str = ""
+    quant_method: str = ""
+    quant_level: str = ""
+    model_label: str = ""
 
     @classmethod
     def from_dict(cls, data: dict) -> "InstanceInfo":
@@ -171,6 +175,10 @@ class InstanceInfo:
             endpoint=data.get("endpoint", ""),
             gpu_id=data.get("gpu_id"),
             healthy=data.get("healthy", False),
+            model_name=data.get("model_name", ""),
+            quant_method=data.get("quant_method", ""),
+            quant_level=data.get("quant_level", ""),
+            model_label=data.get("model_label", ""),
         )
 
 

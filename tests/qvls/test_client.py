@@ -13,6 +13,7 @@ from tfmx.qvls.client import (
     ChatUsage,
     ChatChoice,
     ChatResponse,
+    InstanceInfo,
     build_vision_messages,
     _encode_image_to_base64,
 )
@@ -165,6 +166,64 @@ class TestEncodeImage:
         img_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 20)
         result = _encode_image_to_base64(str(img_file))
         assert result.startswith("data:image/png;base64,")
+
+
+class TestInstanceInfo:
+    """Test InstanceInfo dataclass."""
+
+    def test_creation(self):
+        info = InstanceInfo(
+            name="qvl--gpu0",
+            endpoint="http://localhost:29880",
+            gpu_id=0,
+            healthy=True,
+        )
+        assert info.name == "qvl--gpu0"
+        assert info.healthy is True
+
+    def test_model_fields(self):
+        info = InstanceInfo(
+            name="qvl--gpu0",
+            endpoint="http://localhost:29880",
+            gpu_id=0,
+            healthy=True,
+            model_name="Qwen/Qwen3-VL-8B-Instruct",
+            quant_method="gguf",
+            quant_level="Q4_K_M",
+            model_label="8B-Instruct:Q4_K_M",
+        )
+        assert info.model_name == "Qwen/Qwen3-VL-8B-Instruct"
+        assert info.quant_method == "gguf"
+        assert info.quant_level == "Q4_K_M"
+        assert info.model_label == "8B-Instruct:Q4_K_M"
+
+    def test_from_dict(self):
+        data = {
+            "name": "qvl--gpu0",
+            "endpoint": "http://localhost:29880",
+            "gpu_id": 0,
+            "healthy": True,
+            "model_name": "Qwen/Qwen3-VL-8B-Instruct",
+            "quant_method": "gguf",
+            "quant_level": "Q4_K_M",
+            "model_label": "8B-Instruct:Q4_K_M",
+        }
+        info = InstanceInfo.from_dict(data)
+        assert info.model_name == "Qwen/Qwen3-VL-8B-Instruct"
+        assert info.model_label == "8B-Instruct:Q4_K_M"
+
+    def test_from_dict_missing_model_fields(self):
+        data = {
+            "name": "qvl--gpu0",
+            "endpoint": "http://localhost:29880",
+            "gpu_id": 0,
+            "healthy": True,
+        }
+        info = InstanceInfo.from_dict(data)
+        assert info.model_name == ""
+        assert info.quant_method == ""
+        assert info.quant_level == ""
+        assert info.model_label == ""
 
 
 class TestQVLClient:

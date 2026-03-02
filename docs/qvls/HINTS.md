@@ -98,6 +98,46 @@ qvl_compose up --mount-mode manual
 
 ## Architecture Notes
 
+### Per-GPU Model Configuration
+
+In a multi-GPU deployment, each GPU can run a different model variant. This enables:
+- Testing quality vs speed tradeoffs across models
+- Running specialized models for different tasks
+- Maximizing GPU utilization with appropriately-sized models
+
+Example 6-GPU deployment:
+```
+GPU 0: 2B-Instruct (Q4_K_M) — Fast, low quality
+GPU 1: 4B-Instruct (Q4_K_M) — Balanced
+GPU 2: 8B-Instruct (Q4_K_M) — High quality
+GPU 3: 4B-Thinking (Q4_K_M) — Reasoning tasks
+GPU 4: 8B-Instruct (Q8_0)   — Highest quality
+GPU 5: 8B-Thinking (Q4_K_M) — Reasoning, high quality
+```
+
+### Model-Aware Routing
+
+The machine proxy (`qvl_machine`) includes a router that:
+1. Discovers which model each vLLM instance is running
+2. Routes requests to matching instances based on `model` field
+3. Falls back to any available instance if no match
+
+Request routing formats:
+- `model="8B-Instruct"` → any 8B-Instruct instance
+- `model="8B-Instruct:Q8_0"` → specific quant level
+- `model=""` → default/any idle instance
+
+### Benchmark Images
+
+Real images from HuggingFace datasets provide more realistic benchmarks than synthetic images. Download once and reuse:
+
+```bash
+python -m tfmx.qvls.benchimgs download -n 500
+python -m tfmx.qvls.benchimgs info
+```
+
+Images are stored in `data/bench_images/` and automatically used by `QVLBenchImageGenerator`.
+
 ### Module Structure
 
 ```
@@ -108,12 +148,13 @@ qvls/
 ├── clients.py          # Production multi-machine client
 ├── clients_cli.py      # CLI infrastructure
 ├── clients_stats.py    # Verbose client with stats logging
-├── machine.py          # FastAPI load-balanced proxy
+├── router.py           # Model/quant-aware request routing
+├── machine.py          # FastAPI load-balanced proxy (with routing)
 ├── scheduler.py        # Re-exports generic scheduler from teis
 ├── perf_tracker.py     # Re-exports generic perf tracker from teis
 ├── performance.py      # QVL-specific performance config
 ├── benchmark.py        # Throughput benchmarking
-└── benchimgs.py        # Synthetic image+prompt generation
+└── benchimgs.py        # Benchmark image generation (HF datasets + synthetic)
 ```
 
 ### Key Differences from TEI Module

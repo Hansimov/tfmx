@@ -13,11 +13,18 @@ qvl_compose up
 # Start with specific model
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct"
 
-# Start with GGUF quantization
+# Start with GGUF quantization (default: Q4_K_M)
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
 
 # Start on specific GPUs
 qvl_compose up -g "0,1"
+
+# Per-GPU model/quant config (different models on different GPUs)
+qvl_compose up --gpu-configs "0:2B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"
+
+# Full 6-GPU deployment
+qvl_compose up --gpu-configs \
+  "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q4_K_M,3:4B-Thinking:Q4_K_M,4:8B-Instruct:Q8_0,5:8B-Thinking:Q4_K_M"
 
 # Custom port base (default: 29880)
 qvl_compose up -p 29890
@@ -43,9 +50,17 @@ qvl_compose generate    # Generate compose YAML without starting
 qvl_compose health      # Check GPU health
 ```
 
+#### GPU Config Format
+
+The `--gpu-configs` argument uses the format `GPU_ID:MODEL_SHORTCUT:QUANT_LEVEL,...`
+
+Model shortcuts: `2B-Instruct`, `2B-Thinking`, `4B-Instruct`, `4B-Thinking`, `8B-Instruct`, `8B-Thinking`
+
+Quant levels: `Q4_K_M` (default), `Q5_K_M`, `Q6_K`, `Q8_0`
+
 ### qvl_machine
 
-Start the load-balanced proxy server that distributes requests across vLLM instances.
+Start the load-balanced proxy server that distributes requests across vLLM instances. Supports model/quant-aware routing for multi-model deployments.
 
 ```bash
 # Start with auto-discovery of vLLM containers
@@ -69,6 +84,16 @@ qvl_machine discover
 # Health check
 qvl_machine health
 ```
+
+#### Model-Aware Routing
+
+When running a multi-model deployment, the machine proxy automatically discovers what model each instance is running and routes requests accordingly:
+
+- Request `model="8B-Instruct:Q4_K_M"` → routes to 8B-Instruct Q4_K_M instance
+- Request `model="4B-Thinking"` → routes to any 4B-Thinking instance
+- Request `model=""` → routes to default/any idle instance
+
+The `/info` endpoint returns available models and per-instance metadata.
 
 ### qvl_client
 
@@ -248,24 +273,34 @@ clients.close()
 ### Docker Compose Management
 
 ```python
-from tfmx.qvls import QVLComposer
+from tfmx.qvls import QVLComposer, GpuModelConfig, parse_gpu_configs
 
+# Basic deployment (default: 8B-Instruct GGUF Q4_K_M)
 composer = QVLComposer()
+composer.up()
 
-# Bring up services
-composer.up(
-    model_name="Qwen/Qwen3-VL-8B-Instruct",
-    quantization="gguf",
-    gpu_indices="0,1",
+# Per-GPU model configuration
+gpu_configs = parse_gpu_configs(
+    "0:2B-Instruct:Q4_K_M,"
+    "1:4B-Instruct:Q4_K_M,"
+    "2:8B-Instruct:Q4_K_M"
 )
+composer = QVLComposer(gpu_configs=gpu_configs)
+composer.up()
+
+# Or create configs programmatically
+configs = [
+    GpuModelConfig(gpu_id=0, model_name="Qwen/Qwen3-VL-2B-Instruct",
+                   quant_method="gguf", quant_level="Q4_K_M"),
+    GpuModelConfig(gpu_id=1, model_name="Qwen/Qwen3-VL-8B-Instruct",
+                   quant_method="gguf", quant_level="Q8_0"),
+]
+composer = QVLComposer(gpu_configs=configs)
+composer.generate_compose_file()  # Generate YAML only
 
 # Check status
 composer.ps()
-
-# View logs
 composer.logs(follow=True, tail=100)
-
-# Tear down
 composer.down()
 ```
 
@@ -273,11 +308,21 @@ composer.down()
 
 ```python
 from tfmx.qvls import QVLBenchmark, QVLBenchImageGenerator
+from tfmx.qvls import download_benchmark_images, load_local_images
 
-# Generate synthetic test data
+# Download real benchmark images from HuggingFace (one-time setup)
+download_benchmark_images(max_images=500)
+
+# Check available images
+images = load_local_images()
+print(f"Available: {len(images)} images")
+
+# Generate test data (uses real images if available, synthetic fallback)
 gen = QVLBenchImageGenerator(seed=42)
-items = gen.generate(count=50, img_size=(224, 224))
-# Each item: {"prompt": "...", "image": "data:image/png;base64,..."}
+print(f"Using {gen.local_image_count} local images")
+
+items = gen.generate(count=50, img_size=256)
+# Each item: {"messages": [{"role": "user", "content": [...]}]}
 
 # Text-only prompts
 text_items = gen.generate_text_only(count=50)
@@ -297,6 +342,37 @@ print(f"Throughput: {metrics.requests_per_second:.2f} req/s")
 print(f"Gen tokens/s: {metrics.gen_tokens_per_second:.2f}")
 print(f"P50 latency: {metrics.latency_p50:.3f}s")
 print(f"P99 latency: {metrics.latency_p99:.3f}s")
+```
+
+### Router (Programmatic)
+
+```python
+from tfmx.qvls import QVLRouter, InstanceDescriptor, parse_model_spec
+
+# Create router for multi-model deployment
+router = QVLRouter()
+
+# Register instances
+router.register(InstanceDescriptor(
+    model_name="Qwen/Qwen3-VL-2B-Instruct",
+    quant_method="gguf", quant_level="Q4_K_M",
+    endpoint="http://localhost:29880", gpu_id=0,
+))
+router.register(InstanceDescriptor(
+    model_name="Qwen/Qwen3-VL-8B-Instruct",
+    quant_method="gguf", quant_level="Q8_0",
+    endpoint="http://localhost:29881", gpu_id=1,
+))
+
+# Route by model
+match = router.route(model="8B-Instruct", quant="Q8_0")
+print(f"Routed to: {match.endpoint}")
+
+# Route from model field (parses "model:quant" format)
+match = router.route_from_model_field("2B-Instruct:Q4_K_M")
+
+# Available models
+print(router.get_available_models())  # ["2B-Instruct:Q4_K_M", "8B-Instruct:Q8_0"]
 ```
 
 ### Machine Server (Programmatic)

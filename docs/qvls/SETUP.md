@@ -36,9 +36,16 @@ qvl_client --help
 
 ### GGUF Quantized Models (from unsloth)
 
+All model variants are available in GGUF format with multiple quantization levels:
+
 - `unsloth/Qwen3-VL-2B-Instruct-GGUF`
 - `unsloth/Qwen3-VL-4B-Instruct-GGUF`
 - `unsloth/Qwen3-VL-8B-Instruct-GGUF`
+- `unsloth/Qwen3-VL-2B-Thinking-GGUF`
+- `unsloth/Qwen3-VL-4B-Thinking-GGUF`
+- `unsloth/Qwen3-VL-8B-Thinking-GGUF`
+
+Quantization levels: **Q4_K_M** (recommended), Q5_K_M, Q6_K, Q8_0
 
 ## Quick Start
 
@@ -58,14 +65,24 @@ huggingface-cli download Qwen/Qwen3-VL-8B-Instruct
 # Or with Chinese mirror
 HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-VL-8B-Instruct
 
-# For GGUF quantized model
+# For GGUF quantized model (default recommended)
 huggingface-cli download unsloth/Qwen3-VL-8B-Instruct-GGUF
+
+# Download specific GGUF quant file only
+huggingface-cli download unsloth/Qwen3-VL-8B-Instruct-GGUF \
+  Qwen3-VL-8B-Instruct-Q4_K_M.gguf
+
+# Download multiple model variants for per-GPU deployment
+for model in 2B-Instruct 4B-Instruct 8B-Instruct 4B-Thinking 8B-Thinking; do
+  huggingface-cli download "unsloth/Qwen3-VL-${model}-GGUF"
+  huggingface-cli download "Qwen/Qwen3-VL-${model}"  # tokenizer
+done
 ```
 
 ### 3. Deploy with Docker Compose
 
 ```bash
-# Start on all available GPUs (default model: Qwen3-VL-8B-Instruct)
+# Start on all available GPUs (default: 8B-Instruct GGUF Q4_K_M)
 qvl_compose up
 
 # Start with specific model and quantization
@@ -73,6 +90,13 @@ qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
 
 # Start on specific GPUs
 qvl_compose up -g "0,1"
+
+# Per-GPU model/quant configuration (different models on different GPUs)
+qvl_compose up --gpu-configs "0:2B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"
+
+# Full 6-GPU deployment with different models
+qvl_compose up --gpu-configs \
+  "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q4_K_M,3:4B-Thinking:Q4_K_M,4:8B-Instruct:Q8_0,5:8B-Thinking:Q4_K_M"
 
 # Check status
 qvl_compose ps
@@ -122,9 +146,9 @@ qvl_compose up -g "0,1" -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
 qvl_machine run
 ```
 
-### Machine 2 (2x GPU)
+### Machine 2 (2x GPU, mixed models)
 ```bash
-qvl_compose up -g "0,1" -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+qvl_compose up --gpu-configs "0:4B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"
 qvl_machine run
 ```
 
@@ -133,3 +157,23 @@ qvl_machine run
 qvl_clients health --endpoints http://machine1:29800 http://machine2:29800
 qvl_benchmark run -E "http://machine1:29800,http://machine2:29800" -n 100
 ```
+
+## Benchmark Images
+
+Download real images from HuggingFace datasets for benchmarking:
+
+```bash
+# Install datasets library
+pip install datasets
+
+# Download benchmark images (~500 images from Visual7W)
+python -m tfmx.qvls.benchimgs download -n 500
+
+# Check downloaded images
+python -m tfmx.qvls.benchimgs info
+
+# Test image generation
+python -m tfmx.qvls.benchimgs test -n 5
+```
+
+Images are stored in `data/bench_images/` and used automatically by the benchmark tools. If no local images are available, synthetic images are generated as fallback.

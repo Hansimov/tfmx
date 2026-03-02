@@ -46,6 +46,7 @@ from typing import Optional, Union
 from webu import setup_swagger_ui
 
 from .compose import MAX_CONCURRENT_REQUESTS, MACHINE_PORT, SERVER_PORT
+from .router import QVLRouter, InstanceDescriptor, parse_model_spec
 
 
 PORT = MACHINE_PORT
@@ -83,6 +84,16 @@ class InstanceInfo(BaseModel):
     endpoint: str = Field(..., description="HTTP endpoint URL")
     gpu_id: Optional[int] = Field(None, description="GPU device ID")
     healthy: bool = Field(..., description="Whether instance is healthy")
+    model_name: str = Field(
+        "", description="Model name (e.g., Qwen/Qwen3-VL-8B-Instruct)"
+    )
+    quant_method: str = Field(
+        "", description="Quantization method (gguf, bitsandbytes, etc.)"
+    )
+    quant_level: str = Field("", description="Quantization level (Q4_K_M, Q8_0, etc.)")
+    model_label: str = Field(
+        "", description="Short model label (e.g., 8B-Instruct:Q4_K_M)"
+    )
 
 
 class MachineStats(BaseModel):
@@ -103,6 +114,9 @@ class InfoResponse(BaseModel):
     port: int = Field(..., description="Machine server port")
     instances: list[InstanceInfo] = Field(..., description="vLLM instances")
     stats: MachineStats = Field(..., description="Machine statistics")
+    available_models: list[str] = Field(
+        default_factory=list, description="Available model labels"
+    )
 
 
 @dataclass
@@ -115,6 +129,9 @@ class VLLMInstance:
     gpu_id: Optional[int] = None
     healthy: bool = False
     _active_requests: int = 0
+    model_name: str = ""
+    quant_method: str = ""
+    quant_level: str = ""
 
     @property
     def endpoint(self) -> str:
@@ -143,17 +160,37 @@ class VLLMInstance:
     def __repr__(self) -> str:
         status = "✓" if self.healthy else "×"
         gpu_info = f"GPU{self.gpu_id}" if self.gpu_id is not None else "GPU?"
+        model_info = ""
+        if self.model_name:
+            from .compose import MODEL_SHORTCUT_REV
+
+            shortcut = MODEL_SHORTCUT_REV.get(
+                self.model_name, self.model_name.split("/")[-1]
+            )
+            quant = f":{self.quant_level}" if self.quant_level else ""
+            model_info = f" [{shortcut}{quant}]"
         return (
             f"VLLMInstance({status} {self.container_name} "
-            f"@ {self.endpoint}, {gpu_info})"
+            f"@ {self.endpoint}, {gpu_info}{model_info})"
         )
 
     def to_info(self) -> InstanceInfo:
+        from .compose import MODEL_SHORTCUT_REV
+
+        shortcut = MODEL_SHORTCUT_REV.get(
+            self.model_name, self.model_name.split("/")[-1] if self.model_name else ""
+        )
+        quant = f":{self.quant_level}" if self.quant_level else ""
+        label = f"{shortcut}{quant}" if shortcut else ""
         return InstanceInfo(
             name=self.container_name,
             endpoint=self.endpoint,
             gpu_id=self.gpu_id,
             healthy=self.healthy,
+            model_name=self.model_name,
+            quant_method=self.quant_method,
+            quant_level=self.quant_level,
+            model_label=label,
         )
 
 
@@ -347,21 +384,52 @@ class QVLMachineServer:
         self._health_task: Optional[asyncio.Task] = None
         self.enable_perf_tracking = enable_perf_tracking
 
+        # Router for model/quant-aware request routing
+        self.router = QVLRouter()
+
         # Round-robin index for distributing requests
         self._rr_lock: Optional[asyncio.Lock] = None
 
         self.app = self._create_app()
 
+    def _build_router(self) -> None:
+        """Build router from discovered instances."""
+        self.router = QVLRouter()
+        for inst in self.instances:
+            desc = InstanceDescriptor(
+                model_name=inst.model_name,
+                quant_method=inst.quant_method,
+                quant_level=inst.quant_level,
+                endpoint=inst.endpoint,
+                gpu_id=inst.gpu_id,
+                instance_id=inst.container_name,
+                healthy=inst.healthy,
+            )
+            self.router.register(desc)
+
     def get_healthy_instances(self) -> list[VLLMInstance]:
         return [i for i in self.instances if i.healthy]
 
-    def _get_idle_instance(self) -> Optional[VLLMInstance]:
-        """Get the instance with most available slots."""
-        idle = [i for i in self.instances if i.healthy and i.is_idle]
-        if not idle:
+    def _get_idle_instance(
+        self, model: str = "", quant: str = ""
+    ) -> Optional[VLLMInstance]:
+        """Get idle instance, optionally filtered by model/quant."""
+        if model or quant:
+            # Use router to find matching instances
+            matching_descs = self.router.find_instances(model, quant)
+            matching_endpoints = {d.endpoint for d in matching_descs}
+            candidates = [
+                i
+                for i in self.instances
+                if i.healthy and i.is_idle and i.endpoint in matching_endpoints
+            ]
+        else:
+            candidates = [i for i in self.instances if i.healthy and i.is_idle]
+
+        if not candidates:
             return None
-        idle.sort(key=lambda i: i.available_slots, reverse=True)
-        return idle[0]
+        candidates.sort(key=lambda i: i.available_slots, reverse=True)
+        return candidates[0]
 
     def _create_app(self) -> FastAPI:
         app = FastAPI(
@@ -401,6 +469,8 @@ class QVLMachineServer:
         self._rr_lock = asyncio.Lock()
 
         await self.health_check_all()
+        await self._discover_instance_models()
+        self._build_router()
 
         healthy = self.get_healthy_instances()
         if not healthy:
@@ -412,6 +482,10 @@ class QVLMachineServer:
         healthy_str = logstr.okay(len(healthy))
         total_str = logstr.mesg(len(self.instances))
         logger.mesg(f"[qvl_machine] Healthy instances: {healthy_str}/{total_str}")
+        if self.router:
+            models = self.router.get_available_models()
+            if models:
+                logger.mesg(f"[qvl_machine] Models: {models}")
 
         yield
 
@@ -437,6 +511,12 @@ class QVLMachineServer:
         tasks = [self._check_instance_health(inst) for inst in self.instances]
         await asyncio.gather(*tasks, return_exceptions=True)
 
+        # Update router health status
+        for inst in self.instances:
+            for desc in self.router.instances:
+                if desc.endpoint == inst.endpoint:
+                    desc.healthy = inst.healthy
+
     async def _check_instance_health(self, instance: VLLMInstance) -> bool:
         try:
             resp = await self._client.get(instance.health_url)
@@ -457,32 +537,75 @@ class QVLMachineServer:
             raise HTTPException(status_code=503, detail=response.model_dump())
         return response
 
+    async def _discover_instance_models(self) -> None:
+        """Query each instance's /v1/models to discover model names."""
+        if not self._client:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
+
+        for inst in self.instances:
+            if not inst.healthy or inst.model_name:
+                continue
+            try:
+                resp = await self._client.get(f"{inst.endpoint}/v1/models")
+                if resp.status_code == 200:
+                    data = resp.json()
+                    models_data = data.get("data", [])
+                    if models_data:
+                        model_id = models_data[0].get("id", "")
+                        inst.model_name = model_id
+                        # Try to infer quant from model name
+                        if "GGUF" in model_id.upper():
+                            inst.quant_method = "gguf"
+                        logger.mesg(
+                            f"[qvl_machine] {inst.container_name}: model={model_id}"
+                        )
+            except Exception:
+                pass
+
     async def info(self) -> InfoResponse:
         return InfoResponse(
             port=self.port,
             instances=[inst.to_info() for inst in self.instances],
             stats=self.stats.to_model(),
+            available_models=self.router.get_available_models(),
         )
 
     async def chat_completions(self, request: Request) -> Response:
         """Forward chat completion request to an idle vLLM instance.
 
-        Selects the least-loaded instance and proxies the request.
+        Routes based on model/quant in request body if specified.
+        Uses least-loaded instance for unspecified requests.
         """
         t0 = time.perf_counter()
         self.stats.total_requests += 1
         self.stats.active_requests += 1
 
         try:
-            # Get an idle instance
-            instance = self._get_idle_instance()
+            # Parse model/quant from request body for routing
+            body = await request.body()
+            req_model = ""
+            req_quant = ""
+            try:
+                req_data = orjson.loads(body)
+                model_field = req_data.get("model", "")
+                if model_field:
+                    req_model, req_quant = parse_model_spec(model_field)
+            except Exception:
+                pass
+
+            # Get an idle instance (with optional model/quant filter)
+            instance = self._get_idle_instance(model=req_model, quant=req_quant)
             if instance is None:
                 # Wait briefly for a slot to free up
                 for _ in range(10):
                     await asyncio.sleep(0.1)
-                    instance = self._get_idle_instance()
+                    instance = self._get_idle_instance(model=req_model, quant=req_quant)
                     if instance:
                         break
+
+            if instance is None:
+                # Fall back to any idle instance
+                instance = self._get_idle_instance()
 
             if instance is None:
                 self.stats.total_errors += 1
@@ -493,9 +616,7 @@ class QVLMachineServer:
             instance._active_requests += 1
 
             try:
-                # Read raw request body and forward to vLLM
-                body = await request.body()
-
+                # Forward pre-read body to vLLM
                 resp = await self._client.post(
                     instance.chat_url,
                     content=body,
@@ -635,29 +756,35 @@ def log_instances(instances: list[VLLMInstance], show_health: bool = False) -> N
         logger.warn("× No vLLM instances found")
         return
 
-    dash_len = 85
+    dash_len = 100
     logger.note("=" * dash_len)
 
     if show_health:
-        logger.note(f"{'GPU':<6} {'CONTAINER':<40} {'ENDPOINT':<25} {'STATUS':<8}")
+        logger.note(
+            f"{'GPU':<6} {'CONTAINER':<35} {'ENDPOINT':<25} {'MODEL':<22} {'STATUS':<8}"
+        )
     else:
-        logger.note(f"{'GPU':<6} {'CONTAINER':<45} {'ENDPOINT':<25}")
+        logger.note(f"{'GPU':<6} {'CONTAINER':<35} {'ENDPOINT':<25} {'MODEL':<22}")
 
     logger.note("-" * dash_len)
 
     for inst in instances:
         gpu_str = str(inst.gpu_id) if inst.gpu_id is not None else "?"
+        model_info = inst.to_info().model_label or "?"
         if show_health:
             if inst.healthy:
                 status = logstr.okay("✓ healthy")
             else:
                 status = logstr.erro("× sick")
             logger.mesg(
-                f"{gpu_str:<6} {inst.container_name:<40} "
-                f"{inst.endpoint:<25} {status:<8}"
+                f"{gpu_str:<6} {inst.container_name:<35} "
+                f"{inst.endpoint:<25} {model_info:<22} {status:<8}"
             )
         else:
-            logger.mesg(f"{gpu_str:<6} {inst.container_name:<45} {inst.endpoint:<25}")
+            logger.mesg(
+                f"{gpu_str:<6} {inst.container_name:<35} "
+                f"{inst.endpoint:<25} {model_info:<22}"
+            )
 
     logger.note("=" * dash_len)
 

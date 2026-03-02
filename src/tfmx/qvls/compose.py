@@ -70,6 +70,7 @@ import argparse
 import re
 import subprocess
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -140,7 +141,50 @@ GGUF_MODELS = {
     "unsloth/Qwen3-VL-2B-Instruct-GGUF": "Qwen/Qwen3-VL-2B-Instruct",
     "unsloth/Qwen3-VL-4B-Instruct-GGUF": "Qwen/Qwen3-VL-4B-Instruct",
     "unsloth/Qwen3-VL-8B-Instruct-GGUF": "Qwen/Qwen3-VL-8B-Instruct",
+    "unsloth/Qwen3-VL-2B-Thinking-GGUF": "Qwen/Qwen3-VL-2B-Thinking",
+    "unsloth/Qwen3-VL-4B-Thinking-GGUF": "Qwen/Qwen3-VL-4B-Thinking",
+    "unsloth/Qwen3-VL-8B-Thinking-GGUF": "Qwen/Qwen3-VL-8B-Thinking",
 }
+
+# Model shortcuts: size-type → full HF model name
+MODEL_SHORTCUTS = {
+    "2B-Instruct": "Qwen/Qwen3-VL-2B-Instruct",
+    "2B-Thinking": "Qwen/Qwen3-VL-2B-Thinking",
+    "4B-Instruct": "Qwen/Qwen3-VL-4B-Instruct",
+    "4B-Thinking": "Qwen/Qwen3-VL-4B-Thinking",
+    "8B-Instruct": "Qwen/Qwen3-VL-8B-Instruct",
+    "8B-Thinking": "Qwen/Qwen3-VL-8B-Thinking",
+}
+
+# Reverse map: full name → shortcut
+MODEL_SHORTCUT_REV = {v: k for k, v in MODEL_SHORTCUTS.items()}
+
+# Base model → GGUF repo mapping
+GGUF_REPO_MAP = {
+    "Qwen/Qwen3-VL-2B-Instruct": "unsloth/Qwen3-VL-2B-Instruct-GGUF",
+    "Qwen/Qwen3-VL-4B-Instruct": "unsloth/Qwen3-VL-4B-Instruct-GGUF",
+    "Qwen/Qwen3-VL-8B-Instruct": "unsloth/Qwen3-VL-8B-Instruct-GGUF",
+    "Qwen/Qwen3-VL-2B-Thinking": "unsloth/Qwen3-VL-2B-Thinking-GGUF",
+    "Qwen/Qwen3-VL-4B-Thinking": "unsloth/Qwen3-VL-4B-Thinking-GGUF",
+    "Qwen/Qwen3-VL-8B-Thinking": "unsloth/Qwen3-VL-8B-Thinking-GGUF",
+}
+
+# GGUF filenames by model shortcut and quant level
+GGUF_FILES = {
+    shortcut: {
+        "Q4_K_M": f"Qwen3-VL-{shortcut}-Q4_K_M.gguf",
+        "Q5_K_M": f"Qwen3-VL-{shortcut}-Q5_K_M.gguf",
+        "Q6_K": f"Qwen3-VL-{shortcut}-Q6_K.gguf",
+        "Q8_0": f"Qwen3-VL-{shortcut}-Q8_0.gguf",
+    }
+    for shortcut in MODEL_SHORTCUTS
+}
+
+# Default GGUF configuration
+DEFAULT_QUANT_METHOD = "gguf"
+DEFAULT_QUANT_LEVEL = "Q4_K_M"
+DEFAULT_GGUF_REPO = "unsloth/Qwen3-VL-8B-Instruct-GGUF"
+DEFAULT_GGUF_FILE = "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"
 
 # Quantization recommendations by GPU VRAM and model size
 # RTX 3060/3070: ~8-12GB, RTX 3080/3090: ~10-24GB
@@ -159,6 +203,108 @@ GPU_COMPUTE_CAPS = {
     "8.0": "A100/A30",  # Ampere 80
     "9.0": "H100",  # Hopper
 }
+
+
+@dataclass
+class GpuModelConfig:
+    """Per-GPU model and quantization configuration."""
+
+    gpu_id: int
+    model_name: str = MODEL_NAME
+    quant_method: str = DEFAULT_QUANT_METHOD
+    quant_level: str = DEFAULT_QUANT_LEVEL
+
+    @property
+    def model_shortcut(self) -> str:
+        """Get model shortcut from full name."""
+        return MODEL_SHORTCUT_REV.get(self.model_name, self.model_name.split("/")[-1])
+
+    @property
+    def gguf_repo(self) -> str | None:
+        """Get GGUF repo name for this model."""
+        if self.quant_method != "gguf":
+            return None
+        return GGUF_REPO_MAP.get(self.model_name)
+
+    @property
+    def gguf_file(self) -> str | None:
+        """Get specific GGUF filename."""
+        if self.quant_method != "gguf":
+            return None
+        shortcut = self.model_shortcut
+        return GGUF_FILES.get(shortcut, {}).get(self.quant_level)
+
+    @property
+    def vllm_model_arg(self) -> str:
+        """Get the --model argument for vLLM."""
+        if self.quant_method == "gguf" and self.gguf_repo:
+            return self.gguf_repo
+        return self.model_name
+
+    @property
+    def vllm_tokenizer_arg(self) -> str | None:
+        """Get --tokenizer argument (needed for GGUF models)."""
+        if self.quant_method == "gguf":
+            return self.model_name
+        return None
+
+    @property
+    def label(self) -> str:
+        """Human-readable label."""
+        if self.quant_level:
+            return f"{self.model_shortcut}:{self.quant_level}"
+        return self.model_shortcut
+
+    def to_dict(self) -> dict:
+        return {
+            "gpu_id": self.gpu_id,
+            "model_name": self.model_name,
+            "model_shortcut": self.model_shortcut,
+            "quant_method": self.quant_method,
+            "quant_level": self.quant_level,
+            "gguf_repo": self.gguf_repo,
+            "gguf_file": self.gguf_file,
+        }
+
+
+def parse_gpu_configs(config_str: str) -> list[GpuModelConfig]:
+    """Parse per-GPU model/quant configs from CLI string.
+
+    Format: "GPU_ID:MODEL_SHORTCUT:QUANT_LEVEL,..."
+    Example: "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q4_K_M"
+
+    If QUANT_LEVEL is omitted, defaults to Q4_K_M.
+    MODEL_SHORTCUT can be a shortcut (e.g., '8B-Instruct') or full name.
+    """
+    configs = []
+    for part in config_str.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        fields = part.split(":")
+        if len(fields) < 2:
+            raise ValueError(f"Invalid config: '{part}'. Format: GPU_ID:MODEL[:QUANT]")
+
+        gpu_id = int(fields[0].strip())
+        model_key = fields[1].strip()
+        quant_level = fields[2].strip() if len(fields) > 2 else DEFAULT_QUANT_LEVEL
+
+        model_name = MODEL_SHORTCUTS.get(model_key, model_key)
+
+        # Determine quant method from quant level
+        gguf_levels = {"Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"}
+        quant_method = "gguf" if quant_level in gguf_levels else "none"
+
+        configs.append(
+            GpuModelConfig(
+                gpu_id=gpu_id,
+                model_name=model_name,
+                quant_method=quant_method,
+                quant_level=quant_level,
+            )
+        )
+
+    return configs
 
 
 class NvidiaDriverLibs:
@@ -455,6 +601,7 @@ class ComposeFileGenerator:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
         limit_mm_per_prompt: str = LIMIT_MM_PER_PROMPT,
+        gpu_configs: list[GpuModelConfig] | None = None,
     ):
         self.gpus = gpus
         self.model_name = model_name
@@ -472,6 +619,22 @@ class ComposeFileGenerator:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.limit_mm_per_prompt = limit_mm_per_prompt
+        self.gpu_configs = gpu_configs
+        self._gpu_config_map: dict[int, GpuModelConfig] = {}
+        if gpu_configs:
+            for gc in gpu_configs:
+                self._gpu_config_map[gc.gpu_id] = gc
+
+    def _get_gpu_config(self, gpu: GPUInfo) -> GpuModelConfig:
+        """Get model config for a specific GPU."""
+        if gpu.index in self._gpu_config_map:
+            return self._gpu_config_map[gpu.index]
+        return GpuModelConfig(
+            gpu_id=gpu.index,
+            model_name=self.model_name,
+            quant_method=self.quantization or DEFAULT_QUANT_METHOD,
+            quant_level=DEFAULT_QUANT_LEVEL if self.quantization == "gguf" else "",
+        )
 
     def generate(self) -> str:
         """Generate docker-compose.yml content."""
@@ -485,15 +648,28 @@ class ComposeFileGenerator:
 
     def _generate_header(self) -> list[str]:
         """Generate compose file header."""
-        quant_info = f", quantization: {self.quantization}" if self.quantization else ""
-        return [
+        lines = [
             f"# QVL (Qwen3-VL) Multi-GPU Deployment via vLLM",
-            f"# Model: {self.model_name}{quant_info}",
-            f"# GPUs: {[g.index for g in self.gpus]}",
-            f"",
-            f"name: {self.project_name}",
-            f"",
         ]
+        if self._gpu_config_map:
+            lines.append(f"# Per-GPU configs:")
+            for gpu in self.gpus:
+                gc = self._get_gpu_config(gpu)
+                lines.append(f"#   GPU {gc.gpu_id}: {gc.label}")
+        else:
+            quant_info = (
+                f", quantization: {self.quantization}" if self.quantization else ""
+            )
+            lines.append(f"# Model: {self.model_name}{quant_info}")
+        lines.extend(
+            [
+                f"# GPUs: {[g.index for g in self.gpus]}",
+                f"",
+                f"name: {self.project_name}",
+                f"",
+            ]
+        )
+        return lines
 
     def _generate_common_config(self) -> list[str]:
         """Generate common configuration as YAML anchor."""
@@ -545,6 +721,7 @@ class ComposeFileGenerator:
 
     def _generate_service(self, gpu: GPUInfo) -> list[str]:
         """Generate service definition for a single GPU."""
+        gpu_config = self._get_gpu_config(gpu)
         service_port = self.port + gpu.index
         container_name = f"{self.project_name}--gpu{gpu.index}"
 
@@ -593,11 +770,27 @@ class ComposeFileGenerator:
             )
 
         # vLLM command arguments
+        vllm_model = gpu_config.vllm_model_arg
         lines.extend(
             [
                 f"    command:",
                 f"      - --model",
-                f"      - {self.model_name}",
+                f"      - {vllm_model}",
+            ]
+        )
+
+        # Add tokenizer for GGUF models
+        tokenizer = gpu_config.vllm_tokenizer_arg
+        if tokenizer:
+            lines.extend(
+                [
+                    f"      - --tokenizer",
+                    f"      - {tokenizer}",
+                ]
+            )
+
+        lines.extend(
+            [
                 f"      - --max-model-len",
                 f'      - "{self.max_model_len}"',
                 f"      - --max-num-seqs",
@@ -610,16 +803,17 @@ class ComposeFileGenerator:
             ]
         )
 
-        # Quantization
-        if self.quantization and self.quantization != "none":
-            if self.quantization == "gguf":
+        # Quantization (per-GPU config takes priority)
+        quant = gpu_config.quant_method
+        if quant and quant != "none":
+            if quant == "gguf":
                 lines.extend(
                     [
                         f"      - --quantization",
                         f"      - gguf",
                     ]
                 )
-            elif self.quantization == "bitsandbytes":
+            elif quant == "bitsandbytes":
                 lines.extend(
                     [
                         f"      - --quantization",
@@ -628,7 +822,7 @@ class ComposeFileGenerator:
                         f"      - bitsandbytes",
                     ]
                 )
-            elif self.quantization == "awq":
+            elif quant == "awq":
                 lines.extend(
                     [
                         f"      - --quantization",
@@ -694,6 +888,7 @@ class QVLComposer:
         quantization: Optional[str] = None,
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
+        gpu_configs: list[GpuModelConfig] | None = None,
     ):
         self.model_name = model_name
         self.port = port
@@ -704,11 +899,15 @@ class QVLComposer:
         self.quantization = quantization
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.gpu_configs = gpu_configs
 
         # project name: lowercase, safe characters
-        project_dash = model_name.replace("/", "--").lower()
-        project_dash = re.sub(r"[^a-z0-9_-]", "_", project_dash)
-        self.project_name = project_name or f"qvl--{project_dash}"
+        if gpu_configs:
+            self.project_name = project_name or "qvl-multi"
+        else:
+            project_dash = model_name.replace("/", "--").lower()
+            project_dash = re.sub(r"[^a-z0-9_-]", "_", project_dash)
+            self.project_name = project_name or f"qvl--{project_dash}"
 
         # Compose file location
         if compose_dir:
@@ -755,6 +954,7 @@ class QVLComposer:
             quantization=self.quantization,
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
+            gpu_configs=self.gpu_configs,
         )
         content = compose_generator.generate()
         self.compose_file.write_text(content)
@@ -781,6 +981,9 @@ class QVLComposer:
             return
 
         logger.mesg(f"[qvl] Starting vLLM for model: {self.model_name}")
+        if self.gpu_configs:
+            for gc in self.gpu_configs:
+                logger.mesg(f"[qvl]   GPU {gc.gpu_id}: {gc.label}")
         logger.mesg(
             f"[qvl] GPUs: {[f'{g.index}(cap={g.compute_cap})' for g in self.gpus]}"
         )
@@ -1014,6 +1217,16 @@ class QVLComposeArgParser:
             default=MAX_NUM_SEQS,
             help=f"Max concurrent sequences (default: {MAX_NUM_SEQS})",
         )
+        parser.add_argument(
+            "--gpu-configs",
+            type=str,
+            default=None,
+            help=(
+                "Per-GPU model/quant configs. "
+                'Format: "GPU:MODEL:QUANT,...". '
+                'Example: "0:2B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"'
+            ),
+        )
 
     def _setup_arguments(self):
         subparsers = self.parser.add_subparsers(
@@ -1080,6 +1293,12 @@ def main():
         "max_model_len": getattr(args, "max_model_len", MAX_MODEL_LEN),
         "max_num_seqs": getattr(args, "max_num_seqs", MAX_NUM_SEQS),
     }
+
+    # Parse per-GPU configs if provided
+    gpu_configs_str = getattr(args, "gpu_configs", None)
+    if gpu_configs_str:
+        composer_kwargs["gpu_configs"] = parse_gpu_configs(gpu_configs_str)
+
     composer = QVLComposer(**composer_kwargs)
 
     if args.action == "up":

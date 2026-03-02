@@ -2,6 +2,7 @@
 dist/
 src/*.egg-info/
 docker_data/
+data/
 configs/
 weights/
 __pycache__

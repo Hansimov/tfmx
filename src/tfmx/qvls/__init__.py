@@ -8,6 +8,19 @@ from .compose import QVLComposer, QVLComposeArgParser
 from .compose import GPUInfo, GPUDetector
 from .compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
 from .compose import SUPPORTED_MODELS, GGUF_MODELS
+from .compose import (
+    GpuModelConfig,
+    parse_gpu_configs,
+    MODEL_SHORTCUTS,
+    MODEL_SHORTCUT_REV,
+    GGUF_REPO_MAP,
+    GGUF_FILES,
+    DEFAULT_QUANT_METHOD,
+    DEFAULT_QUANT_LEVEL,
+    DEFAULT_GGUF_REPO,
+    DEFAULT_GGUF_FILE,
+)
+from .router import QVLRouter, InstanceDescriptor, parse_model_spec
 from .client import QVLClient, AsyncQVLClient, QVLClientArgParser
 from .client import HealthResponse, ModelInfo, ChatMessage, ChatResponse, ChatUsage
 from .clients_core import (
@@ -41,4 +54,10 @@ from .perf_tracker import (
     reset_global_tracker,
 )
 from .benchmark import QVLBenchmark, BenchmarkMetrics
-from .benchimgs import QVLBenchImageGenerator
+from .benchimgs import (
+    QVLBenchImageGenerator,
+    download_benchmark_images,
+    load_local_images,
+    DATA_DIR,
+    BENCH_IMAGES_DIR,
+)
