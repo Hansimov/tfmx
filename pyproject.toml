@@ -32,6 +32,12 @@ tei_client = "tfmx.teis.client:main"
 tei_clients = "tfmx.teis.clients:main"
 tei_clients_stats = "tfmx.teis.clients_stats:main"
 tei_benchmark = "tfmx.teis.benchmark:main"
+qvl_compose = "tfmx.qvls.compose:main"
+qvl_machine = "tfmx.qvls.machine:main"
+qvl_client = "tfmx.qvls.client:main"
+qvl_clients = "tfmx.qvls.clients_cli:run_cli_main"
+qvl_clients_stats = "tfmx.qvls.clients_stats:run_cli_main"
+qvl_benchmark = "tfmx.qvls.benchmark:main"
 
 [tool.setuptools]
 include-package-data = true
