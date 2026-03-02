@@ -4,7 +4,7 @@ Distribute embed/lsh requests across multiple TEI machines with async pipeline.
 For verbose logging and stats, use TEIClientsWithStats.
 """
 
-from .tei_clients_core import _TEIClientsBase, _TEIClientsPipeline
+from .clients_core import _TEIClientsBase, _TEIClientsPipeline
 
 
 # ANCHOR[id=clients-clis]
@@ -45,7 +45,7 @@ class TEIClients(_TEIClientsBase):
 
 def main():
     """Main entry point for CLI."""
-    from .tei_clients_cli import (
+    from .clients_cli import (
         TEIClientsArgParserBase,
         run_cli_main,
     )

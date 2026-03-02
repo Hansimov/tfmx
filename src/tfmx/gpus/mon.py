@@ -7,7 +7,7 @@ from pathlib import Path
 from tclogger import logger, log_error
 from typing import Union
 
-from tfmx.gpu_ctl import (
+from .ctl import (
     MIN_FAN_PERCENT,
     MAX_FAN_PERCENT,
     is_none_or_empty,
@@ -24,8 +24,8 @@ DEFAULT_INTERVAL = 1.0
 
 
 def get_script_dir() -> Path:
-    """Get the directory of current script"""
-    return Path(__file__).parent
+    """Get the configs directory (parent package's configs/)"""
+    return Path(__file__).resolve().parent.parent / "configs"
 
 
 def round_speed_up(speed: int, step: int = SPEED_STEP) -> int:
@@ -459,15 +459,15 @@ def parse_curve_arg(curve_arg: str) -> tuple[str, str]:
 
 def parse_multi_curve_arg(curve_arg: str) -> list[tuple[str, str]]:
     """Parse multi-GPU curve argument separated by semicolons.
-    
+
     Format: "<gpu1>:<curve1>;<gpu2>:<curve2>;..."
     Example: "a:30-50/50-65/60-80/75-100;3:30-100"
-    
+
     Returns list of (gpu_idx, curve_str) tuples.
     Later entries can override earlier ones (e.g., GPU 3 overrides 'a').
     """
     results = []
-    
+
     # Check if this is a multi-curve format (contains ; with : after it)
     if ";" in curve_arg:
         # Split by semicolon to get individual GPU settings
@@ -484,7 +484,7 @@ def parse_multi_curve_arg(curve_arg: str) -> list[tuple[str, str]]:
         gpu_idx, curve_val = parse_curve_arg(curve_arg)
         if curve_val is not None:
             results.append((gpu_idx, curve_val))
-    
+
     return results
 
 
@@ -531,7 +531,7 @@ def main():
     else:
         # Check if this is a multi-curve format (contains ; separator)
         multi_curves = parse_multi_curve_arg(args.curve)
-        
+
         if len(multi_curves) > 1:
             # Multi-GPU curve setting: "a:curve1;3:curve2"
             for gpu_idx, curve_val in multi_curves:
@@ -540,7 +540,9 @@ def main():
                 else:
                     curve_points = parse_curve_points(curve_val)
                     if curve_points is None:
-                        log_error(f"× Invalid curve format for GPU {gpu_idx}: {curve_val}")
+                        log_error(
+                            f"× Invalid curve format for GPU {gpu_idx}: {curve_val}"
+                        )
                         return
                     # Parse multiple GPU indices (e.g., "0,1" or "a")
                     if is_str_and_all(gpu_idx):

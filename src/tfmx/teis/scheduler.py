@@ -30,7 +30,7 @@ from dataclasses import dataclass, field
 from typing import TypeVar, Generic, Callable, Optional, Any
 from tclogger import logger, logstr
 
-from .tei_compose import MAX_CLIENT_BATCH_SIZE
+from .compose import MAX_CLIENT_BATCH_SIZE
 from .perf_tracker import PerfTracker, get_global_tracker
 
 

@@ -47,5 +47,5 @@ tei_compose up && sleep 45 && tei_machine run --perf-track
 Run tei benchmark:
 
 ```sh
-tei_benchmark -E "http://localhost:28800" -n 1000000 run
+tei_benchmark run -E "http://localhost:28800" -n 100000
 ```

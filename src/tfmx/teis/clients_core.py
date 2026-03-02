@@ -20,9 +20,9 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Optional, Iterator, Callable, Any, Union, Iterable
 
-from .tei_client import TEIClient, AsyncTEIClient, InfoResponse
-from .tei_compose import MAX_CLIENT_BATCH_SIZE
-from .tei_performance import ExplorationConfig
+from .client import TEIClient, AsyncTEIClient, InfoResponse
+from .compose import MAX_CLIENT_BATCH_SIZE
+from .performance import ExplorationConfig
 
 
 @dataclass

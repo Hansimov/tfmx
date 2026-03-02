@@ -3,7 +3,7 @@ import argparse
 from tclogger import logger, shell_cmd, log_error
 from typing import Union, Literal
 
-from tfmx.gpu_ctl import (
+from .ctl import (
     MIN_FAN_PERCENT,
     MAX_FAN_PERCENT,
     get_nv_settings_cmd,

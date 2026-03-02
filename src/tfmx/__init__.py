@@ -1,39 +1,37 @@
-from .llm import LLMConfigsType, LLMClient, LLMClientByConfig
-from .vector_utils import floats_to_bits, bits_to_hash, bits_dist, hash_dist
-from .vector_utils import bits_sim, hash_sim, dot_sim
-from .embed_client import EmbedClientConfigsType
-from .embed_client import EmbedClient, EmbedClientByConfig
-from .embed_server import TEIEmbedServerConfigsType
-from .embed_server import TEIEmbedServer, TEIEmbedServerByConfig
-from .embed_server import EmbedServerArgParser
-from .tei_compose import TEIComposer, TEIComposeArgParser
-from .tei_compose import GPUInfo, GPUDetector
-from .tei_compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
-from .tei_client import TEIClient, AsyncTEIClient, TEIClientArgParser
-from .tei_client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
-from .tei_clients_core import (
+# Utils
+from .utils.vectors import floats_to_bits, bits_to_hash, bits_dist, hash_dist
+from .utils.vectors import bits_sim, hash_sim, dot_sim
+from .utils.lsh import LSHConverter
+
+# TEI
+from .teis.compose import TEIComposer, TEIComposeArgParser
+from .teis.compose import GPUInfo, GPUDetector
+from .teis.compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
+from .teis.client import TEIClient, AsyncTEIClient, TEIClientArgParser
+from .teis.client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
+from .teis.clients_core import (
     MachineState,
     MachineScheduler,
     ClientsHealthResponse,
     IteratorBuffer,
 )
-from .tei_clients import TEIClients
-from .tei_clients_stats import TEIClientsWithStats
-from .tei_clients_cli import TEIClientsArgParserBase, TEIClientsCLIBase
-from .tei_performance import (
+from .teis.clients import TEIClients
+from .teis.clients_stats import TEIClientsWithStats
+from .teis.clients_cli import TEIClientsArgParserBase, TEIClientsCLIBase
+from .teis.performance import (
     ExplorationConfig,
     PerformanceTracker,
     PerformanceMetrics,
     ExplorationState,
 )
-from .tei_scheduler import (
+from .teis.scheduler import (
     WorkerState,
     IdleFillingScheduler,
     DistributionResult,
     distribute_with_adaptive_pipeline,
     MAX_CLIENT_BATCH_SIZE,
 )
-from .perf_tracker import (
+from .teis.perf_tracker import (
     PerfTracker,
     WorkerEvent,
     TaskRecord,
@@ -44,5 +42,7 @@ from .perf_tracker import (
     get_global_tracker,
     reset_global_tracker,
 )
-from .gpu_fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
-from .gpu_pow import NvidiaSmiParser, GPUPowerController, GPUPowerArgParser
+
+# GPU
+from .gpus.fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
+from .gpus.pow import NvidiaSmiParser, GPUPowerController, GPUPowerArgParser

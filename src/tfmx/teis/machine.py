@@ -51,10 +51,10 @@ from tclogger import logger, logstr
 from typing import Optional, Union
 from webu import setup_swagger_ui
 
-from .lsh import LSHConverter
+from ..utils.lsh import LSHConverter
 from .perf_tracker import PerfTracker
-from .tei_compose import MAX_CLIENT_BATCH_SIZE
-from .tei_scheduler import (
+from .compose import MAX_CLIENT_BATCH_SIZE
+from .scheduler import (
     IdleFillingScheduler,
     distribute_with_adaptive_pipeline,
 )

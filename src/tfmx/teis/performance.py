@@ -17,11 +17,11 @@ from pathlib import Path
 from tclogger import logger
 from typing import Optional
 
-from .tei_compose import MAX_CLIENT_BATCH_SIZE
+from .compose import MAX_CLIENT_BATCH_SIZE
 
 
 # Config directory
-CONFIG_DIR = Path(__file__).parent
+CONFIG_DIR = Path(__file__).resolve().parent.parent / "configs"
 
 
 class ExplorationConfig:

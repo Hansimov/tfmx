@@ -4,7 +4,7 @@ from pathlib import Path
 from tclogger import logger
 from typing import Optional, TYPE_CHECKING
 
-WEIGHTS_DIR = Path(__file__).parent / "weights"
+WEIGHTS_DIR = Path(__file__).resolve().parent.parent / "weights"
 
 # Try to import torch for GPU acceleration
 try:

@@ -2,7 +2,7 @@
 dist/
 src/*.egg-info/
 docker_data/
-compose/
+configs/
 weights/
 __pycache__
 *.chats

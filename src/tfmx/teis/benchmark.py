@@ -13,10 +13,10 @@ Features:
 Usage:
     # Basic benchmark
     tei_benchmark -E "http://m1:28800,http://m2:28800" run -n 100000
-    
+
     # Auto-tune batch sizes
     tei_benchmark -E "http://m1:28800,http://m2:28800" tune
-    
+
     # Verbose with results saved
     tei_benchmark -E "http://m1:28800,http://m2:28800" -v run -o results.json
 
@@ -63,8 +63,8 @@ import json
 from dataclasses import dataclass, field
 from tclogger import logger, logstr
 
-from .tei_clients_stats import TEIClientsWithStats
-from .tei_benchtext import TEIBenchTextGenerator
+from .clients_stats import TEIClientsWithStats
+from .benchtext import TEIBenchTextGenerator
 
 
 @dataclass

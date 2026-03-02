@@ -6,8 +6,8 @@ For production use without overhead, use TEIClients.
 
 from tclogger import logger, logstr
 
-from .tei_clients_core import _TEIClientsBase, _TEIClientsPipeline, MachineState
-from .tei_performance import ExplorationConfig
+from .clients_core import _TEIClientsBase, _TEIClientsPipeline, MachineState
+from .performance import ExplorationConfig
 
 
 # ANCHOR[id=clients-stats-clis]
@@ -129,7 +129,7 @@ class TEIClientsWithStats(_TEIClientsBase):
 
 def main():
     """Main entry point for CLI."""
-    from .tei_clients_cli import (
+    from .clients_cli import (
         TEIClientsArgParserBase,
         run_cli_main,
     )

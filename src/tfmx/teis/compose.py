@@ -713,12 +713,12 @@ class TEIComposer:
         project_dash = re.sub(r"[^a-z0-9_-]", "_", project_dash)
         self.project_name = project_name or f"tei--{project_dash}"
 
-        # Compose file location (default to script directory)
+        # Compose file location (default to configs directory)
         if compose_dir:
             self.compose_dir = Path(compose_dir)
         else:
             script_dir = Path(__file__).resolve().parent
-            self.compose_dir = script_dir / "compose"
+            self.compose_dir = script_dir.parent / "configs"
 
         self.compose_file = self.compose_dir / f"{self.project_name}.yml"
 
