@@ -117,11 +117,19 @@ qvl_compose down
 ### 4. Start Machine Proxy
 
 ```bash
-# Auto-discover vLLM containers
+# Auto-discover vLLM containers (foreground)
 qvl_machine run
+
+# Run as background daemon (recommended for production)
+qvl_machine run -b
 
 # Or specify endpoints manually
 qvl_machine run -e "http://localhost:29880,http://localhost:29881"
+
+# Check status / stop / restart
+qvl_machine status
+qvl_machine stop
+qvl_machine restart
 ```
 
 ### 5. Test with Client
@@ -150,13 +158,13 @@ qvl_clients generate --endpoints http://localhost:29800 --prompt "Describe what 
 ### Machine 1 (2x GPU)
 ```bash
 qvl_compose up -g "0,1" -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
-qvl_machine run
+qvl_machine run -b
 ```
 
 ### Machine 2 (2x GPU, mixed models)
 ```bash
 qvl_compose up --gpu-configs "0:4b-instruct:4bit,1:8b-instruct:4bit"
-qvl_machine run
+qvl_machine run -b
 ```
 
 ### Client (any machine)

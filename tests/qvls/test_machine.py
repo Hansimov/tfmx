@@ -1,7 +1,10 @@
 """Tests for tfmx.qvls.machine module"""
 
 import asyncio
+import os
+import signal
 import pytest
+from pathlib import Path
 from unittest.mock import patch, MagicMock, AsyncMock
 from dataclasses import asdict
 
@@ -10,6 +13,7 @@ from tfmx.qvls.machine import (
     VLLMStatsData,
     VLLMInstanceDiscovery,
     QVLMachineServer,
+    QVLMachineDaemon,
     ChatCompletionRequest,
     HealthResponse,
     InstanceInfo,
@@ -460,3 +464,194 @@ class TestQVLMachineServer:
         assert "/info" in route_paths
         assert "/v1/chat/completions" in route_paths
         assert "/chat" in route_paths
+
+
+# ── QVLMachineDaemon ─────────────────────────────────────────────────
+
+
+class TestQVLMachineDaemon:
+    """Test daemon lifecycle management (PID/log file operations)."""
+
+    @pytest.fixture(autouse=True)
+    def daemon(self, tmp_path):
+        """Create a daemon with temp PID/log files for each test."""
+        self.pid_file = tmp_path / "qvl_machine.pid"
+        self.log_file = tmp_path / "qvl_machine.log"
+        self.d = QVLMachineDaemon(
+            pid_file=self.pid_file,
+            log_file=self.log_file,
+        )
+
+    # ── get_pid ──
+
+    def test_get_pid_no_file(self):
+        assert self.d.get_pid() is None
+
+    def test_get_pid_valid(self):
+        """Reading PID of current process should succeed."""
+        self.pid_file.write_text(str(os.getpid()))
+        assert self.d.get_pid() == os.getpid()
+
+    def test_get_pid_stale_cleans_up(self):
+        """Stale PID (nonexistent process) returns None and removes file."""
+        self.pid_file.write_text("999999999")
+        assert self.d.get_pid() is None
+        assert not self.pid_file.exists()
+
+    def test_get_pid_garbage_content(self):
+        """Non-integer PID file content returns None and removes file."""
+        self.pid_file.write_text("not-a-pid")
+        assert self.d.get_pid() is None
+        assert not self.pid_file.exists()
+
+    # ── is_running ──
+
+    def test_is_running_false_no_file(self):
+        assert self.d.is_running() is False
+
+    def test_is_running_true(self):
+        self.pid_file.write_text(str(os.getpid()))
+        assert self.d.is_running() is True
+
+    def test_is_running_false_stale(self):
+        self.pid_file.write_text("999999999")
+        assert self.d.is_running() is False
+
+    # ── write_pid / remove_pid ──
+
+    def test_write_pid(self):
+        self.d.write_pid()
+        assert self.pid_file.exists()
+        assert int(self.pid_file.read_text().strip()) == os.getpid()
+
+    def test_remove_pid(self):
+        self.d.write_pid()
+        self.d.remove_pid()
+        assert not self.pid_file.exists()
+
+    def test_remove_pid_no_file(self):
+        """remove_pid is safe to call when no PID file exists."""
+        self.d.remove_pid()  # should not raise
+
+    # ── stop ──
+
+    def test_stop_no_daemon(self):
+        """Stop returns False when no daemon is running."""
+        assert self.d.stop() is False
+
+    @patch("os.kill")
+    def test_stop_sends_sigterm(self, mock_kill):
+        """Stop sends SIGTERM to the daemon PID."""
+        self.pid_file.write_text("12345")
+        # First os.kill(pid, 0) in get_pid — process alive
+        # Then os.kill(pid, SIGTERM) — send signal
+        # Then os.kill(pid, 0) in the wait loop — process gone
+        call_count = 0
+
+        def side_effect(pid, sig):
+            nonlocal call_count
+            call_count += 1
+            if sig == 0 and call_count == 1:
+                return  # alive for get_pid check
+            if sig == signal.SIGTERM:
+                return  # SIGTERM sent ok
+            if sig == 0:
+                raise ProcessLookupError  # dead after SIGTERM
+
+        mock_kill.side_effect = side_effect
+        result = self.d.stop()
+        assert result is True
+        assert not self.pid_file.exists()
+
+    # ── status (output verification) ──
+
+    def test_status_not_running(self, capsys):
+        """status prints 'not running' when no daemon active."""
+        self.d.status()
+        # No exception raised
+
+    def test_status_running(self):
+        """status works when daemon PID is alive."""
+        self.pid_file.write_text(str(os.getpid()))
+        self.d.status()  # should not raise
+
+    def test_status_with_log_file(self):
+        """status reports log size when log file exists."""
+        self.pid_file.write_text(str(os.getpid()))
+        self.log_file.write_text("sample log line\n" * 100)
+        self.d.status()  # should not raise
+
+    # ── show_logs ──
+
+    def test_show_logs_no_file(self):
+        """show_logs handles missing log file gracefully."""
+        self.d.show_logs()  # should not raise
+
+    @patch("subprocess.run")
+    def test_show_logs_reads_tail(self, mock_run):
+        """show_logs calls tail with correct args."""
+        self.log_file.write_text("line1\nline2\nline3\n")
+        mock_run.return_value = MagicMock(stdout="line1\nline2\nline3\n")
+        self.d.show_logs(follow=False, tail=20)
+        mock_run.assert_called_once()
+        cmd = mock_run.call_args[0][0]
+        assert "tail" in cmd
+        assert "-n" in cmd
+        assert "20" in cmd
+
+    @patch("subprocess.run")
+    def test_show_logs_follow(self, mock_run):
+        """show_logs uses tail -f in follow mode."""
+        self.log_file.write_text("log\n")
+        self.d.show_logs(follow=True, tail=10)
+        cmd = mock_run.call_args[0][0]
+        assert "-f" in cmd
+
+    # ── start_background ──
+
+    @patch("subprocess.Popen")
+    def test_start_background_strips_b_flag(self, mock_popen):
+        """start_background removes -b from argv."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 99999
+        mock_popen.return_value = mock_proc
+
+        self.d.start_background(["qvl_machine", "run", "-b", "-p", "29800"])
+
+        cmd = mock_popen.call_args[0][0]
+        assert "-b" not in cmd
+        assert "--background" not in cmd
+        assert "-p" in cmd
+        assert "29800" in cmd
+
+    @patch("subprocess.Popen")
+    def test_start_background_writes_pid(self, mock_popen):
+        """start_background writes child PID to file."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 42000
+        mock_popen.return_value = mock_proc
+
+        self.d.start_background(["qvl_machine", "run", "-b"])
+        assert self.pid_file.exists()
+        assert int(self.pid_file.read_text().strip()) == 42000
+
+    @patch("subprocess.Popen")
+    def test_start_background_sets_env(self, mock_popen):
+        """start_background passes _QVL_MACHINE_DAEMON env var."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 11111
+        mock_popen.return_value = mock_proc
+
+        self.d.start_background(["qvl_machine", "run", "-b"])
+        env = mock_popen.call_args[1]["env"]
+        assert env["_QVL_MACHINE_DAEMON"] == "1"
+
+    @patch("subprocess.Popen")
+    def test_start_background_detached(self, mock_popen):
+        """start_background uses start_new_session=True for detach."""
+        mock_proc = MagicMock()
+        mock_proc.pid = 22222
+        mock_popen.return_value = mock_proc
+
+        self.d.start_background(["qvl_machine", "run", "--background"])
+        assert mock_popen.call_args[1]["start_new_session"] is True

@@ -64,14 +64,18 @@ Quant levels (case-insensitive): `4bit` (default)
 
 ### qvl_machine
 
-Start the load-balanced proxy server that distributes requests across vLLM instances. Supports model/quant-aware routing for multi-model deployments.
+Start the load-balanced proxy server that distributes requests across vLLM instances. Supports model/quant-aware routing for multi-model deployments, and can run as a background daemon.
 
 ```bash
-# Start with auto-discovery of vLLM containers
+# Start with auto-discovery of vLLM containers (foreground)
 qvl_machine run
 
 # Start on specific port (default: 29800)
 qvl_machine run -p 29800
+
+# Start as background daemon (logs to file)
+qvl_machine run -b
+qvl_machine run -b -e "http://localhost:29880,http://localhost:29881"
 
 # Filter containers by name pattern
 qvl_machine run -n "qvl--qwen"
@@ -88,6 +92,39 @@ qvl_machine discover
 # Health check
 qvl_machine health
 ```
+
+#### Daemon Management
+
+When running with `-b` (`--background`), `qvl_machine` forks into a daemon
+process with logs redirected to `~/.cache/tfmx/qvl_machine.log`.
+
+```bash
+# Start as background daemon
+qvl_machine run -b
+
+# Check daemon status (PID, log file size)
+qvl_machine status
+
+# View recent logs (last 50 lines)
+qvl_machine logs
+
+# Follow logs in real-time (like tail -f)
+qvl_machine logs -f
+
+# View last 200 lines
+qvl_machine logs --tail 200
+
+# Stop the background daemon (SIGTERM → wait 10s → SIGKILL)
+qvl_machine stop
+
+# Restart the daemon (stop + run -b)
+qvl_machine restart
+qvl_machine restart -e "http://localhost:29880"  # restart with new endpoints
+```
+
+Daemon files:
+- **PID file**: `~/.cache/tfmx/qvl_machine.pid`
+- **Log file**: `~/.cache/tfmx/qvl_machine.log`
 
 #### Model-Aware Routing
 
@@ -405,10 +442,11 @@ qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 # 2. Wait for containers to be healthy (~60-120s)
 qvl_compose logs -f   # Watch for "Uvicorn running on ..."
 
-# 3. Start load-balanced proxy
-qvl_machine run
+# 3. Start load-balanced proxy (background daemon)
+qvl_machine run -b
 
 # 4. Verify everything works
+qvl_machine status
 qvl_client health
 qvl_client chat "Hello, what can you do?"
 
@@ -427,11 +465,11 @@ On each machine:
 ```bash
 # Machine 1 (host1)
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
-qvl_machine run
+qvl_machine run -b
 
 # Machine 2 (host2)
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
-qvl_machine run
+qvl_machine run -b
 ```
 
 From any machine:

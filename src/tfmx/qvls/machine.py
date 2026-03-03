@@ -7,9 +7,13 @@ across multiple vLLM Docker instances running on different GPUs.
 # ANCHOR[id=qvl-machine-clis]
 CLI_EPILOG = """
 Examples:
-  # Start machine server (auto-discover vLLM containers)
+  # Start machine server (foreground, auto-discover vLLM containers)
   qvl_machine run                   # Start on default port 29800
   qvl_machine run -p 29800          # Start on specific port
+
+  # Start as background daemon
+  qvl_machine run -b                # Run in background (logs to file)
+  qvl_machine run -b -e "http://localhost:29880,http://localhost:29881"
 
   # Filter containers by name pattern
   qvl_machine run -n "qvl--qwen"    # Only match containers with this pattern
@@ -19,6 +23,15 @@ Examples:
 
   # Performance tracking
   qvl_machine run --perf-track      # Enable detailed performance tracking
+
+  # Service management (for background daemon)
+  qvl_machine stop                  # Stop the background service
+  qvl_machine restart               # Restart (stop + run -b)
+  qvl_machine restart -e "..."      # Restart with new endpoints
+  qvl_machine status                # Check if service is running
+  qvl_machine logs                  # View recent logs (last 50 lines)
+  qvl_machine logs -f               # Follow logs in real-time
+  qvl_machine logs --tail 200       # View last 200 lines
 
   # Check discovered instances without starting server
   qvl_machine discover              # List all discovered vLLM instances
@@ -30,8 +43,11 @@ Examples:
 import argparse
 import asyncio
 import base64
+import os
 import re
+import signal
 import subprocess
+import sys
 import time
 
 import httpx
@@ -41,6 +57,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from pathlib import Path
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
 from typing import Annotated, Literal, Optional, Union
@@ -934,6 +951,178 @@ class QVLMachineServer:
         await server.serve()
 
 
+# ── Daemon Management ────────────────────────────────────────────────
+
+# Default paths for PID and log files
+_CACHE_DIR = Path.home() / ".cache" / "tfmx"
+_PID_FILE = _CACHE_DIR / "qvl_machine.pid"
+_LOG_FILE = _CACHE_DIR / "qvl_machine.log"
+
+
+class QVLMachineDaemon:
+    """Manages the qvl_machine process lifecycle (start, stop, status, logs).
+
+    In background mode (``-b``), the server forks into a daemon process with
+    stdout/stderr redirected to a log file. A PID file tracks the process.
+
+    File locations:
+        - PID: ``~/.cache/tfmx/qvl_machine.pid``
+        - Log: ``~/.cache/tfmx/qvl_machine.log``
+    """
+
+    def __init__(
+        self,
+        pid_file: Path = _PID_FILE,
+        log_file: Path = _LOG_FILE,
+    ):
+        self.pid_file = pid_file
+        self.log_file = log_file
+        self._ensure_cache_dir()
+
+    def _ensure_cache_dir(self) -> None:
+        self.pid_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def get_pid(self) -> Optional[int]:
+        """Read PID from file. Returns None if not found or stale."""
+        if not self.pid_file.exists():
+            return None
+        try:
+            pid = int(self.pid_file.read_text().strip())
+            # Verify process is actually alive
+            os.kill(pid, 0)
+            return pid
+        except (ValueError, ProcessLookupError, PermissionError):
+            # PID file is stale - clean it up
+            self.pid_file.unlink(missing_ok=True)
+            return None
+
+    def is_running(self) -> bool:
+        """Check if the daemon process is alive."""
+        return self.get_pid() is not None
+
+    def write_pid(self) -> None:
+        """Write current process PID to file."""
+        self.pid_file.write_text(str(os.getpid()))
+
+    def remove_pid(self) -> None:
+        """Remove PID file."""
+        self.pid_file.unlink(missing_ok=True)
+
+    def start_background(self, argv: list[str]) -> None:
+        """Fork the current command into a background daemon process.
+
+        Rebuilds the command line from sys.argv with ``-b`` removed,
+        then launches it as a detached subprocess with output to log file.
+        """
+        # Build command: same as current invocation but without -b/--background
+        cmd = [sys.executable, "-m", "tfmx.qvls.machine"]
+        for arg in argv[1:]:
+            if arg in ("-b", "--background"):
+                continue
+            cmd.append(arg)
+
+        self._ensure_cache_dir()
+        log_fh = open(self.log_file, "a")
+
+        proc = subprocess.Popen(
+            cmd,
+            stdout=log_fh,
+            stderr=subprocess.STDOUT,
+            start_new_session=True,  # detach from terminal
+            env={**os.environ, "_QVL_MACHINE_DAEMON": "1"},
+        )
+
+        # Write PID of the child
+        self.pid_file.write_text(str(proc.pid))
+
+        logger.okay(f"[qvl_machine] Started in background (PID {proc.pid})")
+        logger.mesg(f"  Log: {self.log_file}")
+        logger.mesg(f"  PID: {self.pid_file}")
+
+    def stop(self) -> bool:
+        """Stop the background daemon. Returns True if a process was stopped."""
+        pid = self.get_pid()
+        if pid is None:
+            logger.mesg("[qvl_machine] No running daemon found")
+            return False
+
+        logger.mesg(f"[qvl_machine] Stopping daemon (PID {pid})...")
+        try:
+            os.kill(pid, signal.SIGTERM)
+            # Wait for process to exit (up to 10s)
+            for _ in range(100):
+                try:
+                    os.kill(pid, 0)
+                    time.sleep(0.1)
+                except ProcessLookupError:
+                    break
+            else:
+                # Force kill if still alive after 10s
+                logger.warn(f"[qvl_machine] Force killing PID {pid}")
+                os.kill(pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        except PermissionError:
+            logger.warn(f"x Permission denied killing PID {pid}")
+            return False
+
+        self.remove_pid()
+        logger.okay("[qvl_machine] Daemon stopped")
+        return True
+
+    def status(self) -> None:
+        """Print daemon status information."""
+        pid = self.get_pid()
+        if pid is None:
+            logger.mesg("[qvl_machine] Status: not running")
+            return
+
+        logger.okay(f"[qvl_machine] Status: running (PID {pid})")
+        logger.mesg(f"  PID file: {self.pid_file}")
+        logger.mesg(f"  Log file: {self.log_file}")
+
+        if self.log_file.exists():
+            size = self.log_file.stat().st_size
+            if size < 1024:
+                logger.mesg(f"  Log size: {size} B")
+            elif size < 1024 * 1024:
+                logger.mesg(f"  Log size: {size / 1024:.1f} KB")
+            else:
+                logger.mesg(f"  Log size: {size / 1024 / 1024:.1f} MB")
+
+    def show_logs(self, follow: bool = False, tail: int = 50) -> None:
+        """Show daemon log output.
+
+        Args:
+            follow: If True, use ``tail -f`` to follow logs in real-time.
+            tail: Number of lines to show from the end of the log file.
+        """
+        if not self.log_file.exists():
+            logger.mesg("[qvl_machine] No log file found")
+            return
+
+        if follow:
+            try:
+                subprocess.run(
+                    ["tail", "-f", "-n", str(tail), str(self.log_file)],
+                )
+            except KeyboardInterrupt:
+                pass
+        else:
+            try:
+                result = subprocess.run(
+                    ["tail", "-n", str(tail), str(self.log_file)],
+                    capture_output=True,
+                    text=True,
+                )
+                if result.stdout:
+                    print(result.stdout, end="")
+                else:
+                    logger.mesg("[qvl_machine] Log file is empty")
+            except Exception as e:
+                logger.warn(f"x Failed to read logs: {e}")
+
+
 class QVLMachineArgParser:
     """Argument parser for QVL Machine CLI."""
 
@@ -947,6 +1136,18 @@ class QVLMachineArgParser:
         self.args = self.parser.parse_args()
 
     def _setup_arguments(self):
+        self.parser.add_argument(
+            "action",
+            nargs="?",
+            choices=["run", "discover", "health", "stop", "restart", "status", "logs"],
+            default=None,
+            help=(
+                "Action: run (start server), stop (stop daemon), "
+                "restart (restart daemon), status (check daemon), "
+                "logs (view logs), discover (list instances), "
+                "health (check health)"
+            ),
+        )
         self.parser.add_argument(
             "-p",
             "--port",
@@ -981,11 +1182,22 @@ class QVLMachineArgParser:
             help="Enable detailed performance tracking",
         )
         self.parser.add_argument(
-            "action",
-            nargs="?",
-            choices=["run", "discover", "health"],
-            default=None,
-            help="Action: run (start server), discover (list instances), health (check health)",
+            "-b",
+            "--background",
+            action="store_true",
+            help="Run as background daemon (logs to file instead of terminal)",
+        )
+        self.parser.add_argument(
+            "-f",
+            "--follow",
+            action="store_true",
+            help="Follow logs in real-time (for 'logs' action)",
+        )
+        self.parser.add_argument(
+            "--tail",
+            type=int,
+            default=50,
+            help="Number of log lines to show (default: 50)",
         )
 
 
@@ -1058,13 +1270,54 @@ async def check_health(instances: list[VLLMInstance]) -> None:
 
 
 def main():
-    """Main entry point."""
+    """Main entry point for qvl_machine CLI.
+
+    Supports foreground and background (daemon) modes:
+    - ``qvl_machine run``       — foreground server
+    - ``qvl_machine run -b``    — background daemon
+    - ``qvl_machine stop``      — stop daemon
+    - ``qvl_machine restart``   — restart daemon
+    - ``qvl_machine status``    — check if daemon is running
+    - ``qvl_machine logs [-f]`` — view daemon logs
+    """
     arg_parser = QVLMachineArgParser()
     args = arg_parser.args
 
     if args.action is None:
         arg_parser.parser.print_help()
         return
+
+    daemon = QVLMachineDaemon()
+
+    # ── Service management actions (no instance discovery needed) ──
+
+    if args.action == "stop":
+        daemon.stop()
+        return
+
+    if args.action == "status":
+        daemon.status()
+        return
+
+    if args.action == "logs":
+        daemon.show_logs(
+            follow=getattr(args, "follow", False),
+            tail=getattr(args, "tail", 50),
+        )
+        return
+
+    if args.action == "restart":
+        daemon.stop()
+        # Re-run in background mode
+        argv = sys.argv[:]
+        # Replace 'restart' with 'run' and ensure -b is present
+        argv = [a if a != "restart" else "run" for a in argv]
+        if "-b" not in argv and "--background" not in argv:
+            argv.append("-b")
+        daemon.start_background(argv)
+        return
+
+    # ── Actions requiring instance discovery ──
 
     instances = discover_instances(args)
 
@@ -1079,9 +1332,25 @@ def main():
     if args.action == "run":
         if not instances:
             logger.warn(
-                "× No vLLM instances found. " "Use -e to specify endpoints manually."
+                "× No vLLM instances found. Use -e to specify endpoints manually."
             )
             return
+
+        # Background mode: fork and exit
+        if getattr(args, "background", False):
+            if daemon.is_running():
+                logger.warn(
+                    f"[qvl_machine] Daemon already running "
+                    f"(PID {daemon.get_pid()}). Use 'restart' to replace it."
+                )
+                return
+            daemon.start_background(sys.argv)
+            return
+
+        # Foreground mode: write PID for status checks, run directly
+        is_daemon = os.environ.get("_QVL_MACHINE_DAEMON") == "1"
+        if is_daemon:
+            daemon.write_pid()
 
         server = QVLMachineServer(
             instances=instances,
@@ -1089,7 +1358,12 @@ def main():
             timeout=args.timeout,
             enable_perf_tracking=args.perf_track,
         )
-        server.run()
+
+        try:
+            server.run()
+        finally:
+            if is_daemon:
+                daemon.remove_pid()
 
 
 if __name__ == "__main__":

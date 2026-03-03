@@ -127,6 +127,14 @@ Vision benchmark (6x RTX 3080 20GB, uniform 4B-Thinking:4bit, 512px images, 256 
 - 100% success rate, avg latency 317ms/request
 - 24,503 generated tokens across 100 requests
 
+### Daemon Won't Start / Already Running
+
+- `qvl_machine status` — check if a daemon is already running
+- If the PID file is stale (process died), `qvl_machine run -b` will detect it and start fresh
+- If a daemon is already running, use `qvl_machine restart` to replace it
+- Check logs: `qvl_machine logs` or `cat ~/.cache/tfmx/qvl_machine.log`
+- Force cleanup: `rm ~/.cache/tfmx/qvl_machine.pid` then `qvl_machine run -b`
+
 ### Container Won't Start
 
 1. Check GPU availability: `nvidia-smi`
@@ -227,7 +235,7 @@ qvls/
 ├── clients_cli.py      # CLI infrastructure
 ├── clients_stats.py    # Verbose client with stats logging
 ├── router.py           # Model/quant-aware request routing
-├── machine.py          # FastAPI load-balanced proxy (with routing & form UI)
+├── machine.py          # FastAPI load-balanced proxy (with routing, form UI & daemon mode)
 ├── scheduler.py        # Re-exports generic scheduler from teis
 ├── perf_tracker.py     # Re-exports generic perf tracker from teis
 ├── performance.py      # QVL-specific performance config
