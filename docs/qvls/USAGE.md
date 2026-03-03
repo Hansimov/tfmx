@@ -42,13 +42,17 @@ qvl_compose up --mount-mode manual
 qvl_compose ps          # Container status
 qvl_compose logs        # View logs
 qvl_compose logs -f     # Follow logs
-qvl_compose stop        # Stop containers (keep them)
+qvl_compose stop        # Stop ALL running QVL containers
 qvl_compose start       # Start stopped containers
 qvl_compose restart     # Restart containers
-qvl_compose down        # Stop and remove containers
+qvl_compose down        # Stop and remove ALL QVL containers
 qvl_compose generate    # Generate compose YAML without starting
 qvl_compose health      # Check GPU health
 ```
+
+> **Note**: `stop`, `down`, `restart`, `start`, `logs`, and `ps` auto-detect
+> existing compose files and running containers. No `-j` flag needed — they will
+> find and operate on all QVL containers automatically.
 
 #### GPU Config Format
 
@@ -275,7 +279,7 @@ clients.close()
 ```python
 from tfmx.qvls import QVLComposer, GpuModelConfig, parse_gpu_configs
 
-# Basic deployment (default: 8B-Instruct AWQ 4bit)
+# Basic deployment (default: 4B-Thinking AWQ 4bit)
 composer = QVLComposer()
 composer.up()
 

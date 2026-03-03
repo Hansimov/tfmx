@@ -29,6 +29,7 @@ Examples:
 
 import argparse
 import asyncio
+import base64
 import re
 import subprocess
 import time
@@ -39,10 +40,10 @@ import uvicorn
 
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
-from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
-from typing import Optional, Union
+from typing import Annotated, Literal, Optional, Union
 from webu import setup_swagger_ui
 
 from .compose import MAX_CONCURRENT_REQUESTS, MACHINE_PORT, SERVER_PORT
@@ -55,19 +56,131 @@ MAX_CONCURRENT = MAX_CONCURRENT_REQUESTS
 VLLM_CONTAINER_IMAGE_PATTERN = "vllm"
 
 
-class ChatCompletionRequest(BaseModel):
-    """Request model for chat completion endpoint."""
+# ANCHOR[id=qvl-machine-models]
 
-    model: str = Field(default="", description="Model name")
-    messages: list[dict] = Field(
+
+class TextContent(BaseModel):
+    """Text content part."""
+
+    type: Literal["text"] = "text"
+    text: str = Field(..., description="Text content")
+
+
+class ImageURL(BaseModel):
+    """Image URL reference."""
+
+    url: str = Field(
         ...,
-        description="Chat messages in OpenAI format",
-        examples=[[{"role": "user", "content": "Hello!"}]],
+        description="Image URL or base64 data URI (data:image/jpeg;base64,...)",
+    )
+    detail: str = Field(default="auto", description="Detail level: auto, low, high")
+
+
+class ImageContent(BaseModel):
+    """Image content part."""
+
+    type: Literal["image_url"] = "image_url"
+    image_url: ImageURL
+
+
+class VideoURL(BaseModel):
+    """Video URL reference."""
+
+    url: str = Field(..., description="Video URL or base64 data URI")
+
+
+class VideoContent(BaseModel):
+    """Video content part."""
+
+    type: Literal["video_url"] = "video_url"
+    video_url: VideoURL
+
+
+ContentPart = Union[TextContent, ImageContent, VideoContent]
+
+
+class ChatMessage(BaseModel):
+    """A chat message with role and content.
+
+    Content can be a simple string or a list of multimodal content parts.
+    """
+
+    role: Literal["system", "user", "assistant"] = Field(
+        ..., description="Message role"
+    )
+    content: Union[str, list[ContentPart]] = Field(
+        ...,
+        description=(
+            "Message content: plain text string, or a list of content parts "
+            "(text, image_url, video_url) for multimodal inputs"
+        ),
+        examples=[
+            "Hello, what can you do?",
+            [
+                {"type": "text", "text": "What is in this image?"},
+                {
+                    "type": "image_url",
+                    "image_url": {"url": "data:image/jpeg;base64,..."},
+                },
+            ],
+        ],
+    )
+
+
+class ChatCompletionRequest(BaseModel):
+    """OpenAI-compatible chat completion request with multimodal support.
+
+    Supports text, images (URL or base64), and video content.
+    """
+
+    model: str = Field(
+        default="",
+        description=(
+            "Model name or shortcut (e.g., '4b-thinking', '8b-instruct:4bit'). "
+            "Leave empty for default model."
+        ),
+    )
+    messages: list[ChatMessage] = Field(
+        ...,
+        description="Chat messages",
+        examples=[
+            [
+                {"role": "system", "content": "You are a helpful assistant."},
+                {"role": "user", "content": "Hello!"},
+            ]
+        ],
     )
     max_tokens: int = Field(default=512, description="Maximum tokens to generate")
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     stream: bool = Field(default=False, description="Enable streaming")
+
+
+class ChatChoiceDelta(BaseModel):
+    """A single completion choice."""
+
+    index: int = 0
+    message: dict = Field(default_factory=dict)
+    finish_reason: Optional[str] = None
+
+
+class UsageInfo(BaseModel):
+    """Token usage information."""
+
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+
+
+class ChatCompletionResponse(BaseModel):
+    """OpenAI-compatible chat completion response."""
+
+    id: str = Field(default="", description="Completion ID")
+    object: str = Field(default="chat.completion")
+    created: int = Field(default=0, description="Unix timestamp")
+    model: str = Field(default="", description="Model used")
+    choices: list[ChatChoiceDelta] = Field(default_factory=list)
+    usage: UsageInfo = Field(default_factory=UsageInfo)
 
 
 class HealthResponse(BaseModel):
@@ -427,7 +540,15 @@ class QVLMachineServer:
     def _create_app(self) -> FastAPI:
         app = FastAPI(
             title="QVL Machine",
-            description="Load-balanced proxy for Qwen3-VL vLLM instances",
+            description=(
+                "Load-balanced proxy for Qwen3-VL vLLM instances.\n\n"
+                "## Endpoints\n\n"
+                "- **POST /v1/chat/completions** — OpenAI-compatible chat API "
+                "(supports multimodal: text, images, video)\n"
+                "- **POST /chat** — Simplified form-based chat with file uploads\n"
+                "- **GET /health** — Health check\n"
+                "- **GET /info** — Instance info and stats\n"
+            ),
             version="1.0.0",
             lifespan=self._lifespan,
             docs_url=None,
@@ -450,9 +571,29 @@ class QVLMachineServer:
 
         app.post(
             "/v1/chat/completions",
-            summary="Chat completion",
-            description="Distribute chat completion to vLLM instances",
+            response_model=ChatCompletionResponse,
+            summary="Chat completion (OpenAI-compatible)",
+            description=(
+                "Forward chat completion request to a vLLM instance. "
+                "Supports multimodal messages with text, images (base64 or URL), "
+                "and video content.\n\n"
+                "**Model routing**: Use short names like `4b-thinking`, "
+                "`8b-instruct:4bit`, or leave empty for the default model."
+            ),
         )(self.chat_completions)
+
+        app.post(
+            "/chat",
+            response_model=ChatCompletionResponse,
+            summary="Chat (form-based, with file uploads)",
+            description=(
+                "Simplified chat endpoint for the Swagger UI. "
+                "Upload images/PDFs/videos as files and type your message — "
+                "no need to manually construct JSON message arrays.\n\n"
+                "Each uploaded file is automatically converted to the appropriate "
+                "multimodal content type based on its MIME type."
+            ),
+        )(self.chat_form)
 
         return app
 
@@ -563,28 +704,119 @@ class QVLMachineServer:
             available_models=self.router.get_available_models(),
         )
 
-    async def chat_completions(self, request: Request) -> Response:
+    async def chat_completions(
+        self, request: ChatCompletionRequest
+    ) -> ChatCompletionResponse:
         """Forward chat completion request to an idle vLLM instance.
 
         Routes based on model/quant in request body if specified.
         Uses least-loaded instance for unspecified requests.
         """
+        body = orjson.dumps(request.model_dump(exclude_none=True))
+        return await self._forward_chat(body, request.model)
+
+    async def chat_form(
+        self,
+        text: Annotated[
+            str,
+            Form(description="Your message text"),
+        ],
+        files: Annotated[
+            list[UploadFile],
+            File(description="Upload images, PDFs, or videos"),
+        ] = [],
+        system_prompt: Annotated[
+            str,
+            Form(description="Optional system prompt"),
+        ] = "",
+        model: Annotated[
+            str,
+            Form(
+                description=(
+                    "Model shortcut (e.g., '4b-thinking', '8b-instruct:4bit'). "
+                    "Leave empty for default."
+                )
+            ),
+        ] = "",
+        max_tokens: Annotated[
+            int, Form(description="Maximum tokens to generate")
+        ] = 512,
+        temperature: Annotated[
+            float, Form(description="Sampling temperature (0.0-2.0)")
+        ] = 0.7,
+    ) -> ChatCompletionResponse:
+        """Chat with file uploads — no JSON needed.
+
+        Upload images/PDFs/videos and type your message.
+        Files are auto-converted to multimodal content parts.
+        """
+        # Build content parts from text + uploaded files
+        content_parts: list[dict] = []
+
+        for file in files:
+            file_data = await file.read()
+            b64 = base64.b64encode(file_data).decode("utf-8")
+            mime = file.content_type or "application/octet-stream"
+
+            if mime.startswith("image/"):
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
+            elif mime.startswith("video/"):
+                content_parts.append(
+                    {
+                        "type": "video_url",
+                        "video_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
+            else:
+                # PDF and other files: send as image (vLLM can handle some)
+                content_parts.append(
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{b64}"},
+                    }
+                )
+
+        content_parts.append({"type": "text", "text": text})
+
+        # Build messages
+        messages = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+
+        # Use content_parts list if multimodal, plain string if text-only
+        if files:
+            messages.append({"role": "user", "content": content_parts})
+        else:
+            messages.append({"role": "user", "content": text})
+
+        req_data = {
+            "model": model,
+            "messages": messages,
+            "max_tokens": max_tokens,
+            "temperature": temperature,
+        }
+        body = orjson.dumps(req_data)
+        return await self._forward_chat(body, model)
+
+    async def _forward_chat(
+        self, body: bytes, model_field: str = ""
+    ) -> ChatCompletionResponse:
+        """Forward a chat request body to a vLLM instance and return typed response."""
         t0 = time.perf_counter()
         self.stats.total_requests += 1
         self.stats.active_requests += 1
 
         try:
-            # Parse model/quant from request body for routing
-            body = await request.body()
+            # Parse model/quant for routing
             req_model = ""
             req_quant = ""
-            try:
-                req_data = orjson.loads(body)
-                model_field = req_data.get("model", "")
-                if model_field:
-                    req_model, req_quant = parse_model_spec(model_field)
-            except Exception:
-                pass
+            if model_field:
+                req_model, req_quant = parse_model_spec(model_field)
 
             # Get an idle instance (with optional model/quant filter)
             instance = self._get_idle_instance(model=req_model, quant=req_quant)
@@ -634,10 +866,11 @@ class QVLMachineServer:
                 )
 
                 # Track tokens from response
+                resp_data = None
                 if resp.status_code == 200:
                     try:
-                        data = orjson.loads(resp.content)
-                        usage = data.get("usage", {})
+                        resp_data = orjson.loads(resp.content)
+                        usage = resp_data.get("usage", {})
                         self.stats.total_tokens += usage.get("total_tokens", 0)
                     except Exception:
                         pass
@@ -649,11 +882,25 @@ class QVLMachineServer:
                         f"status={resp.status_code} latency={latency:.2f}s"
                     )
 
-                return Response(
-                    content=resp.content,
-                    status_code=resp.status_code,
-                    headers=dict(resp.headers),
-                    media_type="application/json",
+                if resp.status_code != 200:
+                    raise HTTPException(
+                        status_code=resp.status_code,
+                        detail=resp.text,
+                    )
+
+                # Parse vLLM response into typed model
+                if resp_data is None:
+                    resp_data = orjson.loads(resp.content)
+
+                return ChatCompletionResponse(
+                    id=resp_data.get("id", ""),
+                    object=resp_data.get("object", "chat.completion"),
+                    created=resp_data.get("created", 0),
+                    model=resp_data.get("model", ""),
+                    choices=[
+                        ChatChoiceDelta(**c) for c in resp_data.get("choices", [])
+                    ],
+                    usage=UsageInfo(**resp_data.get("usage", {})),
                 )
 
             finally:

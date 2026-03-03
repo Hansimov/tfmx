@@ -80,7 +80,7 @@ from tclogger import logger
 
 SERVER_PORT = 29880
 MACHINE_PORT = 29800
-MODEL_NAME = "Qwen/Qwen3-VL-8B-Instruct"
+MODEL_NAME = "Qwen/Qwen3-VL-4B-Thinking"
 HF_ENDPOINT = "https://hf-mirror.com"
 CACHE_HF = ".cache/huggingface"
 CACHE_HF_HUB = f"{CACHE_HF}/hub"
@@ -99,7 +99,16 @@ MAX_CONCURRENT_REQUESTS = 8
 MAX_MODEL_LEN = 8096
 MAX_NUM_SEQS = 5
 LIMIT_MM_PER_PROMPT = '{"image": 5}'
-GPU_MEMORY_UTILIZATION = 0.85
+GPU_MEMORY_UTILIZATION = 0.40
+
+# Per-model-size GPU memory utilization limits (fraction of total VRAM)
+# Designed for RTX 3080 20GB with TEI colocated (~1.4GB each)
+# 2B: ≤6GB → 0.30, 4B: ≤10GB → 0.50, 8B: ≤14GB → 0.70
+GPU_MEMORY_UTILIZATION_BY_SIZE = {
+    "2B": 0.30,
+    "4B": 0.50,
+    "8B": 0.70,
+}
 
 # Device mount mode
 DEVICE_MOUNT_MODE = "manual"
@@ -324,6 +333,32 @@ class GpuModelConfig:
     def display_shortcut(self) -> str:
         """Get display-friendly shortcut (original casing)."""
         return get_display_shortcut(self.model_shortcut)
+
+    @property
+    def model_size(self) -> str:
+        """Get model size (e.g., '2B', '4B', '8B') from model name."""
+        info = SUPPORTED_MODELS.get(self.model_name)
+        if info:
+            return info["size"]
+        # Try AWQ lookup
+        base = AWQ_MODELS.get(self.model_name)
+        if base:
+            info = SUPPORTED_MODELS.get(base)
+            if info:
+                return info["size"]
+        # Fallback: extract from shortcut (e.g., '8b-instruct' → '8B')
+        sc = self.model_shortcut
+        for prefix in ("2b", "4b", "8b"):
+            if sc.startswith(prefix):
+                return prefix.upper()
+        return "8B"  # conservative default
+
+    @property
+    def gpu_memory_utilization(self) -> float:
+        """Get GPU memory utilization for this model size."""
+        return GPU_MEMORY_UTILIZATION_BY_SIZE.get(
+            self.model_size, GPU_MEMORY_UTILIZATION
+        )
 
     @property
     def awq_repo(self) -> str | None:
@@ -896,7 +931,7 @@ class ComposeFileGenerator:
                 f"      - --limit-mm-per-prompt",
                 f"      - '{self.limit_mm_per_prompt}'",
                 f"      - --gpu-memory-utilization",
-                f'      - "{self.gpu_memory_utilization}"',
+                f'      - "{gpu_config.gpu_memory_utilization}"',
                 f"      - --dtype",
                 f"      - half",
                 f"      - --trust-remote-code",
@@ -1013,6 +1048,65 @@ class QVLComposer:
         self.model_config_manager = ModelConfigManager()
         self.image_manager = DockerImageManager()
 
+    def _find_compose_file(self) -> Path | None:
+        """Find an existing QVL compose file.
+
+        Tries in order:
+        1. The configured compose file path
+        2. qvl-multi.yml (common multi-GPU deploy)
+        3. Any qvl*.yml file in the configs directory
+        """
+        if self.compose_file.exists():
+            return self.compose_file
+
+        multi = self.compose_dir / "qvl-multi.yml"
+        if multi.exists():
+            return multi
+
+        # Search for any qvl compose file
+        candidates = sorted(self.compose_dir.glob("qvl*.yml"))
+        if candidates:
+            return candidates[0]
+
+        return None
+
+    @staticmethod
+    def _find_qvl_containers(include_stopped: bool = False) -> list[str]:
+        """Find all QVL-related Docker containers.
+
+        Matches containers whose names start with 'qvl-' or 'qvl--'.
+        """
+        flag = "-a" if include_stopped else ""
+        result = subprocess.run(
+            f'docker ps {flag} --filter "name=qvl" ' f'--format "{{{{.Names}}}}"',
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+        names = [
+            n.strip()
+            for n in result.stdout.strip().split("\n")
+            if n.strip() and re.match(r"qvl[-_]", n.strip())
+        ]
+        return sorted(names)
+
+    def _resolve_compose_cmd(self, cmd: str, require_file: bool = True) -> bool:
+        """Try to run a compose command, auto-discovering the compose file.
+
+        Returns True if the command was executed, False otherwise.
+        """
+        compose_file = self._find_compose_file()
+        if compose_file:
+            if compose_file != self.compose_file:
+                logger.mesg(f"[qvl] Using compose file: {compose_file}")
+            full_cmd = f"docker compose -f {compose_file} {cmd}"
+            logger.mesg(f"[qvl] Running: {full_cmd}")
+            subprocess.run(full_cmd, shell=True)
+            return True
+        return False
+
     def _get_service_name(self, gpu: GPUInfo) -> str:
         return f"qvl-gpu{gpu.index}"
 
@@ -1115,67 +1209,100 @@ class QVLComposer:
 
     def down(self) -> None:
         """Stop and remove all QVL containers."""
-        if self.compose_file.exists():
-            logger.mesg(f"[qvl] Using compose file: {self.compose_file}")
-            self._run_compose_cmd("down --remove-orphans")
+        if self._resolve_compose_cmd("down --remove-orphans"):
             return
 
-        # Fallback: find and remove containers by name pattern
-        pattern = f"{self.project_name}--gpu"
-        result = subprocess.run(
-            f'docker ps -a --filter "name={pattern}" --format "{{{{.Names}}}}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-
-        if result.returncode != 0:
-            logger.warn(f"× Failed to query containers")
-            return
-
-        container_names = [
-            name.strip() for name in result.stdout.strip().split("\n") if name.strip()
-        ]
-
+        # Fallback: find and remove all QVL containers directly
+        container_names = self._find_qvl_containers(include_stopped=True)
         if not container_names:
-            logger.mesg(f"[qvl] No containers found matching pattern: {pattern}*")
+            logger.mesg("[qvl] No QVL containers found")
             return
 
+        logger.mesg(
+            f"[qvl] Removing {len(container_names)} container(s): {', '.join(container_names)}"
+        )
         for name in container_names:
             subprocess.run(f"docker rm -f {name}", shell=True, capture_output=True)
-
         logger.okay(f"[qvl] Removed {len(container_names)} container(s)")
 
     def stop(self) -> None:
-        if not self.compose_file.exists():
-            logger.warn(f"× Compose file not found: {self.compose_file}")
+        """Stop all QVL containers."""
+        if self._resolve_compose_cmd("stop"):
             return
-        self._run_compose_cmd("stop")
+
+        # Fallback: stop all running QVL containers directly
+        container_names = self._find_qvl_containers(include_stopped=False)
+        if not container_names:
+            logger.mesg("[qvl] No running QVL containers found")
+            return
+
+        logger.mesg(
+            f"[qvl] Stopping {len(container_names)} container(s): {', '.join(container_names)}"
+        )
+        for name in container_names:
+            subprocess.run(f"docker stop {name}", shell=True, capture_output=True)
+        logger.okay(f"[qvl] Stopped {len(container_names)} container(s)")
 
     def start(self) -> None:
-        if not self.compose_file.exists():
-            logger.warn(f"× Compose file not found: {self.compose_file}")
+        """Start stopped QVL containers."""
+        if self._resolve_compose_cmd("start"):
             return
-        self._run_compose_cmd("start")
+
+        # Fallback: start all stopped QVL containers
+        container_names = self._find_qvl_containers(include_stopped=True)
+        running = set(self._find_qvl_containers(include_stopped=False))
+        stopped = [n for n in container_names if n not in running]
+        if not stopped:
+            logger.mesg("[qvl] No stopped QVL containers found")
+            return
+
+        logger.mesg(f"[qvl] Starting {len(stopped)} container(s): {', '.join(stopped)}")
+        for name in stopped:
+            subprocess.run(f"docker start {name}", shell=True, capture_output=True)
+        logger.okay(f"[qvl] Started {len(stopped)} container(s)")
 
     def restart(self) -> None:
-        if not self.compose_file.exists():
-            logger.warn(f"× Compose file not found: {self.compose_file}")
+        """Restart all QVL containers."""
+        if self._resolve_compose_cmd("restart"):
             return
-        self._run_compose_cmd("restart")
+
+        # Fallback: restart all QVL containers directly
+        container_names = self._find_qvl_containers(include_stopped=False)
+        if not container_names:
+            logger.mesg("[qvl] No running QVL containers found")
+            return
+
+        logger.mesg(
+            f"[qvl] Restarting {len(container_names)} container(s): {', '.join(container_names)}"
+        )
+        for name in container_names:
+            subprocess.run(f"docker restart {name}", shell=True, capture_output=True)
+        logger.okay(f"[qvl] Restarted {len(container_names)} container(s)")
 
     def ps(self) -> None:
-        if not self.compose_file.exists():
-            self._show_manual_status()
+        if self._resolve_compose_cmd("ps"):
             return
-        self._run_compose_cmd("ps")
+        self._show_manual_status()
 
     def logs(self, follow: bool = False, tail: int = 100) -> None:
-        if not self.compose_file.exists():
-            logger.warn(f"× Compose file not found: {self.compose_file}")
-            return
         follow_flag = "-f" if follow else ""
-        self._run_compose_cmd(f"logs --tail={tail} {follow_flag}".strip())
+        cmd = f"logs --tail={tail} {follow_flag}".strip()
+        if self._resolve_compose_cmd(cmd):
+            return
+
+        # Fallback: show logs for individual containers
+        container_names = self._find_qvl_containers(include_stopped=True)
+        if not container_names:
+            logger.mesg("[qvl] No QVL containers found")
+            return
+
+        for name in container_names:
+            logger.mesg(f"[qvl] Logs for {name}:")
+            follow_arg = "-f" if follow else ""
+            subprocess.run(
+                f"docker logs --tail={tail} {follow_arg} {name}".strip(),
+                shell=True,
+            )
 
     def _show_manual_status(self) -> None:
         """Show status by querying Docker directly."""

@@ -17,7 +17,7 @@ The `qvls` module deploys and manages **Qwen3-VL** vision-language models via **
 # Install the package
 pip install -e .
 
-# Verify installation
+# Verify installation (python-multipart is required for file uploads)
 qvl_compose --help
 qvl_machine --help
 qvl_client --help
@@ -82,7 +82,12 @@ done
 ### 3. Deploy with Docker Compose
 
 ```bash
-# Start on all available GPUs (default: 8B-Instruct AWQ 4bit)
+# Uniform deployment: 4B-Thinking on all 6 GPUs (recommended)
+qvl_compose up --gpu-configs \
+  "0:4b-thinking:4bit,1:4b-thinking:4bit,2:4b-thinking:4bit,3:4b-thinking:4bit,4:4b-thinking:4bit,5:4b-thinking:4bit" \
+  --mount-mode manual
+
+# Start on all available GPUs (default: 4B-Thinking AWQ 4bit)
 qvl_compose up
 
 # Start with specific model and quantization
@@ -95,7 +100,7 @@ qvl_compose up -g "0,1"
 # Note: model shortcuts and quant levels are case-insensitive
 qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:4b-instruct:4bit"
 
-# Full 6-GPU deployment with different models
+# Mixed 6-GPU deployment with different models
 qvl_compose up --gpu-configs \
   "0:2b-instruct:4bit,1:2b-thinking:4bit,2:4b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:4bit,5:8b-thinking:4bit"
 
@@ -138,6 +143,7 @@ qvl_clients generate --endpoints http://localhost:29800 --prompt "Describe what 
 |---------|------|-------------|
 | vLLM instances | 29880+ | One per GPU (29880, 29881, 29882...) |
 | Machine proxy | 29800 | Load-balanced proxy |
+| Swagger UI | 29800/docs | Interactive API docs with file upload support |
 
 ## Multi-Machine Deployment
 

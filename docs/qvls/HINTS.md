@@ -52,6 +52,20 @@ qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q bitsandbytes
 
 ## Performance Tips
 
+### GPU Memory Budget
+
+Each GPU has a per-model-size memory utilization setting to leave room for TEI
+embedding services colocated on the same GPU:
+
+| Model Size | Max VRAM (RTX 3080 20GB) | `gpu_memory_utilization` |
+|------------|--------------------------|-------------------------|
+| 2B         | ≤ 6 GB                   | 0.30                    |
+| 4B         | ≤ 8 GB                   | 0.40                    |
+| 8B         | ≤ 12 GB                  | 0.60                    |
+
+These are set automatically in `GPU_MEMORY_UTILIZATION_BY_SIZE` in `compose.py`.
+`GpuModelConfig.gpu_memory_utilization` resolves the correct value per model.
+
 ### vLLM Tuning Parameters
 
 - **max-model-len** (default: 8096): Reduce for less VRAM usage, increase for longer context
@@ -100,11 +114,18 @@ High-throughput benchmark (4 GPUs uniform, 100 requests via `qvl_benchmark`):
 - Average latency: 88ms per request (pipeline-batched)
 - 100% success rate (100/100)
 
-Memory usage (with TEI colocated, `--gpu-memory-utilization 0.85`):
-- 2B models: ~17.5 GB / 20 GB
-- 4B models: ~17.0 GB / 20 GB
-- 8B models: ~17.5 GB / 20 GB (AWQ 4bit fits on 20GB)
-- TEI baseline: ~1.4 GB per GPU
+Memory usage (with TEI colocated):
+
+| Model Size | `gpu_memory_utilization` | Actual Usage (RTX 3080 20GB) | TEI Overhead |
+|------------|--------------------------|------------------------------|-------------|
+| 2B:4bit    | 0.30                     | ~6 GB                        | ~1.4 GB     |
+| 4B:4bit    | 0.40                     | ~8 GB                        | ~1.4 GB     |
+| 8B:4bit    | 0.60                     | ~12 GB                       | ~1.4 GB     |
+
+Vision benchmark (6x RTX 3080 20GB, uniform 4B-Thinking:4bit, 512px images, 256 max tokens):
+- **774 tok/s** aggregate throughput, **3.2 req/s**
+- 100% success rate, avg latency 317ms/request
+- 24,503 generated tokens across 100 requests
 
 ### Container Won't Start
 
@@ -206,13 +227,27 @@ qvls/
 ├── clients_cli.py      # CLI infrastructure
 ├── clients_stats.py    # Verbose client with stats logging
 ├── router.py           # Model/quant-aware request routing
-├── machine.py          # FastAPI load-balanced proxy (with routing)
+├── machine.py          # FastAPI load-balanced proxy (with routing & form UI)
 ├── scheduler.py        # Re-exports generic scheduler from teis
 ├── perf_tracker.py     # Re-exports generic perf tracker from teis
 ├── performance.py      # QVL-specific performance config
 ├── benchmark.py        # Throughput benchmarking
 └── benchimgs.py        # Benchmark image generation (HF datasets + synthetic)
 ```
+
+### FastAPI Proxy Endpoints
+
+The machine proxy at port 29800 exposes:
+
+| Endpoint | Method | Description |
+|----------|--------|-------------|
+| `/v1/chat/completions` | POST | OpenAI-compatible multimodal chat (typed request/response) |
+| `/chat` | POST | Form-based chat with file uploads (Swagger UI friendly) |
+| `/health` | GET | Health check |
+| `/info` | GET | Instance info and stats |
+
+The `/chat` form endpoint lets you upload images/PDFs/videos and type text directly
+in the Swagger UI without manually constructing JSON message arrays.
 
 ### Key Differences from TEI Module
 

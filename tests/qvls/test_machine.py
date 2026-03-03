@@ -459,3 +459,4 @@ class TestQVLMachineServer:
         assert "/health" in route_paths
         assert "/info" in route_paths
         assert "/v1/chat/completions" in route_paths
+        assert "/chat" in route_paths
