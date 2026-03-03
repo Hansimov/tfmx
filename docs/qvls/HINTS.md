@@ -1,30 +1,41 @@
 # QVL Module - Hints & Tips
 
+## Case-Insensitive Naming Convention
+
+All model shortcuts and quant levels are **case-insensitive** internally. The convention is to use **lowercase** everywhere:
+
+- Model shortcuts: `2b-instruct`, `4b-thinking`, `8b-instruct`, etc.
+- Quant levels: `4bit`, `8bit`
+
+Inputs in any casing are accepted (`8B-Instruct`, `8b-instruct`, `8B-INSTRUCT` all resolve the same way). Display-facing labels use original casing (e.g., `8B-Instruct:4bit`) via `get_display_shortcut()`.
+
 ## Quantization Guide
 
 ### Choosing the Right Quantization
 
 | GPU | VRAM | Recommended Setup |
 |-----|------|-------------------|
-| RTX 3060 | 12GB | 8B-Q4 or 4B-FP16 |
-| RTX 3070 | 8GB | 4B-Q8 or 2B-FP16 |
-| RTX 3080 | 10-12GB | 8B-Q4 or 4B-FP16 |
-| RTX 3090 | 24GB | 8B-FP16 or 8B-Q8 |
-| RTX 4060 | 8GB | 4B-Q8 or 2B-FP16 |
-| RTX 4070 | 12GB | 8B-Q4 or 4B-FP16 |
-| RTX 4080 | 16GB | 8B-Q8 |
+| RTX 3060 | 12GB | 8B-AWQ-4bit or 4B-FP16 |
+| RTX 3070 | 8GB | 4B-AWQ-8bit or 2B-FP16 |
+| RTX 3080 | 10-12GB | 8B-AWQ-4bit or 4B-FP16 |
+| RTX 3090 | 24GB | 8B-FP16 or 8B-AWQ-8bit |
+| RTX 4060 | 8GB | 4B-AWQ-8bit or 2B-FP16 |
+| RTX 4070 | 12GB | 8B-AWQ-4bit or 4B-FP16 |
+| RTX 4080 | 16GB | 8B-AWQ-8bit |
 | RTX 4090 | 24GB | 8B-FP16 |
 
 ### Quantization Methods
 
-- **GGUF** (`-q gguf`): Best compression, slight quality loss. Uses unsloth GGUF models.
+- **AWQ** (`-q awq`): Best option for RTX 30/40 series. Uses pre-quantized AWQ models from `cyankiwi` on HuggingFace. Native vLLM support, fast inference, minimal quality loss.
 - **BitsAndBytes** (`-q bitsandbytes`): Good balance. Requires bitsandbytes in container.
-- **AWQ** (`-q awq`): Fast inference. Requires pre-quantized AWQ model.
 - **None** (default): Full FP16 precision. Requires most VRAM.
 
 ```bash
-# GGUF quantization (recommended for RTX 30 series)
-qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+# AWQ quantization (recommended for RTX 30 series)
+qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
+
+# Per-GPU AWQ bit depths
+qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:8b-instruct:8bit"
 
 # BitsAndBytes 4-bit
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q bitsandbytes
@@ -67,7 +78,8 @@ For Chinese users, HuggingFace mirror is configured by default:
 ### Out of Memory (OOM)
 
 - Use a smaller model (`-m "Qwen/Qwen3-VL-2B-Instruct"`)
-- Enable quantization (`-q gguf`)
+- Enable quantization (`-q awq`)
+- Use 4bit quant (`--gpu-configs "0:8b-instruct:4bit"`)
 - Reduce `max-model-len`
 - Reduce `max-num-seqs`
 
@@ -107,12 +119,12 @@ In a multi-GPU deployment, each GPU can run a different model variant. This enab
 
 Example 6-GPU deployment:
 ```
-GPU 0: 2B-Instruct (Q4_K_M) — Fast, low quality
-GPU 1: 4B-Instruct (Q4_K_M) — Balanced
-GPU 2: 8B-Instruct (Q4_K_M) — High quality
-GPU 3: 4B-Thinking (Q4_K_M) — Reasoning tasks
-GPU 4: 8B-Instruct (Q8_0)   — Highest quality
-GPU 5: 8B-Thinking (Q4_K_M) — Reasoning, high quality
+GPU 0: 2b-instruct (4bit) — Fast, low quality
+GPU 1: 4b-instruct (4bit) — Balanced
+GPU 2: 8b-instruct (4bit) — High quality
+GPU 3: 4b-thinking (4bit) — Reasoning tasks
+GPU 4: 8b-instruct (8bit) — Highest quality
+GPU 5: 8b-thinking (8bit) — Reasoning, high quality
 ```
 
 ### Model-Aware Routing
@@ -123,8 +135,8 @@ The machine proxy (`qvl_machine`) includes a router that:
 3. Falls back to any available instance if no match
 
 Request routing formats:
-- `model="8B-Instruct"` → any 8B-Instruct instance
-- `model="8B-Instruct:Q8_0"` → specific quant level
+- `model="8b-instruct"` → any 8B-Instruct instance
+- `model="8b-instruct:8bit"` → specific quant level
 - `model=""` → default/any idle instance
 
 ### Benchmark Images

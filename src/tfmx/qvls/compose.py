@@ -1,7 +1,7 @@
 """QVL (Qwen3-VL) Docker Compose Manager
 
 Manages Docker Compose deployments for Qwen3-VL vision-language models
-running on vLLM inference engine with GGUF quantization support.
+running on vLLM inference engine with AWQ quantization support.
 """
 
 # ANCHOR[id=clis]
@@ -25,9 +25,8 @@ Examples:
   qvl_compose up -m "$MODEL"
   qvl_compose up -m "Qwen/Qwen3-VL-4B-Instruct"
 
-  # With quantized GGUF model (recommended for RTX 30/40)
-  qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
-  qvl_compose up -m "Qwen/Qwen3-VL-4B-Instruct" -q bitsandbytes
+  # With AWQ quantization (recommended for RTX 30/40)
+  qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 
   # With specific GPUs
   qvl_compose up -g "0,1"           # Start on GPU 0 and 1
@@ -47,6 +46,9 @@ Examples:
   qvl_compose logs -f               # Follow logs in real-time
   qvl_compose logs --tail 200       # Show last 200 lines
 
+  # Per-GPU model/quant config (AWQ bit depths)
+  qvl_compose up --gpu-configs "0:2b-instruct:4bit,1:8b-instruct:8bit"
+
 Supported Models:
   - Qwen/Qwen3-VL-2B-Instruct      (2B parameters, instruction-tuned)
   - Qwen/Qwen3-VL-2B-Thinking      (2B parameters, thinking mode)
@@ -56,9 +58,8 @@ Supported Models:
   - Qwen/Qwen3-VL-8B-Thinking      (8B parameters, thinking mode)
 
 Quantization Options (for RTX 30/40 series):
-  - gguf:         GGUF format from unsloth (Q4_K_M, Q8_0)
+  - awq:          AWQ quantization from cyankiwi (4bit, 8bit)
   - bitsandbytes: BitsAndBytes 4-bit quantization
-  - awq:          AWQ quantization (if model available)
   - none:         No quantization (requires more VRAM)
 
 Device Mount Modes:
@@ -97,7 +98,8 @@ MAX_CONCURRENT_REQUESTS = 8
 # vLLM model parameters
 MAX_MODEL_LEN = 8096
 MAX_NUM_SEQS = 5
-LIMIT_MM_PER_PROMPT = "image=5"
+LIMIT_MM_PER_PROMPT = '{"image": 5}'
+GPU_MEMORY_UTILIZATION = 0.85
 
 # Device mount mode
 DEVICE_MOUNT_MODE = "manual"
@@ -136,63 +138,136 @@ SUPPORTED_MODELS = {
     },
 }
 
-# GGUF quantized variants from unsloth (maps to base model)
-GGUF_MODELS = {
-    "unsloth/Qwen3-VL-2B-Instruct-GGUF": "Qwen/Qwen3-VL-2B-Instruct",
-    "unsloth/Qwen3-VL-4B-Instruct-GGUF": "Qwen/Qwen3-VL-4B-Instruct",
-    "unsloth/Qwen3-VL-8B-Instruct-GGUF": "Qwen/Qwen3-VL-8B-Instruct",
-    "unsloth/Qwen3-VL-2B-Thinking-GGUF": "Qwen/Qwen3-VL-2B-Thinking",
-    "unsloth/Qwen3-VL-4B-Thinking-GGUF": "Qwen/Qwen3-VL-4B-Thinking",
-    "unsloth/Qwen3-VL-8B-Thinking-GGUF": "Qwen/Qwen3-VL-8B-Thinking",
+# AWQ quantized variants from cyankiwi
+# Format: cyankiwi/Qwen3-VL-{size}{type}-AWQ-{bits}bit
+AWQ_MODELS = {
+    "cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit": "Qwen/Qwen3-VL-2B-Instruct",
+    "cyankiwi/Qwen3-VL-2B-Thinking-AWQ-4bit": "Qwen/Qwen3-VL-2B-Thinking",
+    "cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit": "Qwen/Qwen3-VL-4B-Instruct",
+    "cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit": "Qwen/Qwen3-VL-4B-Thinking",
+    "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit": "Qwen/Qwen3-VL-8B-Instruct",
+    "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit": "Qwen/Qwen3-VL-8B-Instruct",
+    "cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit": "Qwen/Qwen3-VL-8B-Thinking",
 }
 
 # Model shortcuts: size-type → full HF model name
+# Keys are lowercase for case-insensitive matching
 MODEL_SHORTCUTS = {
-    "2B-Instruct": "Qwen/Qwen3-VL-2B-Instruct",
-    "2B-Thinking": "Qwen/Qwen3-VL-2B-Thinking",
-    "4B-Instruct": "Qwen/Qwen3-VL-4B-Instruct",
-    "4B-Thinking": "Qwen/Qwen3-VL-4B-Thinking",
-    "8B-Instruct": "Qwen/Qwen3-VL-8B-Instruct",
-    "8B-Thinking": "Qwen/Qwen3-VL-8B-Thinking",
+    "2b-instruct": "Qwen/Qwen3-VL-2B-Instruct",
+    "2b-thinking": "Qwen/Qwen3-VL-2B-Thinking",
+    "4b-instruct": "Qwen/Qwen3-VL-4B-Instruct",
+    "4b-thinking": "Qwen/Qwen3-VL-4B-Thinking",
+    "8b-instruct": "Qwen/Qwen3-VL-8B-Instruct",
+    "8b-thinking": "Qwen/Qwen3-VL-8B-Thinking",
 }
 
-# Reverse map: full name → shortcut
+# Reverse map: full name → shortcut (lowercase)
 MODEL_SHORTCUT_REV = {v: k for k, v in MODEL_SHORTCUTS.items()}
+# Also map lowercased full names for case-insensitive lookup
+MODEL_SHORTCUT_REV_LOWER = {v.lower(): k for k, v in MODEL_SHORTCUTS.items()}
 
-# Base model → GGUF repo mapping
-GGUF_REPO_MAP = {
-    "Qwen/Qwen3-VL-2B-Instruct": "unsloth/Qwen3-VL-2B-Instruct-GGUF",
-    "Qwen/Qwen3-VL-4B-Instruct": "unsloth/Qwen3-VL-4B-Instruct-GGUF",
-    "Qwen/Qwen3-VL-8B-Instruct": "unsloth/Qwen3-VL-8B-Instruct-GGUF",
-    "Qwen/Qwen3-VL-2B-Thinking": "unsloth/Qwen3-VL-2B-Thinking-GGUF",
-    "Qwen/Qwen3-VL-4B-Thinking": "unsloth/Qwen3-VL-4B-Thinking-GGUF",
-    "Qwen/Qwen3-VL-8B-Thinking": "unsloth/Qwen3-VL-8B-Thinking-GGUF",
+# Original (display) shortcut names: lowercase key → display name
+_DISPLAY_SHORTCUTS = {
+    "2b-instruct": "2B-Instruct",
+    "2b-thinking": "2B-Thinking",
+    "4b-instruct": "4B-Instruct",
+    "4b-thinking": "4B-Thinking",
+    "8b-instruct": "8B-Instruct",
+    "8b-thinking": "8B-Thinking",
 }
 
-# GGUF filenames by model shortcut and quant level
-GGUF_FILES = {
-    shortcut: {
-        "Q4_K_M": f"Qwen3-VL-{shortcut}-Q4_K_M.gguf",
-        "Q5_K_M": f"Qwen3-VL-{shortcut}-Q5_K_M.gguf",
-        "Q6_K": f"Qwen3-VL-{shortcut}-Q6_K.gguf",
-        "Q8_0": f"Qwen3-VL-{shortcut}-Q8_0.gguf",
-    }
+# Base model → AWQ repo mapping: (shortcut, quant_level) → cyankiwi repo
+# Uses _DISPLAY_SHORTCUTS to generate display-cased repo names
+AWQ_REPO_MAP = {
+    (shortcut, level): f"cyankiwi/Qwen3-VL-{_DISPLAY_SHORTCUTS[shortcut]}-AWQ-{level}"
     for shortcut in MODEL_SHORTCUTS
+    for level in ("4bit", "8bit")
 }
 
-# Default GGUF configuration
-DEFAULT_QUANT_METHOD = "gguf"
-DEFAULT_QUANT_LEVEL = "Q4_K_M"
-DEFAULT_GGUF_REPO = "unsloth/Qwen3-VL-8B-Instruct-GGUF"
-DEFAULT_GGUF_FILE = "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"
+# Default AWQ configuration (all lowercase for consistency)
+DEFAULT_QUANT_METHOD = "awq"
+DEFAULT_QUANT_LEVEL = "4bit"
+
+# Known AWQ quant levels (lowercase)
+AWQ_QUANT_LEVELS = {"4bit", "8bit"}
+
+
+def normalize_model_key(key: str) -> str:
+    """Normalize a model shortcut or name to lowercase for matching.
+
+    Examples:
+        normalize_model_key("8B-Instruct") -> "8b-instruct"
+        normalize_model_key("4bit") -> "4bit"
+        normalize_model_key("Qwen/Qwen3-VL-8B-Instruct") -> "qwen/qwen3-vl-8b-instruct"
+    """
+    return key.strip().lower() if key else ""
+
+
+def resolve_model_name(key: str) -> str:
+    """Resolve a model key (shortcut or full name) to the canonical full HF name.
+
+    Case-insensitive. Returns original key if no match found.
+
+    Examples:
+        resolve_model_name("8b-instruct") -> "Qwen/Qwen3-VL-8B-Instruct"
+        resolve_model_name("8B-Instruct") -> "Qwen/Qwen3-VL-8B-Instruct"
+        resolve_model_name("Qwen/Qwen3-VL-8B-Instruct") -> "Qwen/Qwen3-VL-8B-Instruct"
+    """
+    normalized = normalize_model_key(key)
+    # Check shortcuts first
+    if normalized in MODEL_SHORTCUTS:
+        return MODEL_SHORTCUTS[normalized]
+    # Check if it's already a full name (case-insensitive)
+    for full_name in SUPPORTED_MODELS:
+        if full_name.lower() == normalized:
+            return full_name
+    return key
+
+
+def resolve_quant_level(level: str) -> str:
+    """Normalize quant level to lowercase.
+
+    Examples:
+        resolve_quant_level("4bit") -> "4bit"
+        resolve_quant_level("8BIT") -> "8bit"
+    """
+    return normalize_model_key(level)
+
+
+def get_model_shortcut(model_name: str) -> str:
+    """Get the lowercase shortcut for a model name.
+
+    Examples:
+        get_model_shortcut("Qwen/Qwen3-VL-8B-Instruct") -> "8b-instruct"
+    """
+    result = MODEL_SHORTCUT_REV.get(model_name)
+    if result:
+        return result
+    # Try case-insensitive lookup
+    result = MODEL_SHORTCUT_REV_LOWER.get(model_name.lower())
+    if result:
+        return result
+    # Fallback: extract from full name
+    parts = model_name.split("/")[-1] if model_name else ""
+    return parts.lower()
+
+
+def get_display_shortcut(shortcut: str) -> str:
+    """Get display-friendly shortcut (original casing).
+
+    Examples:
+        get_display_shortcut("8b-instruct") -> "8B-Instruct"
+    """
+    return _DISPLAY_SHORTCUTS.get(normalize_model_key(shortcut), shortcut)
+
 
 # Quantization recommendations by GPU VRAM and model size
 # RTX 3060/3070: ~8-12GB, RTX 3080/3090: ~10-24GB
 # RTX 4060/4070: ~8-12GB, RTX 4080/4090: ~16-24GB
 QUANT_RECOMMENDATIONS = {
     "2B": {"min_vram_gb": 4, "recommended_quant": "none"},
-    "4B": {"min_vram_gb": 6, "recommended_quant": "bitsandbytes"},
-    "8B": {"min_vram_gb": 10, "recommended_quant": "gguf"},
+    "4B": {"min_vram_gb": 6, "recommended_quant": "awq"},
+    "8B": {"min_vram_gb": 10, "recommended_quant": "awq"},
 }
 
 # GPU compute capability to image tag mapping (vLLM uses single universal image)
@@ -207,53 +282,70 @@ GPU_COMPUTE_CAPS = {
 
 @dataclass
 class GpuModelConfig:
-    """Per-GPU model and quantization configuration."""
+    """Per-GPU model and quantization configuration.
+
+    All string fields are stored in normalized form:
+    - model_name: canonical HF name (e.g., "Qwen/Qwen3-VL-8B-Instruct")
+    - quant_method: lowercase (e.g., "awq")
+    - quant_level: lowercase (e.g., "4bit")
+    """
 
     gpu_id: int
     model_name: str = MODEL_NAME
     quant_method: str = DEFAULT_QUANT_METHOD
     quant_level: str = DEFAULT_QUANT_LEVEL
 
+    def __post_init__(self):
+        """Normalize model name and quant fields."""
+        self.model_name = resolve_model_name(self.model_name)
+        self.quant_method = self.quant_method.lower().strip()
+        self.quant_level = self.quant_level.lower().strip()
+
     @property
     def model_shortcut(self) -> str:
-        """Get model shortcut from full name."""
-        return MODEL_SHORTCUT_REV.get(self.model_name, self.model_name.split("/")[-1])
+        """Get lowercase model shortcut from full name."""
+        return get_model_shortcut(self.model_name)
 
     @property
-    def gguf_repo(self) -> str | None:
-        """Get GGUF repo name for this model."""
-        if self.quant_method != "gguf":
-            return None
-        return GGUF_REPO_MAP.get(self.model_name)
+    def display_shortcut(self) -> str:
+        """Get display-friendly shortcut (original casing)."""
+        return get_display_shortcut(self.model_shortcut)
 
     @property
-    def gguf_file(self) -> str | None:
-        """Get specific GGUF filename."""
-        if self.quant_method != "gguf":
+    def awq_repo(self) -> str | None:
+        """Get AWQ repo name for this model and quant level."""
+        if self.quant_method != "awq":
             return None
         shortcut = self.model_shortcut
-        return GGUF_FILES.get(shortcut, {}).get(self.quant_level)
+        return AWQ_REPO_MAP.get((shortcut, self.quant_level))
 
     @property
     def vllm_model_arg(self) -> str:
-        """Get the --model argument for vLLM."""
-        if self.quant_method == "gguf" and self.gguf_repo:
-            return self.gguf_repo
+        """Get the model argument for vLLM serve command.
+
+        For AWQ models, returns the cyankiwi AWQ repo name
+        (e.g. ``cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit``).
+        vLLM natively supports AWQ via ``--quantization awq``.
+        """
+        if self.quant_method == "awq":
+            repo = self.awq_repo
+            if repo:
+                return repo
         return self.model_name
 
     @property
-    def vllm_tokenizer_arg(self) -> str | None:
-        """Get --tokenizer argument (needed for GGUF models)."""
-        if self.quant_method == "gguf":
-            return self.model_name
-        return None
-
-    @property
     def label(self) -> str:
-        """Human-readable label."""
+        """Human-readable label (lowercase)."""
         if self.quant_level:
             return f"{self.model_shortcut}:{self.quant_level}"
         return self.model_shortcut
+
+    @property
+    def display_label(self) -> str:
+        """Display-friendly label with original casing."""
+        if self.quant_level:
+            return f"{self.display_shortcut}:{self.quant_level.upper()}"
+        return self.display_shortcut
 
     def to_dict(self) -> dict:
         return {
@@ -262,8 +354,7 @@ class GpuModelConfig:
             "model_shortcut": self.model_shortcut,
             "quant_method": self.quant_method,
             "quant_level": self.quant_level,
-            "gguf_repo": self.gguf_repo,
-            "gguf_file": self.gguf_file,
+            "awq_repo": self.awq_repo,
         }
 
 
@@ -271,10 +362,11 @@ def parse_gpu_configs(config_str: str) -> list[GpuModelConfig]:
     """Parse per-GPU model/quant configs from CLI string.
 
     Format: "GPU_ID:MODEL_SHORTCUT:QUANT_LEVEL,..."
-    Example: "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q4_K_M"
+    Example: "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:8bit"
 
-    If QUANT_LEVEL is omitted, defaults to Q4_K_M.
-    MODEL_SHORTCUT can be a shortcut (e.g., '8B-Instruct') or full name.
+    Case-insensitive: '8B-Instruct' and '8b-instruct' are equivalent.
+    If QUANT_LEVEL is omitted, defaults to 4bit.
+    MODEL_SHORTCUT can be a shortcut (e.g., '8b-instruct') or full name.
     """
     configs = []
     for part in config_str.split(","):
@@ -286,14 +378,16 @@ def parse_gpu_configs(config_str: str) -> list[GpuModelConfig]:
             raise ValueError(f"Invalid config: '{part}'. Format: GPU_ID:MODEL[:QUANT]")
 
         gpu_id = int(fields[0].strip())
-        model_key = fields[1].strip()
-        quant_level = fields[2].strip() if len(fields) > 2 else DEFAULT_QUANT_LEVEL
+        model_key = normalize_model_key(fields[1])
+        quant_level = (
+            normalize_model_key(fields[2]) if len(fields) > 2 else DEFAULT_QUANT_LEVEL
+        )
 
-        model_name = MODEL_SHORTCUTS.get(model_key, model_key)
+        # Resolve model name (shortcut -> full HF name)
+        model_name = resolve_model_name(model_key)
 
         # Determine quant method from quant level
-        gguf_levels = {"Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"}
-        quant_method = "gguf" if quant_level in gguf_levels else "none"
+        quant_method = "awq" if quant_level in AWQ_QUANT_LEVELS else "none"
 
         configs.append(
             GpuModelConfig(
@@ -512,11 +606,11 @@ class ModelConfigManager:
         if model_name in SUPPORTED_MODELS:
             return SUPPORTED_MODELS[model_name]
 
-        # Check GGUF models
-        base_model = GGUF_MODELS.get(model_name)
+        # Check AWQ models
+        base_model = AWQ_MODELS.get(model_name)
         if base_model and base_model in SUPPORTED_MODELS:
             config = SUPPORTED_MODELS[base_model].copy()
-            config["gguf"] = True
+            config["awq"] = True
             config["base_model"] = base_model
             return config
 
@@ -534,7 +628,7 @@ class ModelConfigManager:
         config = self.get_model_config(model_name)
         size = config.get("size", "8B")
 
-        rec = QUANT_RECOMMENDATIONS.get(size, {"recommended_quant": "gguf"})
+        rec = QUANT_RECOMMENDATIONS.get(size, {"recommended_quant": "awq"})
         min_vram = rec.get("min_vram_gb", 10)
 
         if gpu_vram_gb >= min_vram * 2:
@@ -542,7 +636,7 @@ class ModelConfigManager:
         elif gpu_vram_gb >= min_vram:
             return rec["recommended_quant"]
         else:
-            return "gguf"  # Most aggressive compression
+            return "awq"  # Most aggressive compression
 
 
 class DockerImageManager:
@@ -601,6 +695,7 @@ class ComposeFileGenerator:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
         limit_mm_per_prompt: str = LIMIT_MM_PER_PROMPT,
+        gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
         gpu_configs: list[GpuModelConfig] | None = None,
     ):
         self.gpus = gpus
@@ -619,6 +714,7 @@ class ComposeFileGenerator:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.limit_mm_per_prompt = limit_mm_per_prompt
+        self.gpu_memory_utilization = gpu_memory_utilization
         self.gpu_configs = gpu_configs
         self._gpu_config_map: dict[int, GpuModelConfig] = {}
         if gpu_configs:
@@ -633,7 +729,7 @@ class ComposeFileGenerator:
             gpu_id=gpu.index,
             model_name=self.model_name,
             quant_method=self.quantization or DEFAULT_QUANT_METHOD,
-            quant_level=DEFAULT_QUANT_LEVEL if self.quantization == "gguf" else "",
+            quant_level=DEFAULT_QUANT_LEVEL if self.quantization == "awq" else "",
         )
 
     def generate(self) -> str:
@@ -709,6 +805,8 @@ class ComposeFileGenerator:
 
         if self.mount_mode == "manual":
             lines.append(f"    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64")
+            # CUDA_VISIBLE_DEVICES=0 because each container mounts only one GPU
+            lines.append(f"    - CUDA_VISIBLE_DEVICES=0")
 
         # vLLM requires ipc: host for shared memory
         lines.extend(
@@ -750,12 +848,6 @@ class ComposeFileGenerator:
             for device in NvidiaDriverLibs.get_required_devices():
                 if Path(device).exists():
                     lines.append(f"      - {device}:{device}")
-            lines.extend(
-                [
-                    f"    environment:",
-                    f"      - CUDA_VISIBLE_DEVICES=0",
-                ]
-            )
         else:
             lines.extend(
                 [
@@ -770,24 +862,14 @@ class ComposeFileGenerator:
             )
 
         # vLLM command arguments
+        # Note: newer vLLM (>=0.12) uses positional model arg, not --model flag
         vllm_model = gpu_config.vllm_model_arg
         lines.extend(
             [
                 f"    command:",
-                f"      - --model",
                 f"      - {vllm_model}",
             ]
         )
-
-        # Add tokenizer for GGUF models
-        tokenizer = gpu_config.vllm_tokenizer_arg
-        if tokenizer:
-            lines.extend(
-                [
-                    f"      - --tokenizer",
-                    f"      - {tokenizer}",
-                ]
-            )
 
         lines.extend(
             [
@@ -796,7 +878,9 @@ class ComposeFileGenerator:
                 f"      - --max-num-seqs",
                 f'      - "{self.max_num_seqs}"',
                 f"      - --limit-mm-per-prompt",
-                f'      - "{self.limit_mm_per_prompt}"',
+                f"      - '{self.limit_mm_per_prompt}'",
+                f"      - --gpu-memory-utilization",
+                f'      - "{self.gpu_memory_utilization}"',
                 f"      - --dtype",
                 f"      - half",
                 f"      - --trust-remote-code",
@@ -806,14 +890,7 @@ class ComposeFileGenerator:
         # Quantization (per-GPU config takes priority)
         quant = gpu_config.quant_method
         if quant and quant != "none":
-            if quant == "gguf":
-                lines.extend(
-                    [
-                        f"      - --quantization",
-                        f"      - gguf",
-                    ]
-                )
-            elif quant == "bitsandbytes":
+            if quant == "bitsandbytes":
                 lines.extend(
                     [
                         f"      - --quantization",
@@ -888,6 +965,7 @@ class QVLComposer:
         quantization: Optional[str] = None,
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
+        gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
         gpu_configs: list[GpuModelConfig] | None = None,
     ):
         self.model_name = model_name
@@ -899,6 +977,7 @@ class QVLComposer:
         self.quantization = quantization
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
+        self.gpu_memory_utilization = gpu_memory_utilization
         self.gpu_configs = gpu_configs
 
         # project name: lowercase, safe characters
@@ -954,6 +1033,7 @@ class QVLComposer:
             quantization=self.quantization,
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
+            gpu_memory_utilization=self.gpu_memory_utilization,
             gpu_configs=self.gpu_configs,
         )
         content = compose_generator.generate()
@@ -1201,9 +1281,9 @@ class QVLComposeArgParser:
             "-q",
             "--quantization",
             type=str,
-            choices=["none", "gguf", "bitsandbytes", "awq"],
+            choices=["none", "awq", "bitsandbytes"],
             default=None,
-            help="Quantization method (default: auto-detect)",
+            help="Quantization method (default: awq)",
         )
         parser.add_argument(
             "--max-model-len",
@@ -1218,13 +1298,19 @@ class QVLComposeArgParser:
             help=f"Max concurrent sequences (default: {MAX_NUM_SEQS})",
         )
         parser.add_argument(
+            "--gpu-memory-utilization",
+            type=float,
+            default=GPU_MEMORY_UTILIZATION,
+            help=f"GPU memory utilization ratio (default: {GPU_MEMORY_UTILIZATION})",
+        )
+        parser.add_argument(
             "--gpu-configs",
             type=str,
             default=None,
             help=(
                 "Per-GPU model/quant configs. "
                 'Format: "GPU:MODEL:QUANT,...". '
-                'Example: "0:2B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"'
+                'Example: "0:2B-Instruct:4bit,1:8B-Instruct:8bit"'
             ),
         )
 
@@ -1292,6 +1378,9 @@ def main():
         "quantization": getattr(args, "quantization", None),
         "max_model_len": getattr(args, "max_model_len", MAX_MODEL_LEN),
         "max_num_seqs": getattr(args, "max_num_seqs", MAX_NUM_SEQS),
+        "gpu_memory_utilization": getattr(
+            args, "gpu_memory_utilization", GPU_MEMORY_UTILIZATION
+        ),
     }
 
     # Parse per-GPU configs if provided

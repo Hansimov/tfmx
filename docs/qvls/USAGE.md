@@ -13,18 +13,18 @@ qvl_compose up
 # Start with specific model
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct"
 
-# Start with GGUF quantization (default: Q4_K_M)
-qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+# Start with AWQ quantization (default)
+qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 
 # Start on specific GPUs
 qvl_compose up -g "0,1"
 
 # Per-GPU model/quant config (different models on different GPUs)
-qvl_compose up --gpu-configs "0:2B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"
+qvl_compose up --gpu-configs "0:2b-instruct:4bit,1:8b-instruct:8bit"
 
 # Full 6-GPU deployment
 qvl_compose up --gpu-configs \
-  "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q4_K_M,3:4B-Thinking:Q4_K_M,4:8B-Instruct:Q8_0,5:8B-Thinking:Q4_K_M"
+  "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:8bit,5:8b-thinking:8bit"
 
 # Custom port base (default: 29880)
 qvl_compose up -p 29890
@@ -54,9 +54,9 @@ qvl_compose health      # Check GPU health
 
 The `--gpu-configs` argument uses the format `GPU_ID:MODEL_SHORTCUT:QUANT_LEVEL,...`
 
-Model shortcuts: `2B-Instruct`, `2B-Thinking`, `4B-Instruct`, `4B-Thinking`, `8B-Instruct`, `8B-Thinking`
+Model shortcuts (case-insensitive): `2b-instruct`, `2b-thinking`, `4b-instruct`, `4b-thinking`, `8b-instruct`, `8b-thinking`
 
-Quant levels: `Q4_K_M` (default), `Q5_K_M`, `Q6_K`, `Q8_0`
+Quant levels (case-insensitive): `4bit` (default), `8bit`
 
 ### qvl_machine
 
@@ -89,9 +89,9 @@ qvl_machine health
 
 When running a multi-model deployment, the machine proxy automatically discovers what model each instance is running and routes requests accordingly:
 
-- Request `model="8B-Instruct:Q4_K_M"` → routes to 8B-Instruct Q4_K_M instance
-- Request `model="4B-Thinking"` → routes to any 4B-Thinking instance
-- Request `model=""` → routes to default/any idle instance
+- Request `model="8b-instruct:4bit"` -> routes to 8B-Instruct 4bit instance
+- Request `model="4b-thinking"` -> routes to any 4B-Thinking instance
+- Request `model=""` -> routes to default/any idle instance
 
 The `/info` endpoint returns available models and per-instance metadata.
 
@@ -275,15 +275,15 @@ clients.close()
 ```python
 from tfmx.qvls import QVLComposer, GpuModelConfig, parse_gpu_configs
 
-# Basic deployment (default: 8B-Instruct GGUF Q4_K_M)
+# Basic deployment (default: 8B-Instruct AWQ 4bit)
 composer = QVLComposer()
 composer.up()
 
 # Per-GPU model configuration
 gpu_configs = parse_gpu_configs(
-    "0:2B-Instruct:Q4_K_M,"
-    "1:4B-Instruct:Q4_K_M,"
-    "2:8B-Instruct:Q4_K_M"
+    "0:2b-instruct:4bit,"
+    "1:4b-instruct:4bit,"
+    "2:8b-instruct:4bit"
 )
 composer = QVLComposer(gpu_configs=gpu_configs)
 composer.up()
@@ -291,9 +291,9 @@ composer.up()
 # Or create configs programmatically
 configs = [
     GpuModelConfig(gpu_id=0, model_name="Qwen/Qwen3-VL-2B-Instruct",
-                   quant_method="gguf", quant_level="Q4_K_M"),
+                   quant_method="awq", quant_level="4bit"),
     GpuModelConfig(gpu_id=1, model_name="Qwen/Qwen3-VL-8B-Instruct",
-                   quant_method="gguf", quant_level="Q8_0"),
+                   quant_method="awq", quant_level="8bit"),
 ]
 composer = QVLComposer(gpu_configs=configs)
 composer.generate_compose_file()  # Generate YAML only
@@ -355,24 +355,24 @@ router = QVLRouter()
 # Register instances
 router.register(InstanceDescriptor(
     model_name="Qwen/Qwen3-VL-2B-Instruct",
-    quant_method="gguf", quant_level="Q4_K_M",
+    quant_method="awq", quant_level="4bit",
     endpoint="http://localhost:29880", gpu_id=0,
 ))
 router.register(InstanceDescriptor(
     model_name="Qwen/Qwen3-VL-8B-Instruct",
-    quant_method="gguf", quant_level="Q8_0",
+    quant_method="awq", quant_level="8bit",
     endpoint="http://localhost:29881", gpu_id=1,
 ))
 
-# Route by model
-match = router.route(model="8B-Instruct", quant="Q8_0")
+# Route by model (case-insensitive)
+match = router.route(model="8b-instruct", quant="8bit")
 print(f"Routed to: {match.endpoint}")
 
 # Route from model field (parses "model:quant" format)
-match = router.route_from_model_field("2B-Instruct:Q4_K_M")
+match = router.route_from_model_field("2b-instruct:4bit")
 
 # Available models
-print(router.get_available_models())  # ["2B-Instruct:Q4_K_M", "8B-Instruct:Q8_0"]
+print(router.get_available_models())  # ["2b-instruct:4bit", "8b-instruct:8bit"]
 ```
 
 ### Machine Server (Programmatic)
@@ -396,7 +396,7 @@ server.run()  # Starts uvicorn
 
 ```bash
 # 1. Deploy vLLM containers (one per GPU)
-qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 
 # 2. Wait for containers to be healthy (~60-120s)
 qvl_compose logs -f   # Watch for "Uvicorn running on ..."
@@ -422,11 +422,11 @@ On each machine:
 
 ```bash
 # Machine 1 (host1)
-qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 qvl_machine run
 
 # Machine 2 (host2)
-qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 qvl_machine run
 ```
 

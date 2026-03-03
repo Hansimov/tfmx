@@ -14,15 +14,13 @@ from tfmx.qvls.compose import (
     GpuModelConfig,
     parse_gpu_configs,
     SUPPORTED_MODELS,
-    GGUF_MODELS,
+    AWQ_MODELS,
     MODEL_SHORTCUTS,
     MODEL_SHORTCUT_REV,
-    GGUF_REPO_MAP,
-    GGUF_FILES,
+    AWQ_REPO_MAP,
+    AWQ_QUANT_LEVELS,
     DEFAULT_QUANT_METHOD,
     DEFAULT_QUANT_LEVEL,
-    DEFAULT_GGUF_REPO,
-    DEFAULT_GGUF_FILE,
     SERVER_PORT,
     MACHINE_PORT,
     MAX_CONCURRENT_REQUESTS,
@@ -33,6 +31,11 @@ from tfmx.qvls.compose import (
     MODEL_NAME,
     QUANT_RECOMMENDATIONS,
     CACHE_HF_HUB,
+    normalize_model_key,
+    resolve_model_name,
+    resolve_quant_level,
+    get_model_shortcut,
+    get_display_shortcut,
 )
 
 
@@ -56,10 +59,10 @@ class TestConstants:
             assert "type" in info
             assert info["type"] in ("instruct", "thinking")
 
-    def test_gguf_models(self):
-        assert len(GGUF_MODELS) >= 3
-        for gguf_id, base_id in GGUF_MODELS.items():
-            assert "unsloth" in gguf_id
+    def test_awq_models(self):
+        assert len(AWQ_MODELS) >= 6
+        for awq_id, base_id in AWQ_MODELS.items():
+            assert "cyankiwi" in awq_id
             assert base_id in SUPPORTED_MODELS
 
     def test_default_model_is_supported(self):
@@ -102,10 +105,10 @@ class TestModelConfigManager:
         assert "size" in config
         assert "type" in config
 
-    def test_get_model_config_gguf(self):
+    def test_get_model_config_awq(self):
         mgr = ModelConfigManager()
-        config = mgr.get_model_config("unsloth/Qwen3-VL-8B-Instruct-GGUF")
-        assert config.get("gguf") is True
+        config = mgr.get_model_config("cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit")
+        assert config.get("awq") is True
 
     def test_get_model_config_unknown(self):
         mgr = ModelConfigManager()
@@ -115,14 +118,13 @@ class TestModelConfigManager:
     def test_quantization_recommendation(self):
         mgr = ModelConfigManager()
         rec = mgr.get_quantization_recommendation(MODEL_NAME)
-        assert rec in ("none", "gguf", "bitsandbytes", "awq")
+        assert rec in ("none", "awq", "bitsandbytes")
 
 
 class TestDockerImageManager:
     """Test DockerImageManager (static methods)."""
 
     def test_class_exists(self):
-        # DockerImageManager uses static methods for ensure_image
         assert hasattr(DockerImageManager, "ensure_image")
 
 
@@ -130,8 +132,6 @@ class TestComposeFileGenerator:
     """Test ComposeFileGenerator."""
 
     def test_generate_single_gpu(self):
-        from pathlib import Path
-
         gpu = GPUInfo(index=0, compute_cap="8.9")
         gen = ComposeFileGenerator(
             gpus=[gpu],
@@ -146,8 +146,6 @@ class TestComposeFileGenerator:
         assert "gpu0" in compose
 
     def test_generate_multi_gpu(self):
-        from pathlib import Path
-
         gpus = [GPUInfo(index=i, compute_cap="8.9") for i in range(3)]
         gen = ComposeFileGenerator(
             gpus=gpus,
@@ -160,6 +158,20 @@ class TestComposeFileGenerator:
         assert "gpu0" in compose
         assert "gpu1" in compose
         assert "gpu2" in compose
+
+    def test_no_sitecustomize_mount(self):
+        """AWQ does not need sitecustomize monkey-patch."""
+        gpu = GPUInfo(index=0, compute_cap="8.9")
+        gen = ComposeFileGenerator(
+            gpus=[gpu],
+            model_name="Qwen/Qwen3-VL-8B-Instruct",
+            port=SERVER_PORT,
+            project_name="test-qvl",
+            data_dir=Path("/tmp/test-qvl"),
+        )
+        compose = gen.generate()
+        assert "sitecustomize" not in compose
+        assert "PYTHONPATH" not in compose
 
 
 class TestQVLComposer:
@@ -175,9 +187,9 @@ class TestModelShortcuts:
 
     def test_shortcuts_cover_all_models(self):
         assert len(MODEL_SHORTCUTS) >= 6
-        assert "2B-Instruct" in MODEL_SHORTCUTS
-        assert "4B-Thinking" in MODEL_SHORTCUTS
-        assert "8B-Instruct" in MODEL_SHORTCUTS
+        assert "2b-instruct" in MODEL_SHORTCUTS
+        assert "4b-thinking" in MODEL_SHORTCUTS
+        assert "8b-instruct" in MODEL_SHORTCUTS
 
     def test_shortcuts_resolve_to_supported(self):
         for shortcut, full_name in MODEL_SHORTCUTS.items():
@@ -190,37 +202,28 @@ class TestModelShortcuts:
             assert MODEL_SHORTCUT_REV[full_name] == shortcut
 
 
-class TestGGUFMappings:
-    """Test GGUF repo and file mappings."""
+class TestAWQMappings:
+    """Test AWQ repo mappings."""
 
-    def test_gguf_repo_map_covers_supported(self):
-        for full_name in MODEL_SHORTCUTS.values():
-            assert full_name in GGUF_REPO_MAP, f"{full_name} not in GGUF_REPO_MAP"
-
-    def test_gguf_repo_map_values(self):
-        for base, repo in GGUF_REPO_MAP.items():
-            assert "unsloth" in repo
-            assert "GGUF" in repo
-
-    def test_gguf_files_for_all_shortcuts(self):
+    def test_awq_repo_map_covers_all_shortcuts(self):
         for shortcut in MODEL_SHORTCUTS:
-            assert shortcut in GGUF_FILES, f"{shortcut} not in GGUF_FILES"
-            files = GGUF_FILES[shortcut]
-            assert "Q4_K_M" in files
-            assert "Q8_0" in files
+            assert (shortcut, "4bit") in AWQ_REPO_MAP or (
+                shortcut, "8bit"
+            ) in AWQ_REPO_MAP, f"{shortcut} not in AWQ_REPO_MAP"
 
-    def test_gguf_file_naming(self):
-        for shortcut, files in GGUF_FILES.items():
-            for quant, filename in files.items():
-                assert shortcut in filename
-                assert quant in filename
-                assert filename.endswith(".gguf")
+    def test_awq_repo_map_values(self):
+        for key, repo in AWQ_REPO_MAP.items():
+            assert "cyankiwi" in repo
+            assert "AWQ" in repo
 
-    def test_default_gguf_constants(self):
-        assert DEFAULT_QUANT_METHOD == "gguf"
-        assert DEFAULT_QUANT_LEVEL == "Q4_K_M"
-        assert "unsloth" in DEFAULT_GGUF_REPO
-        assert DEFAULT_GGUF_FILE.endswith(".gguf")
+    def test_awq_quant_levels(self):
+        assert "4bit" in AWQ_QUANT_LEVELS
+        assert "8bit" in AWQ_QUANT_LEVELS
+        assert len(AWQ_QUANT_LEVELS) == 2
+
+    def test_default_awq_constants(self):
+        assert DEFAULT_QUANT_METHOD == "awq"
+        assert DEFAULT_QUANT_LEVEL == "4bit"
 
 
 class TestGpuModelConfig:
@@ -235,42 +238,53 @@ class TestGpuModelConfig:
 
     def test_model_shortcut(self):
         gc = GpuModelConfig(gpu_id=0, model_name="Qwen/Qwen3-VL-8B-Instruct")
-        assert gc.model_shortcut == "8B-Instruct"
+        assert gc.model_shortcut == "8b-instruct"
 
     def test_model_shortcut_unknown(self):
         gc = GpuModelConfig(gpu_id=0, model_name="unknown/model")
         assert gc.model_shortcut == "model"
 
-    def test_gguf_repo(self):
+    def test_awq_repo(self):
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_method="gguf",
+            quant_method="awq",
+            quant_level="4bit",
         )
-        assert gc.gguf_repo == "unsloth/Qwen3-VL-8B-Instruct-GGUF"
+        assert gc.awq_repo == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
 
-    def test_gguf_repo_none_for_non_gguf(self):
+    def test_awq_repo_8bit(self):
+        gc = GpuModelConfig(
+            gpu_id=0,
+            model_name="Qwen/Qwen3-VL-8B-Instruct",
+            quant_method="awq",
+            quant_level="8bit",
+        )
+        assert gc.awq_repo == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit"
+
+    def test_awq_repo_none_for_non_awq(self):
         gc = GpuModelConfig(gpu_id=0, quant_method="none")
-        assert gc.gguf_repo is None
+        assert gc.awq_repo is None
 
-    def test_gguf_file(self):
+    def test_vllm_model_arg_awq(self):
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_method="gguf",
-            quant_level="Q4_K_M",
+            quant_method="awq",
+            quant_level="4bit",
         )
-        assert gc.gguf_file == "Qwen3-VL-8B-Instruct-Q4_K_M.gguf"
+        assert gc.vllm_model_arg == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
 
-    def test_vllm_model_arg_gguf(self):
+    def test_vllm_model_arg_awq_8bit(self):
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_method="gguf",
+            quant_method="awq",
+            quant_level="8bit",
         )
-        assert gc.vllm_model_arg == "unsloth/Qwen3-VL-8B-Instruct-GGUF"
+        assert gc.vllm_model_arg == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit"
 
-    def test_vllm_model_arg_non_gguf(self):
+    def test_vllm_model_arg_non_awq(self):
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
@@ -278,29 +292,13 @@ class TestGpuModelConfig:
         )
         assert gc.vllm_model_arg == "Qwen/Qwen3-VL-8B-Instruct"
 
-    def test_vllm_tokenizer_arg_gguf(self):
-        gc = GpuModelConfig(
-            gpu_id=0,
-            model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_method="gguf",
-        )
-        assert gc.vllm_tokenizer_arg == "Qwen/Qwen3-VL-8B-Instruct"
-
-    def test_vllm_tokenizer_arg_non_gguf(self):
-        gc = GpuModelConfig(
-            gpu_id=0,
-            model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_method="none",
-        )
-        assert gc.vllm_tokenizer_arg is None
-
     def test_label(self):
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_level="Q4_K_M",
+            quant_level="4bit",
         )
-        assert gc.label == "8B-Instruct:Q4_K_M"
+        assert gc.label == "8b-instruct:4bit"
 
     def test_label_no_quant(self):
         gc = GpuModelConfig(
@@ -308,7 +306,7 @@ class TestGpuModelConfig:
             model_name="Qwen/Qwen3-VL-8B-Instruct",
             quant_level="",
         )
-        assert gc.label == "8B-Instruct"
+        assert gc.label == "8b-instruct"
 
     def test_to_dict(self):
         gc = GpuModelConfig(gpu_id=0)
@@ -318,28 +316,27 @@ class TestGpuModelConfig:
         assert "model_shortcut" in d
         assert "quant_method" in d
         assert "quant_level" in d
-        assert "gguf_repo" in d
-        assert "gguf_file" in d
+        assert "awq_repo" in d
 
 
 class TestParseGpuConfigs:
     """Test parse_gpu_configs function."""
 
     def test_single_config(self):
-        configs = parse_gpu_configs("0:8B-Instruct:Q4_K_M")
+        configs = parse_gpu_configs("0:8B-Instruct:4bit")
         assert len(configs) == 1
         assert configs[0].gpu_id == 0
         assert configs[0].model_name == "Qwen/Qwen3-VL-8B-Instruct"
-        assert configs[0].quant_level == "Q4_K_M"
+        assert configs[0].quant_level == "4bit"
 
     def test_multiple_configs(self):
         configs = parse_gpu_configs(
-            "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q8_0"
+            "0:2B-Instruct:4bit,1:4B-Instruct:4bit,2:8B-Instruct:8bit"
         )
         assert len(configs) == 3
         assert configs[0].model_name == "Qwen/Qwen3-VL-2B-Instruct"
         assert configs[1].model_name == "Qwen/Qwen3-VL-4B-Instruct"
-        assert configs[2].quant_level == "Q8_0"
+        assert configs[2].quant_level == "8bit"
 
     def test_default_quant(self):
         configs = parse_gpu_configs("0:8B-Instruct")
@@ -347,9 +344,8 @@ class TestParseGpuConfigs:
         assert configs[0].quant_level == DEFAULT_QUANT_LEVEL
 
     def test_full_model_name(self):
-        configs = parse_gpu_configs("0:Qwen/Qwen3-VL-8B-Instruct:Q8_0")
+        configs = parse_gpu_configs("0:Qwen/Qwen3-VL-8B-Instruct:8bit")
         assert len(configs) == 1
-        # Full name is used as-is since it's not in shortcuts
         assert configs[0].model_name == "Qwen/Qwen3-VL-8B-Instruct"
 
     def test_empty_string(self):
@@ -362,17 +358,17 @@ class TestParseGpuConfigs:
 
     def test_six_gpu_deployment(self):
         config_str = (
-            "0:2B-Instruct:Q4_K_M,"
-            "1:4B-Instruct:Q4_K_M,"
-            "2:8B-Instruct:Q4_K_M,"
-            "3:4B-Thinking:Q4_K_M,"
-            "4:8B-Instruct:Q8_0,"
-            "5:8B-Thinking:Q4_K_M"
+            "0:2B-Instruct:4bit,"
+            "1:4B-Instruct:4bit,"
+            "2:8B-Instruct:4bit,"
+            "3:4B-Thinking:4bit,"
+            "4:8B-Instruct:8bit,"
+            "5:8B-Thinking:8bit"
         )
         configs = parse_gpu_configs(config_str)
         assert len(configs) == 6
         assert configs[3].model_name == "Qwen/Qwen3-VL-4B-Thinking"
-        assert configs[4].quant_level == "Q8_0"
+        assert configs[4].quant_level == "8bit"
         assert configs[5].model_name == "Qwen/Qwen3-VL-8B-Thinking"
 
 
@@ -385,14 +381,14 @@ class TestComposeWithGpuConfigs:
             GpuModelConfig(
                 gpu_id=0,
                 model_name="Qwen/Qwen3-VL-2B-Instruct",
-                quant_method="gguf",
-                quant_level="Q4_K_M",
+                quant_method="awq",
+                quant_level="4bit",
             ),
             GpuModelConfig(
                 gpu_id=1,
                 model_name="Qwen/Qwen3-VL-8B-Instruct",
-                quant_method="gguf",
-                quant_level="Q8_0",
+                quant_method="awq",
+                quant_level="8bit",
             ),
         ]
         gen = ComposeFileGenerator(
@@ -406,12 +402,12 @@ class TestComposeWithGpuConfigs:
         compose = gen.generate()
         assert "gpu0" in compose
         assert "gpu1" in compose
-        # Should have different models
-        assert "unsloth/Qwen3-VL-2B-Instruct-GGUF" in compose
-        assert "unsloth/Qwen3-VL-8B-Instruct-GGUF" in compose
-        # Should have tokenizer args for GGUF
-        assert "--tokenizer" in compose
-        assert "Qwen/Qwen3-VL-2B-Instruct" in compose
+        assert "cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit" in compose
+        assert "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit" in compose
+        assert "--quantization" in compose
+        assert "awq" in compose
+        assert "--tokenizer" not in compose
+        assert "--hf-config-path" not in compose
 
     def test_header_shows_per_gpu_info(self):
         gpus = [GPUInfo(index=0, compute_cap="8.9")]
@@ -419,8 +415,8 @@ class TestComposeWithGpuConfigs:
             GpuModelConfig(
                 gpu_id=0,
                 model_name="Qwen/Qwen3-VL-8B-Instruct",
-                quant_method="gguf",
-                quant_level="Q4_K_M",
+                quant_method="awq",
+                quant_level="4bit",
             ),
         ]
         gen = ComposeFileGenerator(
@@ -433,7 +429,95 @@ class TestComposeWithGpuConfigs:
         )
         compose = gen.generate()
         assert "Per-GPU configs" in compose
-        assert "8B-Instruct:Q4_K_M" in compose
+        assert "8b-instruct:4bit" in compose
+
+
+class TestCaseInsensitiveHelpers:
+    """Test case-insensitive model/quant helper functions."""
+
+    def test_normalize_model_key(self):
+        assert normalize_model_key("8B-Instruct") == "8b-instruct"
+        assert normalize_model_key("4bit") == "4bit"
+        assert (
+            normalize_model_key("Qwen/Qwen3-VL-8B-Instruct")
+            == "qwen/qwen3-vl-8b-instruct"
+        )
+        assert normalize_model_key("") == ""
+        assert normalize_model_key("  8B-Instruct  ") == "8b-instruct"
+
+    def test_resolve_model_name_from_shortcut(self):
+        assert resolve_model_name("8b-instruct") == "Qwen/Qwen3-VL-8B-Instruct"
+        assert resolve_model_name("8B-Instruct") == "Qwen/Qwen3-VL-8B-Instruct"
+        assert resolve_model_name("8B-INSTRUCT") == "Qwen/Qwen3-VL-8B-Instruct"
+        assert resolve_model_name("2b-thinking") == "Qwen/Qwen3-VL-2B-Thinking"
+
+    def test_resolve_model_name_full(self):
+        assert (
+            resolve_model_name("Qwen/Qwen3-VL-8B-Instruct")
+            == "Qwen/Qwen3-VL-8B-Instruct"
+        )
+        assert (
+            resolve_model_name("qwen/qwen3-vl-8b-instruct")
+            == "Qwen/Qwen3-VL-8B-Instruct"
+        )
+
+    def test_resolve_model_name_unknown(self):
+        assert resolve_model_name("unknown/model") == "unknown/model"
+
+    def test_resolve_quant_level(self):
+        assert resolve_quant_level("4bit") == "4bit"
+        assert resolve_quant_level("4BIT") == "4bit"
+        assert resolve_quant_level("8bit") == "8bit"
+
+    def test_get_model_shortcut(self):
+        assert get_model_shortcut("Qwen/Qwen3-VL-8B-Instruct") == "8b-instruct"
+        assert get_model_shortcut("Qwen/Qwen3-VL-2B-Thinking") == "2b-thinking"
+
+    def test_get_display_shortcut(self):
+        assert get_display_shortcut("8b-instruct") == "8B-Instruct"
+        assert get_display_shortcut("2b-thinking") == "2B-Thinking"
+        assert get_display_shortcut("8B-Instruct") == "8B-Instruct"
+
+    def test_model_shortcuts_all_lowercase_keys(self):
+        for key in MODEL_SHORTCUTS:
+            assert (
+                key == key.lower()
+            ), f"MODEL_SHORTCUTS key '{key}' should be lowercase"
+
+    def test_awq_quant_levels_all_lowercase(self):
+        for level in AWQ_QUANT_LEVELS:
+            assert level == level.lower()
+
+    def test_parse_gpu_configs_case_insensitive(self):
+        configs1 = parse_gpu_configs("0:8B-Instruct:4bit")
+        configs2 = parse_gpu_configs("0:8b-instruct:4bit")
+        configs3 = parse_gpu_configs("0:8B-INSTRUCT:4BIT")
+        for cfg in [configs1[0], configs2[0], configs3[0]]:
+            assert cfg.model_name == "Qwen/Qwen3-VL-8B-Instruct"
+            assert cfg.quant_level == "4bit"
+
+    def test_gpu_model_config_normalizes_on_init(self):
+        gc = GpuModelConfig(
+            gpu_id=0,
+            model_name="8B-Instruct",
+            quant_method="AWQ",
+            quant_level="4BIT",
+        )
+        assert gc.model_name == "Qwen/Qwen3-VL-8B-Instruct"
+        assert gc.quant_method == "awq"
+        assert gc.quant_level == "4bit"
+
+    def test_gpu_model_config_display_shortcut(self):
+        gc = GpuModelConfig(gpu_id=0, model_name="Qwen/Qwen3-VL-8B-Instruct")
+        assert gc.display_shortcut == "8B-Instruct"
+
+    def test_gpu_model_config_display_label(self):
+        gc = GpuModelConfig(
+            gpu_id=0,
+            model_name="Qwen/Qwen3-VL-8B-Instruct",
+            quant_level="4bit",
+        )
+        assert gc.display_label == "8B-Instruct:4BIT"
 
 
 if __name__ == "__main__":

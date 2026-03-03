@@ -2,7 +2,7 @@
 
 ## Overview
 
-The `qvls` module deploys and manages **Qwen3-VL** vision-language models via **vLLM** in Docker containers. It supports multi-GPU load balancing across multiple machines with GGUF quantization for RTX 30/40 series GPUs.
+The `qvls` module deploys and manages **Qwen3-VL** vision-language models via **vLLM** in Docker containers. It supports multi-GPU load balancing across multiple machines with AWQ quantization for RTX 30/40 series GPUs.
 
 ## Prerequisites
 
@@ -25,8 +25,8 @@ qvl_client --help
 
 ## Supported Models
 
-| Model | Size | Type | VRAM (FP16) | VRAM (Q8) | VRAM (Q4) |
-|-------|------|------|------------|-----------|-----------|
+| Model | Size | Type | VRAM (FP16) | VRAM (AWQ-8bit) | VRAM (AWQ-4bit) |
+|-------|------|------|------------|-----------------|-----------------|
 | Qwen/Qwen3-VL-2B-Instruct | 2B | Instruct | ~5GB | ~3GB | ~2GB |
 | Qwen/Qwen3-VL-2B-Thinking | 2B | Thinking | ~5GB | ~3GB | ~2GB |
 | Qwen/Qwen3-VL-4B-Instruct | 4B | Instruct | ~9GB | ~5GB | ~3GB |
@@ -34,18 +34,19 @@ qvl_client --help
 | Qwen/Qwen3-VL-8B-Instruct | 8B | Instruct | ~17GB | ~10GB | ~6GB |
 | Qwen/Qwen3-VL-8B-Thinking | 8B | Thinking | ~17GB | ~10GB | ~6GB |
 
-### GGUF Quantized Models (from unsloth)
+### AWQ Quantized Models (from cyankiwi)
 
-All model variants are available in GGUF format with multiple quantization levels:
+Pre-quantized AWQ models are available from the `cyankiwi` organization on HuggingFace:
 
-- `unsloth/Qwen3-VL-2B-Instruct-GGUF`
-- `unsloth/Qwen3-VL-4B-Instruct-GGUF`
-- `unsloth/Qwen3-VL-8B-Instruct-GGUF`
-- `unsloth/Qwen3-VL-2B-Thinking-GGUF`
-- `unsloth/Qwen3-VL-4B-Thinking-GGUF`
-- `unsloth/Qwen3-VL-8B-Thinking-GGUF`
+- `cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit`
+- `cyankiwi/Qwen3-VL-2B-Thinking-AWQ-4bit`
+- `cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit`
+- `cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit`
+- `cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit`
+- `cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit`
+- `cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit`
 
-Quantization levels: **Q4_K_M** (recommended), Q5_K_M, Q6_K, Q8_0
+Quantization levels: **4bit** (recommended), 8bit
 
 ## Quick Start
 
@@ -58,45 +59,46 @@ docker pull vllm/vllm-openai:latest
 ### 2. Download Model
 
 ```bash
-# Using huggingface-cli (recommended)
-pip install huggingface_hub
-huggingface-cli download Qwen/Qwen3-VL-8B-Instruct
+# Using hf CLI (recommended)
+pip install "huggingface_hub[cli]"
+
+# Download AWQ model (recommended for RTX 30/40)
+hf download cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit
 
 # Or with Chinese mirror
-HF_ENDPOINT=https://hf-mirror.com huggingface-cli download Qwen/Qwen3-VL-8B-Instruct
-
-# For GGUF quantized model (default recommended)
-huggingface-cli download unsloth/Qwen3-VL-8B-Instruct-GGUF
-
-# Download specific GGUF quant file only
-huggingface-cli download unsloth/Qwen3-VL-8B-Instruct-GGUF \
-  Qwen3-VL-8B-Instruct-Q4_K_M.gguf
+HF_ENDPOINT=https://hf-mirror.com hf download cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit
 
 # Download multiple model variants for per-GPU deployment
-for model in 2B-Instruct 4B-Instruct 8B-Instruct 4B-Thinking 8B-Thinking; do
-  huggingface-cli download "unsloth/Qwen3-VL-${model}-GGUF"
-  huggingface-cli download "Qwen/Qwen3-VL-${model}"  # tokenizer
+for repo in \
+  cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit \
+  cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit \
+  cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit \
+  cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit \
+  cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit \
+  cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit; do
+  hf download "$repo"
 done
 ```
 
 ### 3. Deploy with Docker Compose
 
 ```bash
-# Start on all available GPUs (default: 8B-Instruct GGUF Q4_K_M)
+# Start on all available GPUs (default: 8B-Instruct AWQ 4bit)
 qvl_compose up
 
 # Start with specific model and quantization
-qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 
 # Start on specific GPUs
 qvl_compose up -g "0,1"
 
 # Per-GPU model/quant configuration (different models on different GPUs)
-qvl_compose up --gpu-configs "0:2B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"
+# Note: model shortcuts and quant levels are case-insensitive
+qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:8b-instruct:8bit"
 
 # Full 6-GPU deployment with different models
 qvl_compose up --gpu-configs \
-  "0:2B-Instruct:Q4_K_M,1:4B-Instruct:Q4_K_M,2:8B-Instruct:Q4_K_M,3:4B-Thinking:Q4_K_M,4:8B-Instruct:Q8_0,5:8B-Thinking:Q4_K_M"
+  "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:8bit,5:8b-thinking:8bit"
 
 # Check status
 qvl_compose ps
@@ -142,13 +144,13 @@ qvl_clients generate --endpoints http://localhost:29800 --prompt "Describe what 
 
 ### Machine 1 (2x GPU)
 ```bash
-qvl_compose up -g "0,1" -m "Qwen/Qwen3-VL-8B-Instruct" -q gguf
+qvl_compose up -g "0,1" -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 qvl_machine run
 ```
 
 ### Machine 2 (2x GPU, mixed models)
 ```bash
-qvl_compose up --gpu-configs "0:4B-Instruct:Q4_K_M,1:8B-Instruct:Q8_0"
+qvl_compose up --gpu-configs "0:4b-instruct:4bit,1:8b-instruct:8bit"
 qvl_machine run
 ```
 

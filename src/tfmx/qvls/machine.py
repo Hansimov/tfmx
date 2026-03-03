@@ -46,6 +46,7 @@ from typing import Optional, Union
 from webu import setup_swagger_ui
 
 from .compose import MAX_CONCURRENT_REQUESTS, MACHINE_PORT, SERVER_PORT
+from .compose import get_model_shortcut, get_display_shortcut, normalize_model_key
 from .router import QVLRouter, InstanceDescriptor, parse_model_spec
 
 
@@ -88,11 +89,11 @@ class InstanceInfo(BaseModel):
         "", description="Model name (e.g., Qwen/Qwen3-VL-8B-Instruct)"
     )
     quant_method: str = Field(
-        "", description="Quantization method (gguf, bitsandbytes, etc.)"
+        "", description="Quantization method (awq, bitsandbytes, etc.)"
     )
-    quant_level: str = Field("", description="Quantization level (Q4_K_M, Q8_0, etc.)")
+    quant_level: str = Field("", description="Quantization level (4bit, 8bit, etc.)")
     model_label: str = Field(
-        "", description="Short model label (e.g., 8B-Instruct:Q4_K_M)"
+        "", description="Short model label (e.g., 8B-Instruct:4bit)"
     )
 
 
@@ -162,11 +163,7 @@ class VLLMInstance:
         gpu_info = f"GPU{self.gpu_id}" if self.gpu_id is not None else "GPU?"
         model_info = ""
         if self.model_name:
-            from .compose import MODEL_SHORTCUT_REV
-
-            shortcut = MODEL_SHORTCUT_REV.get(
-                self.model_name, self.model_name.split("/")[-1]
-            )
+            shortcut = get_model_shortcut(self.model_name)
             quant = f":{self.quant_level}" if self.quant_level else ""
             model_info = f" [{shortcut}{quant}]"
         return (
@@ -175,11 +172,7 @@ class VLLMInstance:
         )
 
     def to_info(self) -> InstanceInfo:
-        from .compose import MODEL_SHORTCUT_REV
-
-        shortcut = MODEL_SHORTCUT_REV.get(
-            self.model_name, self.model_name.split("/")[-1] if self.model_name else ""
-        )
+        shortcut = get_model_shortcut(self.model_name)
         quant = f":{self.quant_level}" if self.quant_level else ""
         label = f"{shortcut}{quant}" if shortcut else ""
         return InstanceInfo(
@@ -554,8 +547,8 @@ class QVLMachineServer:
                         model_id = models_data[0].get("id", "")
                         inst.model_name = model_id
                         # Try to infer quant from model name
-                        if "GGUF" in model_id.upper():
-                            inst.quant_method = "gguf"
+                        if "AWQ" in model_id.upper():
+                            inst.quant_method = "awq"
                         logger.mesg(
                             f"[qvl_machine] {inst.container_name}: model={model_id}"
                         )

@@ -188,14 +188,14 @@ class TestInstanceInfo:
             gpu_id=0,
             healthy=True,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
-            quant_method="gguf",
-            quant_level="Q4_K_M",
-            model_label="8B-Instruct:Q4_K_M",
+            quant_method="awq",
+            quant_level="4bit",
+            model_label="8B-Instruct:4bit",
         )
         assert info.model_name == "Qwen/Qwen3-VL-8B-Instruct"
-        assert info.quant_method == "gguf"
-        assert info.quant_level == "Q4_K_M"
-        assert info.model_label == "8B-Instruct:Q4_K_M"
+        assert info.quant_method == "awq"
+        assert info.quant_level == "4bit"
+        assert info.model_label == "8B-Instruct:4bit"
 
     def test_from_dict(self):
         data = {
@@ -204,13 +204,13 @@ class TestInstanceInfo:
             "gpu_id": 0,
             "healthy": True,
             "model_name": "Qwen/Qwen3-VL-8B-Instruct",
-            "quant_method": "gguf",
-            "quant_level": "Q4_K_M",
-            "model_label": "8B-Instruct:Q4_K_M",
+            "quant_method": "awq",
+            "quant_level": "4bit",
+            "model_label": "8B-Instruct:4bit",
         }
         info = InstanceInfo.from_dict(data)
         assert info.model_name == "Qwen/Qwen3-VL-8B-Instruct"
-        assert info.model_label == "8B-Instruct:Q4_K_M"
+        assert info.model_label == "8B-Instruct:4bit"
 
     def test_from_dict_missing_model_fields(self):
         data = {

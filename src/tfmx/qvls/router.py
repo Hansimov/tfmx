@@ -8,16 +8,17 @@ Usage:
     router = QVLRouter()
     router.register(InstanceDescriptor(
         model_name="Qwen/Qwen3-VL-8B-Instruct",
-        quant_method="gguf", quant_level="Q4_K_M",
+        quant_method="awq", quant_level="4bit",
         endpoint="http://localhost:29880", gpu_id=0,
     ))
-    match = router.route(model="8B-Instruct", quant="Q4_K_M")
+    match = router.route(model="8B-Instruct", quant="4bit")
 """
 
 from dataclasses import dataclass, field
 from typing import Optional
 
-from .compose import MODEL_SHORTCUTS, MODEL_SHORTCUT_REV
+from .compose import MODEL_SHORTCUTS, MODEL_SHORTCUT_REV, AWQ_QUANT_LEVELS
+from .compose import normalize_model_key, get_model_shortcut, get_display_shortcut
 
 
 @dataclass
@@ -25,8 +26,8 @@ class InstanceDescriptor:
     """Describes a model/quant instance for routing."""
 
     model_name: str = ""  # Full HF name, e.g., "Qwen/Qwen3-VL-8B-Instruct"
-    quant_method: str = ""  # "gguf", "bitsandbytes", "awq", "none"
-    quant_level: str = ""  # "Q4_K_M", "Q8_0", etc.
+    quant_method: str = ""  # "awq", "bitsandbytes", "none"
+    quant_level: str = ""  # "4bit", "8bit", etc.
     endpoint: str = ""  # http://host:port
     gpu_id: int | None = None
     instance_id: str = ""  # Container name or unique ID
@@ -34,14 +35,12 @@ class InstanceDescriptor:
 
     @property
     def model_shortcut(self) -> str:
-        """Get model shortcut from full name."""
-        return MODEL_SHORTCUT_REV.get(
-            self.model_name, self.model_name.split("/")[-1] if self.model_name else ""
-        )
+        """Get lowercase model shortcut from full name."""
+        return get_model_shortcut(self.model_name)
 
     @property
     def label(self) -> str:
-        """Human-readable label."""
+        """Human-readable label (lowercase)."""
         shortcut = self.model_shortcut
         if self.quant_level:
             return f"{shortcut}:{self.quant_level}"
@@ -50,25 +49,23 @@ class InstanceDescriptor:
     def matches(self, model: str = "", quant: str = "") -> bool:
         """Check if this instance matches the given model/quant filter.
 
+        Case-insensitive matching for both model and quant.
+
         Args:
-            model: Model filter (shortcut like "8B-Instruct", full name, or empty)
-            quant: Quant level filter (e.g., "Q4_K_M", or empty)
+            model: Model filter (shortcut like "8b-instruct", full name, or empty)
+            quant: Quant level filter (e.g., "4bit", or empty)
 
         Returns:
             True if this instance matches the filter
         """
         if model:
-            # Check if model matches full name, shortcut, or partial
-            model_lower = model.lower()
-            if (
-                model != self.model_name
-                and model != self.model_shortcut
-                and model_lower != self.model_name.lower()
-                and model_lower != self.model_shortcut.lower()
-            ):
+            model_lower = normalize_model_key(model)
+            my_name_lower = self.model_name.lower()
+            my_shortcut_lower = self.model_shortcut.lower()
+            if model_lower != my_name_lower and model_lower != my_shortcut_lower:
                 return False
         if quant:
-            if quant.upper() != self.quant_level.upper():
+            if normalize_model_key(quant) != normalize_model_key(self.quant_level):
                 return False
         return True
 
@@ -89,27 +86,29 @@ class InstanceDescriptor:
 def parse_model_spec(model_field: str) -> tuple[str, str]:
     """Parse a model specification that may include quant info.
 
+    Case-insensitive. All outputs are lowercase.
+
     Formats:
-        "8B-Instruct"              -> ("8B-Instruct", "")
-        "8B-Instruct:Q4_K_M"      -> ("8B-Instruct", "Q4_K_M")
-        "Qwen/Qwen3-VL-8B-Instruct:Q8_0" -> ("Qwen/Qwen3-VL-8B-Instruct", "Q8_0")
+        "8b-instruct"              -> ("8b-instruct", "")
+        "8B-Instruct"              -> ("8b-instruct", "")
+        "8b-instruct:4bit"         -> ("8b-instruct", "4bit")
+        "8B-Instruct:8bit"         -> ("8b-instruct", "8bit")
+        "Qwen/Qwen3-VL-8B-Instruct:4bit" -> ("qwen/qwen3-vl-8b-instruct", "4bit")
         ""                         -> ("", "")
 
     Returns:
-        (model, quant) tuple
+        (model, quant) tuple, both lowercase
     """
     if not model_field:
         return ("", "")
 
     # Check for "model:quant" format
-    gguf_levels = {"Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"}
-
     if ":" in model_field:
         parts = model_field.rsplit(":", 1)
-        if parts[1].upper() in gguf_levels:
-            return (parts[0], parts[1].upper())
+        if normalize_model_key(parts[1]) in AWQ_QUANT_LEVELS:
+            return (normalize_model_key(parts[0]), normalize_model_key(parts[1]))
 
-    return (model_field, "")
+    return (normalize_model_key(model_field), "")
 
 
 class QVLRouter:
@@ -160,7 +159,7 @@ class QVLRouter:
 
         Args:
             model: Model filter (shortcut, full name, or empty for all)
-            quant: Quant level filter (e.g., "Q4_K_M", or empty for all)
+            quant: Quant level filter (e.g., "4bit", or empty for all)
 
         Returns:
             List of matching InstanceDescriptor objects
@@ -216,12 +215,10 @@ class QVLRouter:
         healthy = self.healthy_instances
         return healthy[0] if healthy else None
 
-    def route_from_model_field(
-        self, model_field: str
-    ) -> InstanceDescriptor | None:
+    def route_from_model_field(self, model_field: str) -> InstanceDescriptor | None:
         """Route based on a model field that may contain quant info.
 
-        Parses "8B-Instruct:Q4_K_M" format and routes accordingly.
+        Parses "8B-Instruct:4bit" format and routes accordingly.
         """
         model, quant = parse_model_spec(model_field)
         return self.route(model=model, quant=quant)
