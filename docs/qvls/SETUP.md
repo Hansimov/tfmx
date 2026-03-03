@@ -25,14 +25,14 @@ qvl_client --help
 
 ## Supported Models
 
-| Model | Size | Type | VRAM (FP16) | VRAM (AWQ-8bit) | VRAM (AWQ-4bit) |
-|-------|------|------|------------|-----------------|-----------------|
-| Qwen/Qwen3-VL-2B-Instruct | 2B | Instruct | ~5GB | ~3GB | ~2GB |
-| Qwen/Qwen3-VL-2B-Thinking | 2B | Thinking | ~5GB | ~3GB | ~2GB |
-| Qwen/Qwen3-VL-4B-Instruct | 4B | Instruct | ~9GB | ~5GB | ~3GB |
-| Qwen/Qwen3-VL-4B-Thinking | 4B | Thinking | ~9GB | ~5GB | ~3GB |
-| Qwen/Qwen3-VL-8B-Instruct | 8B | Instruct | ~17GB | ~10GB | ~6GB |
-| Qwen/Qwen3-VL-8B-Thinking | 8B | Thinking | ~17GB | ~10GB | ~6GB |
+| Model | Size | Type | VRAM (FP16) | VRAM (AWQ-4bit) |
+|-------|------|------|------------|------------------|
+| Qwen/Qwen3-VL-2B-Instruct | 2B | Instruct | ~5GB | ~2GB |
+| Qwen/Qwen3-VL-2B-Thinking | 2B | Thinking | ~5GB | ~2GB |
+| Qwen/Qwen3-VL-4B-Instruct | 4B | Instruct | ~9GB | ~3GB |
+| Qwen/Qwen3-VL-4B-Thinking | 4B | Thinking | ~9GB | ~3GB |
+| Qwen/Qwen3-VL-8B-Instruct | 8B | Instruct | ~17GB | ~6GB |
+| Qwen/Qwen3-VL-8B-Thinking | 8B | Thinking | ~17GB | ~6GB |
 
 ### AWQ Quantized Models (from cyankiwi)
 
@@ -43,10 +43,9 @@ Pre-quantized AWQ models are available from the `cyankiwi` organization on Huggi
 - `cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit`
 - `cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit`
 - `cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit`
-- `cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit`
-- `cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit`
+- `cyankiwi/Qwen3-VL-8B-Thinking-AWQ-4bit`
 
-Quantization levels: **4bit** (recommended), 8bit
+Quantization level: **4bit**
 
 ## Quick Start
 
@@ -71,11 +70,11 @@ HF_ENDPOINT=https://hf-mirror.com hf download cyankiwi/Qwen3-VL-8B-Instruct-AWQ-
 # Download multiple model variants for per-GPU deployment
 for repo in \
   cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit \
+  cyankiwi/Qwen3-VL-2B-Thinking-AWQ-4bit \
   cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit \
   cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit \
   cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit \
-  cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit \
-  cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit; do
+  cyankiwi/Qwen3-VL-8B-Thinking-AWQ-4bit; do
   hf download "$repo"
 done
 ```
@@ -94,11 +93,11 @@ qvl_compose up -g "0,1"
 
 # Per-GPU model/quant configuration (different models on different GPUs)
 # Note: model shortcuts and quant levels are case-insensitive
-qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:8b-instruct:8bit"
+qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:4b-instruct:4bit"
 
 # Full 6-GPU deployment with different models
 qvl_compose up --gpu-configs \
-  "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:8bit,5:8b-thinking:8bit"
+  "0:2b-instruct:4bit,1:2b-thinking:4bit,2:4b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:4bit,5:8b-thinking:4bit"
 
 # Check status
 qvl_compose ps
@@ -150,7 +149,7 @@ qvl_machine run
 
 ### Machine 2 (2x GPU, mixed models)
 ```bash
-qvl_compose up --gpu-configs "0:4b-instruct:4bit,1:8b-instruct:8bit"
+qvl_compose up --gpu-configs "0:4b-instruct:4bit,1:8b-instruct:4bit"
 qvl_machine run
 ```
 

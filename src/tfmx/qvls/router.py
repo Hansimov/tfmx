@@ -27,7 +27,7 @@ class InstanceDescriptor:
 
     model_name: str = ""  # Full HF name, e.g., "Qwen/Qwen3-VL-8B-Instruct"
     quant_method: str = ""  # "awq", "bitsandbytes", "none"
-    quant_level: str = ""  # "4bit", "8bit", etc.
+    quant_level: str = ""  # "4bit", etc.
     endpoint: str = ""  # http://host:port
     gpu_id: int | None = None
     instance_id: str = ""  # Container name or unique ID
@@ -92,7 +92,7 @@ def parse_model_spec(model_field: str) -> tuple[str, str]:
         "8b-instruct"              -> ("8b-instruct", "")
         "8B-Instruct"              -> ("8b-instruct", "")
         "8b-instruct:4bit"         -> ("8b-instruct", "4bit")
-        "8B-Instruct:8bit"         -> ("8b-instruct", "8bit")
+        "8B-Instruct:4bit"         -> ("8b-instruct", "4bit")
         "Qwen/Qwen3-VL-8B-Instruct:4bit" -> ("qwen/qwen3-vl-8b-instruct", "4bit")
         ""                         -> ("", "")
 

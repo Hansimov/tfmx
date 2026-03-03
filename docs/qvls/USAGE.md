@@ -20,11 +20,11 @@ qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 qvl_compose up -g "0,1"
 
 # Per-GPU model/quant config (different models on different GPUs)
-qvl_compose up --gpu-configs "0:2b-instruct:4bit,1:8b-instruct:8bit"
+qvl_compose up --gpu-configs "0:2b-instruct:4bit,1:8b-instruct:4bit"
 
 # Full 6-GPU deployment
 qvl_compose up --gpu-configs \
-  "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:8bit,5:8b-thinking:8bit"
+  "0:2b-instruct:4bit,1:2b-thinking:4bit,2:4b-instruct:4bit,3:4b-thinking:4bit,4:8b-instruct:4bit,5:8b-thinking:4bit"
 
 # Custom port base (default: 29880)
 qvl_compose up -p 29890
@@ -56,7 +56,7 @@ The `--gpu-configs` argument uses the format `GPU_ID:MODEL_SHORTCUT:QUANT_LEVEL,
 
 Model shortcuts (case-insensitive): `2b-instruct`, `2b-thinking`, `4b-instruct`, `4b-thinking`, `8b-instruct`, `8b-thinking`
 
-Quant levels (case-insensitive): `4bit` (default), `8bit`
+Quant levels (case-insensitive): `4bit` (default)
 
 ### qvl_machine
 
@@ -293,7 +293,7 @@ configs = [
     GpuModelConfig(gpu_id=0, model_name="Qwen/Qwen3-VL-2B-Instruct",
                    quant_method="awq", quant_level="4bit"),
     GpuModelConfig(gpu_id=1, model_name="Qwen/Qwen3-VL-8B-Instruct",
-                   quant_method="awq", quant_level="8bit"),
+                   quant_method="awq", quant_level="4bit"),
 ]
 composer = QVLComposer(gpu_configs=configs)
 composer.generate_compose_file()  # Generate YAML only
@@ -360,19 +360,19 @@ router.register(InstanceDescriptor(
 ))
 router.register(InstanceDescriptor(
     model_name="Qwen/Qwen3-VL-8B-Instruct",
-    quant_method="awq", quant_level="8bit",
+    quant_method="awq", quant_level="4bit",
     endpoint="http://localhost:29881", gpu_id=1,
 ))
 
 # Route by model (case-insensitive)
-match = router.route(model="8b-instruct", quant="8bit")
+match = router.route(model="8b-instruct", quant="4bit")
 print(f"Routed to: {match.endpoint}")
 
 # Route from model field (parses "model:quant" format)
 match = router.route_from_model_field("2b-instruct:4bit")
 
 # Available models
-print(router.get_available_models())  # ["2b-instruct:4bit", "8b-instruct:8bit"]
+print(router.get_available_models())  # ["2b-instruct:4bit", "8b-instruct:4bit"]
 ```
 
 ### Machine Server (Programmatic)

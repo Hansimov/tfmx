@@ -91,7 +91,7 @@ class InstanceInfo(BaseModel):
     quant_method: str = Field(
         "", description="Quantization method (awq, bitsandbytes, etc.)"
     )
-    quant_level: str = Field("", description="Quantization level (4bit, 8bit, etc.)")
+    quant_level: str = Field("", description="Quantization level (4bit)")
     model_label: str = Field(
         "", description="Short model label (e.g., 8B-Instruct:4bit)"
     )
@@ -609,7 +609,18 @@ class QVLMachineServer:
             instance._active_requests += 1
 
             try:
-                # Forward pre-read body to vLLM
+                # Rewrite model name to match vLLM's actual model name
+                # (proxy accepts short names like "2b-instruct:4bit" but vLLM
+                #  needs the full HF repo name from its /v1/models endpoint)
+                if instance.model_name:
+                    try:
+                        req_data = orjson.loads(body)
+                        req_data["model"] = instance.model_name
+                        body = orjson.dumps(req_data)
+                    except Exception:
+                        pass
+
+                # Forward to vLLM
                 resp = await self._client.post(
                     instance.chat_url,
                     content=body,

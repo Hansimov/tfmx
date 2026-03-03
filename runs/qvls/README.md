@@ -48,8 +48,8 @@ bash runs/qvls/99_cleanup.sh
 | GPU | Mixed Deploy | Uniform Deploy |
 |-----|-------------|----------------|
 | 0 | 2b-instruct:4bit | 4b-instruct:4bit |
-| 1 | 4b-instruct:4bit | 4b-instruct:4bit |
-| 2 | 8b-instruct:4bit | 4b-instruct:4bit |
+| 1 | 2b-thinking:4bit | 4b-instruct:4bit |
+| 2 | 4b-instruct:4bit | 4b-instruct:4bit |
 | 3 | 4b-thinking:4bit | 4b-instruct:4bit |
-| 4 | 8b-instruct:8bit | 4b-instruct:4bit |
-| 5 | 8b-thinking:8bit | 4b-instruct:4bit |
+| 4 | 8b-instruct:4bit | 4b-instruct:4bit |
+| 5 | 8b-thinking:4bit | 4b-instruct:4bit |

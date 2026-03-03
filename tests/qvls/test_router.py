@@ -76,7 +76,7 @@ class TestInstanceDescriptor:
             quant_level="4bit",
         )
         assert desc.matches(quant="4bit") is True
-        assert desc.matches(quant="8bit") is False
+        assert desc.matches(quant="none") is False
 
     def test_matches_quant_case_insensitive(self):
         desc = InstanceDescriptor(
@@ -91,7 +91,7 @@ class TestInstanceDescriptor:
             quant_level="4bit",
         )
         assert desc.matches(model="8B-Instruct", quant="4bit") is True
-        assert desc.matches(model="8B-Instruct", quant="8bit") is False
+        assert desc.matches(model="8B-Instruct", quant="none") is False
         assert desc.matches(model="4B-Instruct", quant="4bit") is False
 
     def test_to_dict(self):
@@ -143,12 +143,12 @@ class TestParseModelSpec:
         assert quant == "4bit"
 
     def test_full_name_with_quant(self):
-        model, quant = parse_model_spec("Qwen/Qwen3-VL-8B-Instruct:8bit")
+        model, quant = parse_model_spec("Qwen/Qwen3-VL-8B-Instruct:4bit")
         assert model == "qwen/qwen3-vl-8b-instruct"
-        assert quant == "8bit"
+        assert quant == "4bit"
 
     def test_quant_levels(self):
-        for level in ["4bit", "8bit", "4BIT", "8BIT"]:
+        for level in ["4bit", "4BIT"]:
             model, quant = parse_model_spec(f"8B-Instruct:{level}")
             assert quant == level.lower()
 
@@ -189,9 +189,9 @@ class TestQVLRouter:
                 instance_id="qvl--gpu2",
             ),
             InstanceDescriptor(
-                model_name="Qwen/Qwen3-VL-8B-Instruct",
+                model_name="Qwen/Qwen3-VL-8B-Thinking",
                 quant_method="awq",
-                quant_level="8bit",
+                quant_level="4bit",
                 endpoint="http://localhost:29883",
                 gpu_id=3,
                 instance_id="qvl--gpu3",
@@ -234,7 +234,7 @@ class TestQVLRouter:
         for d in self._make_descriptors():
             router.register(d)
         found = router.find_instances(model="8B-Instruct")
-        assert len(found) == 2
+        assert len(found) == 1
         for f in found:
             assert f.model_name == "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -242,9 +242,10 @@ class TestQVLRouter:
         router = QVLRouter()
         for d in self._make_descriptors():
             router.register(d)
-        found = router.find_instances(quant="8bit")
-        assert len(found) == 1
-        assert found[0].quant_level == "8bit"
+        found = router.find_instances(quant="4bit")
+        assert len(found) == 4
+        for f in found:
+            assert f.quant_level == "4bit"
 
     def test_find_instances_by_model_and_quant(self):
         router = QVLRouter()
@@ -273,7 +274,7 @@ class TestQVLRouter:
         router = QVLRouter()
         for d in self._make_descriptors():
             router.register(d)
-        result = router.route(model="8B-Instruct", quant="8bit")
+        result = router.route(model="8B-Thinking", quant="4bit")
         assert result.gpu_id == 3
 
     def test_route_no_match_falls_back(self):
@@ -299,7 +300,7 @@ class TestQVLRouter:
         router = QVLRouter()
         for d in self._make_descriptors():
             router.register(d)
-        result = router.route_from_model_field("8B-Instruct:8bit")
+        result = router.route_from_model_field("8B-Thinking:4bit")
         assert result.gpu_id == 3
 
     def test_route_from_model_field_no_quant(self):
@@ -323,7 +324,7 @@ class TestQVLRouter:
         for d in descs:
             router.register(d)
         assert router.default_instance == descs[0]
-        success = router.set_default(model="8B-Instruct", quant="8bit")
+        success = router.set_default(model="8B-Thinking", quant="4bit")
         assert success is True
         assert router.default_instance.gpu_id == 3
 
@@ -358,8 +359,8 @@ class TestQVLRouter:
             router.register(d)
         models = router.get_available_models()
         assert "2b-instruct:4bit" in models
-        assert "8b-instruct:8bit" in models
-        assert len(models) == 4  # 2B/4B/8B 4bit + 8B 8bit
+        assert "8b-thinking:4bit" in models
+        assert len(models) == 4  # 2B/4B/8B-instruct + 8B-thinking
 
     def test_repr(self):
         router = QVLRouter()

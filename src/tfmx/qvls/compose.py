@@ -46,8 +46,8 @@ Examples:
   qvl_compose logs -f               # Follow logs in real-time
   qvl_compose logs --tail 200       # Show last 200 lines
 
-  # Per-GPU model/quant config (AWQ bit depths)
-  qvl_compose up --gpu-configs "0:2b-instruct:4bit,1:8b-instruct:8bit"
+  # Per-GPU model/quant config (AWQ 4bit)
+  qvl_compose up --gpu-configs "0:2b-instruct:4bit,1:8b-instruct:4bit"
 
 Supported Models:
   - Qwen/Qwen3-VL-2B-Instruct      (2B parameters, instruction-tuned)
@@ -58,7 +58,7 @@ Supported Models:
   - Qwen/Qwen3-VL-8B-Thinking      (8B parameters, thinking mode)
 
 Quantization Options (for RTX 30/40 series):
-  - awq:          AWQ quantization from cyankiwi (4bit, 8bit)
+  - awq:          AWQ quantization from cyankiwi (4bit)
   - bitsandbytes: BitsAndBytes 4-bit quantization
   - none:         No quantization (requires more VRAM)
 
@@ -138,16 +138,15 @@ SUPPORTED_MODELS = {
     },
 }
 
-# AWQ quantized variants from cyankiwi
-# Format: cyankiwi/Qwen3-VL-{size}{type}-AWQ-{bits}bit
+# AWQ quantized variants from cyankiwi (4bit only)
+# Format: cyankiwi/Qwen3-VL-{size}-{type}-AWQ-4bit
 AWQ_MODELS = {
     "cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit": "Qwen/Qwen3-VL-2B-Instruct",
     "cyankiwi/Qwen3-VL-2B-Thinking-AWQ-4bit": "Qwen/Qwen3-VL-2B-Thinking",
     "cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit": "Qwen/Qwen3-VL-4B-Instruct",
     "cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit": "Qwen/Qwen3-VL-4B-Thinking",
     "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit": "Qwen/Qwen3-VL-8B-Instruct",
-    "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit": "Qwen/Qwen3-VL-8B-Instruct",
-    "cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit": "Qwen/Qwen3-VL-8B-Thinking",
+    "cyankiwi/Qwen3-VL-8B-Thinking-AWQ-4bit": "Qwen/Qwen3-VL-8B-Thinking",
 }
 
 # Model shortcuts: size-type → full HF model name
@@ -177,11 +176,10 @@ _DISPLAY_SHORTCUTS = {
 }
 
 # Base model → AWQ repo mapping: (shortcut, quant_level) → cyankiwi repo
-# Uses _DISPLAY_SHORTCUTS to generate display-cased repo names
+# Uses _DISPLAY_SHORTCUTS to generate display-cased repo names (4bit only)
 AWQ_REPO_MAP = {
-    (shortcut, level): f"cyankiwi/Qwen3-VL-{_DISPLAY_SHORTCUTS[shortcut]}-AWQ-{level}"
+    (shortcut, "4bit"): f"cyankiwi/Qwen3-VL-{_DISPLAY_SHORTCUTS[shortcut]}-AWQ-4bit"
     for shortcut in MODEL_SHORTCUTS
-    for level in ("4bit", "8bit")
 }
 
 # Default AWQ configuration (all lowercase for consistency)
@@ -189,7 +187,7 @@ DEFAULT_QUANT_METHOD = "awq"
 DEFAULT_QUANT_LEVEL = "4bit"
 
 # Known AWQ quant levels (lowercase)
-AWQ_QUANT_LEVELS = {"4bit", "8bit"}
+AWQ_QUANT_LEVELS = {"4bit"}
 
 
 def normalize_model_key(key: str) -> str:
@@ -229,7 +227,7 @@ def resolve_quant_level(level: str) -> str:
 
     Examples:
         resolve_quant_level("4bit") -> "4bit"
-        resolve_quant_level("8BIT") -> "8bit"
+        resolve_quant_level("4BIT") -> "4bit"
     """
     return normalize_model_key(level)
 
@@ -237,8 +235,11 @@ def resolve_quant_level(level: str) -> str:
 def get_model_shortcut(model_name: str) -> str:
     """Get the lowercase shortcut for a model name.
 
+    Supports both original HF names and AWQ cyankiwi repo names.
+
     Examples:
         get_model_shortcut("Qwen/Qwen3-VL-8B-Instruct") -> "8b-instruct"
+        get_model_shortcut("cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit") -> "8b-instruct"
     """
     result = MODEL_SHORTCUT_REV.get(model_name)
     if result:
@@ -247,6 +248,19 @@ def get_model_shortcut(model_name: str) -> str:
     result = MODEL_SHORTCUT_REV_LOWER.get(model_name.lower())
     if result:
         return result
+    # Try AWQ model name → base model → shortcut
+    base_model = AWQ_MODELS.get(model_name)
+    if base_model:
+        result = MODEL_SHORTCUT_REV.get(base_model)
+        if result:
+            return result
+    # Case-insensitive AWQ lookup
+    name_lower = model_name.lower()
+    for awq_name, base in AWQ_MODELS.items():
+        if awq_name.lower() == name_lower:
+            result = MODEL_SHORTCUT_REV.get(base)
+            if result:
+                return result
     # Fallback: extract from full name
     parts = model_name.split("/")[-1] if model_name else ""
     return parts.lower()
@@ -325,7 +339,7 @@ class GpuModelConfig:
 
         For AWQ models, returns the cyankiwi AWQ repo name
         (e.g. ``cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit``).
-        vLLM natively supports AWQ via ``--quantization awq``.
+        vLLM auto-detects ``compressed-tensors`` from the model config.
         """
         if self.quant_method == "awq":
             repo = self.awq_repo
@@ -362,7 +376,7 @@ def parse_gpu_configs(config_str: str) -> list[GpuModelConfig]:
     """Parse per-GPU model/quant configs from CLI string.
 
     Format: "GPU_ID:MODEL_SHORTCUT:QUANT_LEVEL,..."
-    Example: "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:8bit"
+    Example: "0:2b-instruct:4bit,1:4b-instruct:4bit,2:8b-instruct:4bit"
 
     Case-insensitive: '8B-Instruct' and '8b-instruct' are equivalent.
     If QUANT_LEVEL is omitted, defaults to 4bit.
@@ -725,11 +739,13 @@ class ComposeFileGenerator:
         """Get model config for a specific GPU."""
         if gpu.index in self._gpu_config_map:
             return self._gpu_config_map[gpu.index]
+        quant_method = self.quantization or DEFAULT_QUANT_METHOD
+        quant_level = DEFAULT_QUANT_LEVEL if quant_method == "awq" else ""
         return GpuModelConfig(
             gpu_id=gpu.index,
             model_name=self.model_name,
-            quant_method=self.quantization or DEFAULT_QUANT_METHOD,
-            quant_level=DEFAULT_QUANT_LEVEL if self.quantization == "awq" else "",
+            quant_method=quant_method,
+            quant_level=quant_level,
         )
 
     def generate(self) -> str:
@@ -899,13 +915,8 @@ class ComposeFileGenerator:
                         f"      - bitsandbytes",
                     ]
                 )
-            elif quant == "awq":
-                lines.extend(
-                    [
-                        f"      - --quantization",
-                        f"      - awq",
-                    ]
-                )
+            # AWQ (cyankiwi models): vLLM auto-detects from model config.json
+            # (quant_method=compressed-tensors), no --quantization flag needed.
 
         # HuggingFace token
         if self.hf_token:
@@ -1310,7 +1321,7 @@ class QVLComposeArgParser:
             help=(
                 "Per-GPU model/quant configs. "
                 'Format: "GPU:MODEL:QUANT,...". '
-                'Example: "0:2B-Instruct:4bit,1:8B-Instruct:8bit"'
+                'Example: "0:2B-Instruct:4bit,1:8B-Instruct:4bit"'
             ),
         )
 

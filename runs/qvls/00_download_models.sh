@@ -4,13 +4,13 @@
 #
 # Models needed:
 #   GPU 0: 2b-instruct:4bit   (cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit)
-#   GPU 1: 4b-instruct:4bit   (cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit)
-#   GPU 2: 8b-instruct:4bit   (cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit)
+#   GPU 1: 2b-thinking:4bit   (cyankiwi/Qwen3-VL-2B-Thinking-AWQ-4bit)
+#   GPU 2: 4b-instruct:4bit   (cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit)
 #   GPU 3: 4b-thinking:4bit   (cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit)
-#   GPU 4: 8b-instruct:8bit   (cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit)
-#   GPU 5: 8b-thinking:8bit   (cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit)
+#   GPU 4: 8b-instruct:4bit   (cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit)
+#   GPU 5: 8b-thinking:4bit   (cyankiwi/Qwen3-VL-8B-Thinking-AWQ-4bit)
 #
-# AWQ models are complete HF repos — vLLM serves them natively with --quantization awq
+# AWQ models are complete HF repos — vLLM auto-detects compressed-tensors quantization
 set -euo pipefail
 
 # Use HF mirror for China
@@ -19,11 +19,11 @@ echo "Using HF_ENDPOINT=$HF_ENDPOINT"
 
 AWQ_REPOS=(
     "cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit"
+    "cyankiwi/Qwen3-VL-2B-Thinking-AWQ-4bit"
     "cyankiwi/Qwen3-VL-4B-Instruct-AWQ-4bit"
     "cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit"
     "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
-    "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit"
-    "cyankiwi/Qwen3-VL-8B-Thinking-AWQ-8bit"
+    "cyankiwi/Qwen3-VL-8B-Thinking-AWQ-4bit"
 )
 
 echo "=== Downloading AWQ models ==="

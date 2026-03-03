@@ -5,7 +5,7 @@
 All model shortcuts and quant levels are **case-insensitive** internally. The convention is to use **lowercase** everywhere:
 
 - Model shortcuts: `2b-instruct`, `4b-thinking`, `8b-instruct`, etc.
-- Quant levels: `4bit`, `8bit`
+- Quant levels: `4bit`
 
 Inputs in any casing are accepted (`8B-Instruct`, `8b-instruct`, `8B-INSTRUCT` all resolve the same way). Display-facing labels use original casing (e.g., `8B-Instruct:4bit`) via `get_display_shortcut()`.
 
@@ -16,12 +16,12 @@ Inputs in any casing are accepted (`8B-Instruct`, `8b-instruct`, `8B-INSTRUCT` a
 | GPU | VRAM | Recommended Setup |
 |-----|------|-------------------|
 | RTX 3060 | 12GB | 8B-AWQ-4bit or 4B-FP16 |
-| RTX 3070 | 8GB | 4B-AWQ-8bit or 2B-FP16 |
+| RTX 3070 | 8GB | 4B-AWQ-4bit or 2B-FP16 |
 | RTX 3080 | 10-12GB | 8B-AWQ-4bit or 4B-FP16 |
-| RTX 3090 | 24GB | 8B-FP16 or 8B-AWQ-8bit |
-| RTX 4060 | 8GB | 4B-AWQ-8bit or 2B-FP16 |
+| RTX 3090 | 24GB | 8B-FP16 or 8B-AWQ-4bit |
+| RTX 4060 | 8GB | 4B-AWQ-4bit or 2B-FP16 |
 | RTX 4070 | 12GB | 8B-AWQ-4bit or 4B-FP16 |
-| RTX 4080 | 16GB | 8B-AWQ-8bit |
+| RTX 4080 | 16GB | 8B-AWQ-4bit |
 | RTX 4090 | 24GB | 8B-FP16 |
 
 ### Quantization Methods
@@ -30,12 +30,21 @@ Inputs in any casing are accepted (`8B-Instruct`, `8b-instruct`, `8B-INSTRUCT` a
 - **BitsAndBytes** (`-q bitsandbytes`): Good balance. Requires bitsandbytes in container.
 - **None** (default): Full FP16 precision. Requires most VRAM.
 
+> **IMPORTANT: compressed-tensors quant format**
+>
+> The `cyankiwi` AWQ models use `quant_method: "compressed-tensors"` in their
+> `config.json`, **NOT** `"awq"`. vLLM auto-detects this from the model config
+> and uses `CompressedTensorsWNA16` with MarlinLinearKernel internally.
+> **Do NOT pass `--quantization awq`** to vLLM — it will cause a
+> `ValidationError` (mismatch between config's `compressed-tensors` and the
+> `awq` flag). The compose module handles this automatically.
+
 ```bash
 # AWQ quantization (recommended for RTX 30 series)
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q awq
 
-# Per-GPU AWQ bit depths
-qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:8b-instruct:8bit"
+# Per-GPU AWQ 4bit deployment
+qvl_compose up --gpu-configs "0:8b-instruct:4bit,1:4b-instruct:4bit"
 
 # BitsAndBytes 4-bit
 qvl_compose up -m "Qwen/Qwen3-VL-8B-Instruct" -q bitsandbytes
@@ -68,6 +77,34 @@ For Chinese users, HuggingFace mirror is configured by default:
 ```
 
 ## Troubleshooting
+
+### Benchmark Results (RTX 3080 20GB, AWQ 4bit, vLLM 0.16.0)
+
+Single-request latency (256 tokens, text-only, temperature 0.1):
+
+| Model | Latency | tok/s | Notes |
+|-------|---------|-------|-------|
+| 2B-Instruct:4bit | 790ms | 239.7 | Fastest, good for simple tasks |
+| 2B-Thinking:4bit | 990ms | 258.8 | Thinking overhead, max tokens hit |
+| 4B-Instruct:4bit | 1220ms | 155.3 | Good balance of quality & speed |
+| 4B-Thinking:4bit | 1620ms | 158.0 | Balanced with reasoning |
+| 8B-Thinking:4bit | 2450ms | 104.6 | Highest quality, slowest |
+
+Concurrent throughput (5 GPUs mixed, 25 requests, concurrency 5):
+- **836 tok/s** aggregate across 5 GPUs (mixed 2B/4B/8B models)
+- Average 128 tok/req, 6.5 req/s
+
+High-throughput benchmark (4 GPUs uniform, 100 requests via `qvl_benchmark`):
+- **1,450 tok/s** aggregate (128 max tokens, text-only, async pipeline)
+- **11.3 req/s** throughput
+- Average latency: 88ms per request (pipeline-batched)
+- 100% success rate (100/100)
+
+Memory usage (with TEI colocated, `--gpu-memory-utilization 0.85`):
+- 2B models: ~17.5 GB / 20 GB
+- 4B models: ~17.0 GB / 20 GB
+- 8B models: ~17.5 GB / 20 GB (AWQ 4bit fits on 20GB)
+- TEI baseline: ~1.4 GB per GPU
 
 ### Container Won't Start
 
@@ -120,11 +157,11 @@ In a multi-GPU deployment, each GPU can run a different model variant. This enab
 Example 6-GPU deployment:
 ```
 GPU 0: 2b-instruct (4bit) — Fast, low quality
-GPU 1: 4b-instruct (4bit) — Balanced
-GPU 2: 8b-instruct (4bit) — High quality
-GPU 3: 4b-thinking (4bit) — Reasoning tasks
-GPU 4: 8b-instruct (8bit) — Highest quality
-GPU 5: 8b-thinking (8bit) — Reasoning, high quality
+GPU 1: 2b-thinking (4bit) — Fast, reasoning
+GPU 2: 4b-instruct (4bit) — Balanced
+GPU 3: 4b-thinking (4bit) — Balanced, reasoning
+GPU 4: 8b-instruct (4bit) — High quality
+GPU 5: 8b-thinking (4bit) — High quality, reasoning
 ```
 
 ### Model-Aware Routing
@@ -132,12 +169,20 @@ GPU 5: 8b-thinking (8bit) — Reasoning, high quality
 The machine proxy (`qvl_machine`) includes a router that:
 1. Discovers which model each vLLM instance is running
 2. Routes requests to matching instances based on `model` field
-3. Falls back to any available instance if no match
+3. **Rewrites the model name** in the request body to match vLLM's actual model name
+4. Falls back to any available instance if no match
 
 Request routing formats:
-- `model="8b-instruct"` → any 8B-Instruct instance
-- `model="8b-instruct:8bit"` → specific quant level
-- `model=""` → default/any idle instance
+- `model="8b-instruct"` → any 8B-Instruct instance (name rewritten to full HF repo)
+- `model="8b-instruct:4bit"` → specific quant level
+- `model=""` → default/any idle instance (round-robin)
+
+> **AWQ Model Name Shortcut Resolution**
+>
+> `get_model_shortcut()` resolves both original HF names (`Qwen/Qwen3-VL-8B-Instruct`)
+> and AWQ cyankiwi names (`cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit`) to the same
+> shortcut (`8b-instruct`). This enables the router to match requests by shortcut
+> regardless of which model name format vLLM reports.
 
 ### Benchmark Images
 

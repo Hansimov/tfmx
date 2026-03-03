@@ -37,6 +37,16 @@ class TestPackageImports:
         assert TEIComposer is not None
         assert TEIClient is not None
 
+    def test_import_qvls_module(self):
+        from tfmx.qvls import QVLComposer, QVLComposeArgParser
+        from tfmx.qvls import QVLClient, AsyncQVLClient
+        from tfmx.qvls import QVLRouter, InstanceDescriptor
+        from tfmx.qvls import QVLMachineServer, VLLMInstance
+        from tfmx.qvls import QVLBenchmark, BenchmarkMetrics
+
+        assert QVLComposer is not None
+        assert QVLClient is not None
+
     def test_import_from_root(self):
         """All public APIs should also be importable from root tfmx"""
         from tfmx import TEIClient, TEIClients, TEIClientsWithStats
@@ -62,6 +72,16 @@ class TestPackageImports:
         from tfmx.teis import benchmark, benchtext
 
         assert client is not None
+
+    def test_qvls_submodules(self):
+        """QVL submodule files should be importable"""
+        from tfmx.qvls import client, clients, compose, scheduler
+        from tfmx.qvls import perf_tracker, performance
+        from tfmx.qvls import benchmark, benchimgs
+        from tfmx.qvls import router, machine
+
+        assert client is not None
+        assert router is not None
 
     def test_utils_submodules(self):
         """Utils submodule files should be importable"""
@@ -117,6 +137,25 @@ class TestModuleStructure:
         assert (teis_dir / "clients_core.py").exists()
         assert (teis_dir / "clients_cli.py").exists()
         assert (teis_dir / "clients_stats.py").exists()
+
+    def test_qvls_directory_exists(self):
+        import tfmx.qvls
+        from pathlib import Path
+
+        qvls_dir = Path(tfmx.qvls.__file__).parent
+        assert (qvls_dir / "client.py").exists()
+        assert (qvls_dir / "clients.py").exists()
+        assert (qvls_dir / "compose.py").exists()
+        assert (qvls_dir / "scheduler.py").exists()
+        assert (qvls_dir / "machine.py").exists()
+        assert (qvls_dir / "perf_tracker.py").exists()
+        assert (qvls_dir / "performance.py").exists()
+        assert (qvls_dir / "benchmark.py").exists()
+        assert (qvls_dir / "benchimgs.py").exists()
+        assert (qvls_dir / "clients_core.py").exists()
+        assert (qvls_dir / "clients_cli.py").exists()
+        assert (qvls_dir / "clients_stats.py").exists()
+        assert (qvls_dir / "router.py").exists()
 
     def test_utils_directory_exists(self):
         import tfmx.utils

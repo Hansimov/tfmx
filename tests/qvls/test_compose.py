@@ -207,9 +207,7 @@ class TestAWQMappings:
 
     def test_awq_repo_map_covers_all_shortcuts(self):
         for shortcut in MODEL_SHORTCUTS:
-            assert (shortcut, "4bit") in AWQ_REPO_MAP or (
-                shortcut, "8bit"
-            ) in AWQ_REPO_MAP, f"{shortcut} not in AWQ_REPO_MAP"
+            assert (shortcut, "4bit") in AWQ_REPO_MAP, f"{shortcut} not in AWQ_REPO_MAP"
 
     def test_awq_repo_map_values(self):
         for key, repo in AWQ_REPO_MAP.items():
@@ -218,8 +216,7 @@ class TestAWQMappings:
 
     def test_awq_quant_levels(self):
         assert "4bit" in AWQ_QUANT_LEVELS
-        assert "8bit" in AWQ_QUANT_LEVELS
-        assert len(AWQ_QUANT_LEVELS) == 2
+        assert len(AWQ_QUANT_LEVELS) == 1
 
     def test_default_awq_constants(self):
         assert DEFAULT_QUANT_METHOD == "awq"
@@ -253,14 +250,15 @@ class TestGpuModelConfig:
         )
         assert gc.awq_repo == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
 
-    def test_awq_repo_8bit(self):
+    def test_awq_repo_8bit_returns_none(self):
+        """8bit AWQ no longer supported, should return None."""
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
             quant_method="awq",
             quant_level="8bit",
         )
-        assert gc.awq_repo == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit"
+        assert gc.awq_repo is None
 
     def test_awq_repo_none_for_non_awq(self):
         gc = GpuModelConfig(gpu_id=0, quant_method="none")
@@ -275,14 +273,15 @@ class TestGpuModelConfig:
         )
         assert gc.vllm_model_arg == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit"
 
-    def test_vllm_model_arg_awq_8bit(self):
+    def test_vllm_model_arg_awq_8bit_falls_back(self):
+        """8bit AWQ no longer supported, falls back to base model."""
         gc = GpuModelConfig(
             gpu_id=0,
             model_name="Qwen/Qwen3-VL-8B-Instruct",
             quant_method="awq",
             quant_level="8bit",
         )
-        assert gc.vllm_model_arg == "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit"
+        assert gc.vllm_model_arg == "Qwen/Qwen3-VL-8B-Instruct"
 
     def test_vllm_model_arg_non_awq(self):
         gc = GpuModelConfig(
@@ -331,12 +330,12 @@ class TestParseGpuConfigs:
 
     def test_multiple_configs(self):
         configs = parse_gpu_configs(
-            "0:2B-Instruct:4bit,1:4B-Instruct:4bit,2:8B-Instruct:8bit"
+            "0:2B-Instruct:4bit,1:4B-Instruct:4bit,2:8B-Instruct:4bit"
         )
         assert len(configs) == 3
         assert configs[0].model_name == "Qwen/Qwen3-VL-2B-Instruct"
         assert configs[1].model_name == "Qwen/Qwen3-VL-4B-Instruct"
-        assert configs[2].quant_level == "8bit"
+        assert configs[2].quant_level == "4bit"
 
     def test_default_quant(self):
         configs = parse_gpu_configs("0:8B-Instruct")
@@ -344,7 +343,7 @@ class TestParseGpuConfigs:
         assert configs[0].quant_level == DEFAULT_QUANT_LEVEL
 
     def test_full_model_name(self):
-        configs = parse_gpu_configs("0:Qwen/Qwen3-VL-8B-Instruct:8bit")
+        configs = parse_gpu_configs("0:Qwen/Qwen3-VL-8B-Instruct:4bit")
         assert len(configs) == 1
         assert configs[0].model_name == "Qwen/Qwen3-VL-8B-Instruct"
 
@@ -359,16 +358,16 @@ class TestParseGpuConfigs:
     def test_six_gpu_deployment(self):
         config_str = (
             "0:2B-Instruct:4bit,"
-            "1:4B-Instruct:4bit,"
-            "2:8B-Instruct:4bit,"
+            "1:2B-Thinking:4bit,"
+            "2:4B-Instruct:4bit,"
             "3:4B-Thinking:4bit,"
-            "4:8B-Instruct:8bit,"
-            "5:8B-Thinking:8bit"
+            "4:8B-Instruct:4bit,"
+            "5:8B-Thinking:4bit"
         )
         configs = parse_gpu_configs(config_str)
         assert len(configs) == 6
-        assert configs[3].model_name == "Qwen/Qwen3-VL-4B-Thinking"
-        assert configs[4].quant_level == "8bit"
+        assert configs[1].model_name == "Qwen/Qwen3-VL-2B-Thinking"
+        assert configs[4].quant_level == "4bit"
         assert configs[5].model_name == "Qwen/Qwen3-VL-8B-Thinking"
 
 
@@ -388,7 +387,7 @@ class TestComposeWithGpuConfigs:
                 gpu_id=1,
                 model_name="Qwen/Qwen3-VL-8B-Instruct",
                 quant_method="awq",
-                quant_level="8bit",
+                quant_level="4bit",
             ),
         ]
         gen = ComposeFileGenerator(
@@ -403,9 +402,9 @@ class TestComposeWithGpuConfigs:
         assert "gpu0" in compose
         assert "gpu1" in compose
         assert "cyankiwi/Qwen3-VL-2B-Instruct-AWQ-4bit" in compose
-        assert "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-8bit" in compose
-        assert "--quantization" in compose
-        assert "awq" in compose
+        assert "cyankiwi/Qwen3-VL-8B-Instruct-AWQ-4bit" in compose
+        # AWQ uses compressed-tensors; vLLM auto-detects, no --quantization flag
+        assert "--quantization" not in compose
         assert "--tokenizer" not in compose
         assert "--hf-config-path" not in compose
 
@@ -467,7 +466,6 @@ class TestCaseInsensitiveHelpers:
     def test_resolve_quant_level(self):
         assert resolve_quant_level("4bit") == "4bit"
         assert resolve_quant_level("4BIT") == "4bit"
-        assert resolve_quant_level("8bit") == "8bit"
 
     def test_get_model_shortcut(self):
         assert get_model_shortcut("Qwen/Qwen3-VL-8B-Instruct") == "8b-instruct"

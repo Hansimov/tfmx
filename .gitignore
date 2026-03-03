@@ -4,6 +4,7 @@ src/*.egg-info/
 docker_data/
 data/
 configs/
+results/
 weights/
 __pycache__
 *.chats
