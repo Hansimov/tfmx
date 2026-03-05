@@ -16,9 +16,12 @@ from tfmx.qvls.machine import (
     QVLMachineDaemon,
     ChatCompletionRequest,
     HealthResponse,
+    InstanceHealthDetail,
     InstanceInfo,
     MachineStats,
     InfoResponse,
+    ModelInfo,
+    ModelsResponse,
     VLLM_CONTAINER_IMAGE_PATTERN,
 )
 from tfmx.qvls.compose import MAX_CONCURRENT_REQUESTS, MACHINE_PORT, SERVER_PORT
@@ -464,6 +467,7 @@ class TestQVLMachineServer:
         assert "/info" in route_paths
         assert "/v1/chat/completions" in route_paths
         assert "/chat" in route_paths
+        assert "/v1/models" in route_paths
 
 
 # ── QVLMachineDaemon ─────────────────────────────────────────────────
@@ -655,3 +659,404 @@ class TestQVLMachineDaemon:
 
         self.d.start_background(["qvl_machine", "run", "--background"])
         assert mock_popen.call_args[1]["start_new_session"] is True
+
+
+# ── New Pydantic Models ──────────────────────────────────────────────
+
+
+class TestNewPydanticModels:
+    """Test new Pydantic models: InstanceHealthDetail, ModelInfo, ModelsResponse."""
+
+    def test_instance_health_detail_defaults(self):
+        detail = InstanceHealthDetail(
+            name="gpu0", endpoint="http://localhost:29880", healthy=True
+        )
+        assert detail.latency_ms is None
+        assert detail.active_requests == 0
+        assert detail.model_label == ""
+        assert detail.gpu_id is None
+
+    def test_instance_health_detail_full(self):
+        detail = InstanceHealthDetail(
+            name="gpu0",
+            endpoint="http://localhost:29880",
+            healthy=True,
+            latency_ms=12.34,
+            active_requests=3,
+            model_label="8B-Instruct:4bit",
+            gpu_id=0,
+        )
+        assert detail.latency_ms == 12.34
+        assert detail.active_requests == 3
+        assert detail.model_label == "8B-Instruct:4bit"
+
+    def test_model_info_defaults(self):
+        mi = ModelInfo(id="8B-Instruct:4bit")
+        assert mi.object == "model"
+        assert mi.owned_by == "qvl-machine"
+        assert mi.created == 0
+
+    def test_models_response_empty(self):
+        mr = ModelsResponse()
+        assert mr.object == "list"
+        assert mr.data == []
+
+    def test_models_response_with_data(self):
+        mr = ModelsResponse(data=[ModelInfo(id="8B-Instruct:4bit", created=1000)])
+        assert len(mr.data) == 1
+        assert mr.data[0].id == "8B-Instruct:4bit"
+
+    def test_health_response_with_instances(self):
+        hr = HealthResponse(
+            status="healthy",
+            healthy=1,
+            total=1,
+            instances=[
+                InstanceHealthDetail(
+                    name="gpu0",
+                    endpoint="http://localhost:29880",
+                    healthy=True,
+                    latency_ms=5.0,
+                )
+            ],
+        )
+        assert len(hr.instances) == 1
+        assert hr.instances[0].latency_ms == 5.0
+
+    def test_health_response_backward_compat(self):
+        """Old-style HealthResponse (no instances) still works."""
+        hr = HealthResponse(status="healthy", healthy=2, total=2)
+        assert hr.instances == []
+
+    def test_chat_completion_request_extra_fields(self):
+        """ChatCompletionRequest accepts extra fields (e.g., top_k, stop)."""
+        req = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hi"}],
+            top_k=50,
+            stop=["\n"],
+            presence_penalty=0.5,
+        )
+        dumped = req.model_dump(exclude_none=True)
+        assert dumped["top_k"] == 50
+        assert dumped["stop"] == ["\n"]
+        assert dumped["presence_penalty"] == 0.5
+
+
+# ── _get_model_label ─────────────────────────────────────────────────
+
+
+class TestGetModelLabel:
+    """Test QVLMachineServer._get_model_label."""
+
+    def _make_server(self) -> QVLMachineServer:
+        inst = VLLMInstance(
+            container_name="gpu0",
+            host="localhost",
+            port=29880,
+            gpu_id=0,
+            healthy=True,
+            model_name="Qwen/Qwen3-VL-8B-Instruct",
+            quant_method="awq",
+            quant_level="4bit",
+        )
+        return QVLMachineServer(instances=[inst])
+
+    def test_label_with_quant(self):
+        server = self._make_server()
+        inst = server.instances[0]
+        label = server._get_model_label(inst)
+        assert label == "8B-Instruct:4bit"
+
+    def test_label_without_quant(self):
+        server = self._make_server()
+        inst = server.instances[0]
+        inst.quant_level = ""
+        label = server._get_model_label(inst)
+        assert label == "8B-Instruct"
+
+    def test_label_unknown_model(self):
+        server = self._make_server()
+        inst = server.instances[0]
+        inst.model_name = "some/Unknown-Model"
+        inst.quant_level = ""
+        label = server._get_model_label(inst)
+        # Falls back to raw model name
+        assert label == "some/Unknown-Model" or "unknown" in label.lower()
+
+    def test_label_empty_model(self):
+        server = self._make_server()
+        inst = server.instances[0]
+        inst.model_name = ""
+        label = server._get_model_label(inst)
+        assert label == ""
+
+    def test_label_awq_repo_name(self):
+        """AWQ repo names like cyankiwi/... should still get proper shortcut."""
+        server = self._make_server()
+        inst = server.instances[0]
+        inst.model_name = "cyankiwi/Qwen3-VL-4B-Thinking-AWQ-4bit"
+        inst.quant_level = "4bit"
+        label = server._get_model_label(inst)
+        assert "4bit" in label
+
+
+# ── _acquire_instance ────────────────────────────────────────────────
+
+
+class TestAcquireInstance:
+    """Test the _acquire_instance helper."""
+
+    def _make_server(self, n=2):
+        instances = [
+            VLLMInstance(
+                container_name=f"gpu{i}",
+                host="localhost",
+                port=29880 + i,
+                gpu_id=i,
+                healthy=True,
+                model_name=f"Qwen/Qwen3-VL-{['2B', '8B'][i % 2]}-Instruct",
+                quant_method="awq",
+                quant_level="4bit",
+            )
+            for i in range(n)
+        ]
+        server = QVLMachineServer(instances=instances)
+        server._build_router()
+        return server
+
+    def test_acquire_returns_instance(self):
+        server = self._make_server()
+        inst, _, _ = asyncio.run(server._acquire_instance(""))
+        assert inst is not None
+        assert inst.healthy
+
+    def test_acquire_with_model_filter(self):
+        server = self._make_server()
+        inst, model, quant = asyncio.run(server._acquire_instance("8b-instruct:4bit"))
+        assert inst is not None
+        assert "8B" in inst.model_name
+
+    def test_acquire_no_available_raises_503(self):
+        server = self._make_server(1)
+        server.instances[0].healthy = False
+        with pytest.raises(Exception):
+            asyncio.run(server._acquire_instance(""))
+
+
+# ── _rewrite_model_in_body ───────────────────────────────────────────
+
+
+class TestRewriteModelInBody:
+    """Test body rewriting for vLLM model name."""
+
+    def _make_server(self):
+        inst = VLLMInstance(
+            container_name="gpu0",
+            host="localhost",
+            port=29880,
+            healthy=True,
+            model_name="Qwen/Qwen3-VL-8B-Instruct",
+        )
+        return QVLMachineServer(instances=[inst])
+
+    def test_rewrite_sets_model(self):
+        import orjson
+
+        server = self._make_server()
+        inst = server.instances[0]
+        body = orjson.dumps({"model": "8b-instruct", "messages": []})
+        new_body = server._rewrite_model_in_body(body, inst)
+        data = orjson.loads(new_body)
+        assert data["model"] == "Qwen/Qwen3-VL-8B-Instruct"
+
+    def test_rewrite_no_model_name(self):
+        import orjson
+
+        server = self._make_server()
+        inst = server.instances[0]
+        inst.model_name = ""
+        original = orjson.dumps({"model": "test", "messages": []})
+        result = server._rewrite_model_in_body(original, inst)
+        assert result == original
+
+    def test_rewrite_invalid_json(self):
+        server = self._make_server()
+        inst = server.instances[0]
+        bad_body = b"not json"
+        result = server._rewrite_model_in_body(bad_body, inst)
+        assert result == bad_body
+
+
+# ── VLLMInstance._latency_ms ─────────────────────────────────────────
+
+
+class TestVLLMInstanceLatency:
+    """Test the _latency_ms field on VLLMInstance."""
+
+    def test_default_latency(self):
+        inst = VLLMInstance(container_name="gpu0", host="localhost", port=29880)
+        assert inst._latency_ms == 0.0
+
+    def test_set_latency(self):
+        inst = VLLMInstance(container_name="gpu0", host="localhost", port=29880)
+        inst._latency_ms = 12.5
+        assert inst._latency_ms == 12.5
+
+
+# ── Integration tests with httpx TestClient ──────────────────────────
+
+
+class TestHTTPIntegration:
+    """Test actual HTTP behavior using FastAPI TestClient.
+
+    These tests exercise the full stack: routes, exception handlers,
+    response models, etc.
+    """
+
+    def _make_server(self) -> QVLMachineServer:
+        instances = [
+            VLLMInstance(
+                container_name="gpu0",
+                host="localhost",
+                port=29880,
+                gpu_id=0,
+                healthy=True,
+                model_name="Qwen/Qwen3-VL-8B-Instruct",
+                quant_method="awq",
+                quant_level="4bit",
+                _latency_ms=5.0,
+            ),
+            VLLMInstance(
+                container_name="gpu1",
+                host="localhost",
+                port=29881,
+                gpu_id=1,
+                healthy=True,
+                model_name="Qwen/Qwen3-VL-4B-Thinking",
+                quant_method="awq",
+                quant_level="4bit",
+                _latency_ms=3.2,
+            ),
+        ]
+        server = QVLMachineServer(instances=instances)
+        server._build_router()
+        return server
+
+    def test_health_endpoint_healthy(self):
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        client = TestClient(server.app, raise_server_exceptions=False)
+        resp = client.get("/health")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["status"] == "healthy"
+        assert data["healthy"] == 2
+        assert data["total"] == 2
+        assert len(data["instances"]) == 2
+        inst0 = data["instances"][0]
+        assert "name" in inst0
+        assert "latency_ms" in inst0
+        assert "active_requests" in inst0
+        assert "model_label" in inst0
+
+    def test_health_endpoint_unhealthy(self):
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        for inst in server.instances:
+            inst.healthy = False
+        # Rebuild router with unhealthy instances
+        server._build_router()
+        client = TestClient(server.app, raise_server_exceptions=False)
+        resp = client.get("/health")
+        assert resp.status_code == 503
+        data = resp.json()
+        assert data["status"] == "unhealthy"
+
+    def test_models_endpoint(self):
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        client = TestClient(server.app, raise_server_exceptions=False)
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["object"] == "list"
+        assert len(data["data"]) >= 1
+        model_ids = [m["id"] for m in data["data"]]
+        # Should contain display-cased labels
+        assert any("Instruct" in mid or "Thinking" in mid for mid in model_ids)
+        for m in data["data"]:
+            assert m["object"] == "model"
+            assert m["owned_by"] == "qvl-machine"
+
+    def test_models_endpoint_no_healthy(self):
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        for inst in server.instances:
+            inst.healthy = False
+        client = TestClient(server.app, raise_server_exceptions=False)
+        resp = client.get("/v1/models")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert data["data"] == []
+
+    def test_info_endpoint(self):
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        client = TestClient(server.app, raise_server_exceptions=False)
+        resp = client.get("/info")
+        assert resp.status_code == 200
+        data = resp.json()
+        assert "instances" in data
+        assert "stats" in data
+        assert "available_models" in data
+
+    def test_error_format_openai_style(self):
+        """Error responses should follow OpenAI error format."""
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        # Make all instances unavailable so chat returns 503
+        for inst in server.instances:
+            inst.healthy = False
+        server._build_router()
+
+        # Patch the httpx client so we don't make real requests
+        server._client = AsyncMock()
+
+        client = TestClient(server.app, raise_server_exceptions=False)
+        resp = client.post(
+            "/v1/chat/completions",
+            json={
+                "messages": [{"role": "user", "content": "Hello"}],
+            },
+        )
+        assert resp.status_code == 503
+        data = resp.json()
+        assert "error" in data
+        assert "message" in data["error"]
+        assert "type" in data["error"]
+        assert "code" in data["error"]
+        assert data["error"]["type"] == "service_unavailable"
+
+    def test_chat_stream_request_accepted(self):
+        """Chat with stream=True should not crash at request parsing."""
+        from starlette.testclient import TestClient
+
+        server = self._make_server()
+        # Instances are healthy but we won't have a real httpx client
+        # so the request will fail at forwarding, but it should NOT fail
+        # at request parsing (the original bug)
+        client = TestClient(server.app, raise_server_exceptions=False)
+        # Just verify the request is parsed correctly with stream=True
+        req = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "Hi"}],
+            stream=True,
+        )
+        assert req.stream is True
+        dumped = req.model_dump(exclude_none=True)
+        assert dumped["stream"] is True

@@ -57,6 +57,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from fastapi import FastAPI, File, Form, HTTPException, Request, Response, UploadFile
+from fastapi.responses import JSONResponse, StreamingResponse
 from pathlib import Path
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
@@ -150,6 +151,8 @@ class ChatCompletionRequest(BaseModel):
     Supports text, images (URL or base64), and video content.
     """
 
+    model_config = {"extra": "allow"}
+
     model: str = Field(
         default="",
         description=(
@@ -200,12 +203,45 @@ class ChatCompletionResponse(BaseModel):
     usage: UsageInfo = Field(default_factory=UsageInfo)
 
 
+class InstanceHealthDetail(BaseModel):
+    """Per-instance health detail for health endpoint."""
+
+    name: str = Field(..., description="Container/instance name")
+    endpoint: str = Field(..., description="HTTP endpoint URL")
+    healthy: bool = Field(..., description="Whether instance is healthy")
+    latency_ms: Optional[float] = Field(
+        None, description="Last health check latency in ms"
+    )
+    active_requests: int = Field(0, description="Currently active requests")
+    model_label: str = Field("", description="Model label (e.g., 8B-Instruct:4bit)")
+    gpu_id: Optional[int] = Field(None, description="GPU device ID")
+
+
 class HealthResponse(BaseModel):
     """Response model for health endpoint."""
 
     status: str = Field(..., description="Health status", examples=["healthy"])
     healthy: int = Field(..., description="Number of healthy instances")
     total: int = Field(..., description="Total number of instances")
+    instances: list[InstanceHealthDetail] = Field(
+        default_factory=list, description="Per-instance health details"
+    )
+
+
+class ModelInfo(BaseModel):
+    """OpenAI-compatible model object."""
+
+    id: str = Field(..., description="Model identifier")
+    object: str = Field(default="model")
+    created: int = Field(default=0, description="Unix timestamp")
+    owned_by: str = Field(default="qvl-machine")
+
+
+class ModelsResponse(BaseModel):
+    """OpenAI-compatible model list response."""
+
+    object: str = Field(default="list")
+    data: list[ModelInfo] = Field(default_factory=list)
 
 
 class InstanceInfo(BaseModel):
@@ -263,6 +299,7 @@ class VLLMInstance:
     model_name: str = ""
     quant_method: str = ""
     quant_level: str = ""
+    _latency_ms: float = 0.0
 
     @property
     def endpoint(self) -> str:
@@ -561,12 +598,14 @@ class QVLMachineServer:
                 "Load-balanced proxy for Qwen3-VL vLLM instances.\n\n"
                 "## Endpoints\n\n"
                 "- **POST /v1/chat/completions** — OpenAI-compatible chat API "
-                "(supports multimodal: text, images, video)\n"
+                "(supports multimodal: text, images, video, streaming)\n"
+                "- **GET /v1/models** — List available models "
+                "(OpenAI-compatible)\n"
                 "- **POST /chat** — Simplified form-based chat with file uploads\n"
-                "- **GET /health** — Health check\n"
+                "- **GET /health** — Health check with per-instance details\n"
                 "- **GET /info** — Instance info and stats\n"
             ),
-            version="1.0.0",
+            version="1.1.0",
             lifespan=self._lifespan,
             docs_url=None,
             redoc_url=None,
@@ -574,11 +613,53 @@ class QVLMachineServer:
 
         setup_swagger_ui(app)
 
+        # ── OpenAI-compatible error handler ──
+        @app.exception_handler(HTTPException)
+        async def openai_exception_handler(request: Request, exc: HTTPException):
+            detail = exc.detail
+            # Pass through structured responses (e.g., health endpoint dict)
+            if isinstance(detail, dict):
+                return JSONResponse(status_code=exc.status_code, content=detail)
+            error_types = {
+                400: "invalid_request_error",
+                401: "authentication_error",
+                403: "permission_error",
+                404: "not_found_error",
+                422: "invalid_request_error",
+                429: "rate_limit_error",
+                500: "server_error",
+                503: "service_unavailable",
+            }
+            return JSONResponse(
+                status_code=exc.status_code,
+                content={
+                    "error": {
+                        "message": str(detail),
+                        "type": error_types.get(exc.status_code, "server_error"),
+                        "code": exc.status_code,
+                    }
+                },
+            )
+
         app.get(
             "/health",
             response_model=HealthResponse,
             summary="Health check",
+            description=(
+                "Health check with per-instance latency, active request count, "
+                "and model information."
+            ),
         )(self.health)
+
+        app.get(
+            "/v1/models",
+            response_model=ModelsResponse,
+            summary="List models (OpenAI-compatible)",
+            description=(
+                "List available models in OpenAI-compatible format. "
+                "Use the returned model IDs in chat completion requests."
+            ),
+        )(self.models)
 
         app.get(
             "/info",
@@ -588,14 +669,15 @@ class QVLMachineServer:
 
         app.post(
             "/v1/chat/completions",
-            response_model=ChatCompletionResponse,
             summary="Chat completion (OpenAI-compatible)",
             description=(
                 "Forward chat completion request to a vLLM instance. "
                 "Supports multimodal messages with text, images (base64 or URL), "
                 "and video content.\n\n"
                 "**Model routing**: Use short names like `4b-thinking`, "
-                "`8b-instruct:4bit`, or leave empty for the default model."
+                "`8b-instruct:4bit`, or leave empty for the default model.\n\n"
+                "**Streaming**: Set `stream: true` for SSE streaming response "
+                "(`text/event-stream`)."
             ),
         )(self.chat_completions)
 
@@ -670,23 +752,70 @@ class QVLMachineServer:
 
     async def _check_instance_health(self, instance: VLLMInstance) -> bool:
         try:
+            t0 = time.perf_counter()
             resp = await self._client.get(instance.health_url)
+            latency_ms = (time.perf_counter() - t0) * 1000
             instance.healthy = resp.status_code == 200
+            instance._latency_ms = latency_ms if instance.healthy else 0.0
             return instance.healthy
         except Exception:
             instance.healthy = False
+            instance._latency_ms = 0.0
             return False
 
+    def _get_model_label(self, instance: VLLMInstance) -> str:
+        """Get a consistent, human-readable model label for an instance.
+
+        Returns display-cased shortcut with quant suffix, e.g. '8B-Instruct:4bit'.
+        Falls back to the raw model_name if no shortcut is found.
+        """
+        shortcut = get_model_shortcut(instance.model_name)
+        display = get_display_shortcut(shortcut) if shortcut else ""
+        if display and instance.quant_level:
+            return f"{display}:{instance.quant_level}"
+        return display or instance.model_name
+
     async def health(self) -> HealthResponse:
-        healthy = self.get_healthy_instances()
+        healthy_list = self.get_healthy_instances()
+        instance_details = [
+            InstanceHealthDetail(
+                name=inst.container_name,
+                endpoint=inst.endpoint,
+                healthy=inst.healthy,
+                latency_ms=(
+                    round(inst._latency_ms, 2) if inst._latency_ms > 0 else None
+                ),
+                active_requests=inst._active_requests,
+                model_label=self._get_model_label(inst),
+                gpu_id=inst.gpu_id,
+            )
+            for inst in self.instances
+        ]
         response = HealthResponse(
-            status="healthy" if healthy else "unhealthy",
-            healthy=len(healthy),
+            status="healthy" if healthy_list else "unhealthy",
+            healthy=len(healthy_list),
             total=len(self.instances),
+            instances=instance_details,
         )
-        if not healthy:
+        if not healthy_list:
             raise HTTPException(status_code=503, detail=response.model_dump())
         return response
+
+    async def models(self) -> ModelsResponse:
+        """List available models (OpenAI-compatible GET /v1/models)."""
+        model_data = []
+        seen: set[str] = set()
+        created = int(time.time())
+        for inst in self.instances:
+            if not inst.healthy:
+                continue
+            label = self._get_model_label(inst)
+            if label and label not in seen:
+                seen.add(label)
+                model_data.append(
+                    ModelInfo(id=label, created=created, owned_by="qvl-machine")
+                )
+        return ModelsResponse(data=model_data)
 
     async def _discover_instance_models(self) -> None:
         """Query each instance's /v1/models to discover model names."""
@@ -721,15 +850,16 @@ class QVLMachineServer:
             available_models=self.router.get_available_models(),
         )
 
-    async def chat_completions(
-        self, request: ChatCompletionRequest
-    ) -> ChatCompletionResponse:
+    async def chat_completions(self, request: ChatCompletionRequest):
         """Forward chat completion request to an idle vLLM instance.
 
         Routes based on model/quant in request body if specified.
         Uses least-loaded instance for unspecified requests.
+        When ``stream=True``, returns an SSE ``text/event-stream`` response.
         """
         body = orjson.dumps(request.model_dump(exclude_none=True))
+        if request.stream:
+            return await self._forward_stream(body, request.model)
         return await self._forward_chat(body, request.model)
 
     async def chat_form(
@@ -820,54 +950,176 @@ class QVLMachineServer:
         body = orjson.dumps(req_data)
         return await self._forward_chat(body, model)
 
-    async def _forward_chat(
+    async def _acquire_instance(
+        self, model_field: str = ""
+    ) -> tuple[VLLMInstance, str, str]:
+        """Acquire an idle vLLM instance for a request.
+
+        Parses model/quant from ``model_field``, waits briefly for a slot,
+        and falls back to any idle instance if no match is found.
+
+        Returns:
+            (instance, req_model, req_quant)
+
+        Raises:
+            HTTPException 503 if no instance is available.
+        """
+        req_model = ""
+        req_quant = ""
+        if model_field:
+            req_model, req_quant = parse_model_spec(model_field)
+
+        instance = self._get_idle_instance(model=req_model, quant=req_quant)
+        if instance is None:
+            for _ in range(10):
+                await asyncio.sleep(0.1)
+                instance = self._get_idle_instance(model=req_model, quant=req_quant)
+                if instance:
+                    break
+
+        if instance is None:
+            instance = self._get_idle_instance()
+
+        if instance is None:
+            self.stats.total_errors += 1
+            raise HTTPException(status_code=503, detail="No available vLLM instances")
+
+        return instance, req_model, req_quant
+
+    def _rewrite_model_in_body(self, body: bytes, instance: VLLMInstance) -> bytes:
+        """Rewrite model name in request body to match vLLM's actual model name."""
+        if instance.model_name:
+            try:
+                req_data = orjson.loads(body)
+                req_data["model"] = instance.model_name
+                return orjson.dumps(req_data)
+            except Exception:
+                pass
+        return body
+
+    async def _forward_stream(
         self, body: bytes, model_field: str = ""
-    ) -> ChatCompletionResponse:
-        """Forward a chat request body to a vLLM instance and return typed response."""
+    ) -> StreamingResponse:
+        """Forward a streaming chat request, proxying SSE events.
+
+        Opens a streaming connection to the vLLM backend and yields each
+        Server-Sent Event line to the client.  The ``model`` field in each
+        chunk is rewritten to the proxy's consistent label.
+        """
         t0 = time.perf_counter()
         self.stats.total_requests += 1
         self.stats.active_requests += 1
 
         try:
-            # Parse model/quant for routing
-            req_model = ""
-            req_quant = ""
-            if model_field:
-                req_model, req_quant = parse_model_spec(model_field)
+            instance, _, _ = await self._acquire_instance(model_field)
+        except HTTPException:
+            self.stats.active_requests = max(0, self.stats.active_requests - 1)
+            raise
 
-            # Get an idle instance (with optional model/quant filter)
-            instance = self._get_idle_instance(model=req_model, quant=req_quant)
-            if instance is None:
-                # Wait briefly for a slot to free up
-                for _ in range(10):
-                    await asyncio.sleep(0.1)
-                    instance = self._get_idle_instance(model=req_model, quant=req_quant)
-                    if instance:
-                        break
+        instance._active_requests += 1
+        instance_name = instance.container_name
+        self.stats.requests_per_instance[instance_name] = (
+            self.stats.requests_per_instance.get(instance_name, 0) + 1
+        )
 
-            if instance is None:
-                # Fall back to any idle instance
-                instance = self._get_idle_instance()
+        body = self._rewrite_model_in_body(body, instance)
+        model_label = self._get_model_label(instance)
 
-            if instance is None:
+        async def stream_generator():
+            try:
+                async with self._client.stream(
+                    "POST",
+                    instance.chat_url,
+                    content=body,
+                    headers={"Content-Type": "application/json"},
+                ) as resp:
+                    if resp.status_code != 200:
+                        error_body = await resp.aread()
+                        error_msg = error_body.decode("utf-8", errors="replace")
+                        error_data = {
+                            "error": {
+                                "message": error_msg,
+                                "type": "upstream_error",
+                                "code": resp.status_code,
+                            }
+                        }
+                        yield f"data: {orjson.dumps(error_data).decode()}\n\n"
+                        yield "data: [DONE]\n\n"
+                        self.stats.total_errors += 1
+                        return
+
+                    async for line in resp.aiter_lines():
+                        if not line.strip():
+                            continue
+                        if line.startswith("data: "):
+                            data = line[6:].strip()
+                            if data == "[DONE]":
+                                yield "data: [DONE]\n\n"
+                                break
+                            # Rewrite model field in each chunk
+                            try:
+                                chunk = orjson.loads(data)
+                                if model_label:
+                                    chunk["model"] = model_label
+                                # Track usage from final chunk
+                                usage = chunk.get("usage")
+                                if usage:
+                                    self.stats.total_tokens += usage.get(
+                                        "total_tokens", 0
+                                    )
+                                yield f"data: {orjson.dumps(chunk).decode()}\n\n"
+                            except Exception:
+                                yield f"data: {data}\n\n"
+                        elif line.startswith(":"):
+                            # SSE comment / keepalive
+                            yield f"{line}\n"
+            except Exception as e:
                 self.stats.total_errors += 1
-                raise HTTPException(
-                    status_code=503, detail="No available vLLM instances"
-                )
+                logger.warn(f"× Stream error: {e}")
+                error_data = {
+                    "error": {
+                        "message": str(e),
+                        "type": "proxy_error",
+                        "code": 500,
+                    }
+                }
+                yield f"data: {orjson.dumps(error_data).decode()}\n\n"
+                yield "data: [DONE]\n\n"
+            finally:
+                instance._active_requests = max(0, instance._active_requests - 1)
+                self.stats.active_requests = max(0, self.stats.active_requests - 1)
+                if self.enable_perf_tracking:
+                    latency = time.perf_counter() - t0
+                    logger.mesg(
+                        f"[qvl_machine] {instance_name} "
+                        f"stream done latency={latency:.2f}s"
+                    )
 
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no",
+            },
+        )
+
+    async def _forward_chat(
+        self, body: bytes, model_field: str = ""
+    ) -> ChatCompletionResponse:
+        """Forward a non-streaming chat request and return a typed response."""
+        t0 = time.perf_counter()
+        self.stats.total_requests += 1
+        self.stats.active_requests += 1
+
+        try:
+            instance, _, _ = await self._acquire_instance(model_field)
             instance._active_requests += 1
 
             try:
-                # Rewrite model name to match vLLM's actual model name
-                # (proxy accepts short names like "2b-instruct:4bit" but vLLM
-                #  needs the full HF repo name from its /v1/models endpoint)
-                if instance.model_name:
-                    try:
-                        req_data = orjson.loads(body)
-                        req_data["model"] = instance.model_name
-                        body = orjson.dumps(req_data)
-                    except Exception:
-                        pass
+                body = self._rewrite_model_in_body(body, instance)
+                model_label = self._get_model_label(instance)
 
                 # Forward to vLLM
                 resp = await self._client.post(
@@ -913,7 +1165,7 @@ class QVLMachineServer:
                     id=resp_data.get("id", ""),
                     object=resp_data.get("object", "chat.completion"),
                     created=resp_data.get("created", 0),
-                    model=resp_data.get("model", ""),
+                    model=model_label or resp_data.get("model", ""),
                     choices=[
                         ChatChoiceDelta(**c) for c in resp_data.get("choices", [])
                     ],

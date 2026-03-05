@@ -32,6 +32,11 @@ qvl_compose up -p 29890
 # Custom project name
 qvl_compose up -j my-qvl
 
+# Custom project name, specific GPU, and model config
+qvl_compose up -j 8b-instruct -g "5" --gpu-configs "5:8b-instruct:4bit"
+# -j arg is mandatory to down target containers that started with same name
+qvl_compose down -j 8b-instruct
+
 # Use HTTP proxy for model downloads
 qvl_compose up --proxy http://127.0.0.1:11111
 
@@ -134,7 +139,106 @@ When running a multi-model deployment, the machine proxy automatically discovers
 - Request `model="4b-thinking"` -> routes to any 4B-Thinking instance
 - Request `model=""` -> routes to default/any idle instance
 
+The `/v1/models` endpoint returns available models in OpenAI-compatible format.
 The `/info` endpoint returns available models and per-instance metadata.
+
+#### API Endpoints
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | `/v1/chat/completions` | Chat completion (OpenAI-compatible, supports streaming) |
+| GET | `/v1/models` | List available models (OpenAI-compatible) |
+| POST | `/chat` | Form-based chat with file uploads (Swagger UI) |
+| GET | `/health` | Health check with per-instance details |
+| GET | `/info` | Instance info and stats |
+
+#### Streaming Support
+
+Set `"stream": true` in the request body to receive Server-Sent Events (SSE):
+
+```bash
+curl http://localhost:29800/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"messages":[{"role":"user","content":"Hello"}],"stream":true}'
+```
+
+The streaming response uses `text/event-stream` content type with standard SSE
+format (`data: {...}\n\n`), compatible with the OpenAI Python SDK and other
+SSE clients.
+
+#### OpenAI SDK Compatibility
+
+The machine proxy is compatible with the OpenAI Python SDK:
+
+```python
+from openai import OpenAI
+
+client = OpenAI(base_url="http://localhost:29800/v1", api_key="unused")
+
+# List models
+models = client.models.list()
+for m in models.data:
+    print(m.id)  # e.g., "8B-Instruct:4bit"
+
+# Non-streaming chat
+response = client.chat.completions.create(
+    model="8B-Instruct:4bit",
+    messages=[{"role": "user", "content": "Hello"}],
+    max_tokens=128,
+)
+print(response.choices[0].message.content)
+
+# Streaming chat
+stream = client.chat.completions.create(
+    model="8B-Instruct:4bit",
+    messages=[{"role": "user", "content": "Write a haiku"}],
+    stream=True,
+)
+for chunk in stream:
+    if chunk.choices[0].delta.content:
+        print(chunk.choices[0].delta.content, end="")
+```
+
+#### Error Response Format
+
+All error responses follow the OpenAI error format:
+
+```json
+{
+  "error": {
+    "message": "No available vLLM instances",
+    "type": "service_unavailable",
+    "code": 503
+  }
+}
+```
+
+The error `type` field maps to standard categories: `invalid_request_error`,
+`server_error`, `service_unavailable`, etc.
+
+#### Enhanced Health Check
+
+The `/health` endpoint returns per-instance details including latency, active
+request count, and model information:
+
+```json
+{
+  "status": "healthy",
+  "healthy": 2,
+  "total": 2,
+  "instances": [
+    {
+      "name": "qvl-multi--gpu0",
+      "endpoint": "http://localhost:29880",
+      "healthy": true,
+      "latency_ms": 5.23,
+      "active_requests": 1,
+      "model_label": "8B-Instruct:4bit",
+      "gpu_id": 0
+    }
+  ]
+}
+```
 
 ### qvl_client
 
