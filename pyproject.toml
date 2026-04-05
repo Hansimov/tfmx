@@ -38,6 +38,7 @@ qvl_client = "tfmx.qvls.client:main"
 qvl_clients = "tfmx.qvls.clients_cli:run_cli_main"
 qvl_clients_stats = "tfmx.qvls.clients_stats:run_cli_main"
 qvl_benchmark = "tfmx.qvls.benchmark:main"
+qwn = "tfmx.qwns.cli:main"
 
 [tool.setuptools]
 include-package-data = true

@@ -43,6 +43,13 @@ from .teis.perf_tracker import (
     reset_global_tracker,
 )
 
+# QWN
+from .qwns import QWNBenchmark, BenchmarkMetrics as QWNBenchmarkMetrics
+from .qwns import QWNClient, AsyncQWNClient, build_text_messages
+from .qwns import QWNClients, QWNClientsWithStats
+from .qwns import QWNComposer, QWNRouter, InstanceDescriptor as QWNInstanceDescriptor
+from .qwns import QWNMachineServer, QWNInstance, QWNMachineDaemon
+
 # GPU
 from .gpus.fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
 from .gpus.pow import NvidiaSmiParser, GPUPowerController, GPUPowerArgParser

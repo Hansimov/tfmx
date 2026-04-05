@@ -47,6 +47,16 @@ class TestPackageImports:
         assert QVLComposer is not None
         assert QVLClient is not None
 
+    def test_import_qwns_module(self):
+        from tfmx.qwns import QWNComposer
+        from tfmx.qwns import QWNClient, AsyncQWNClient
+        from tfmx.qwns import QWNRouter, InstanceDescriptor
+        from tfmx.qwns import QWNMachineServer, QWNInstance
+        from tfmx.qwns import QWNBenchmark, BenchmarkMetrics
+
+        assert QWNComposer is not None
+        assert QWNClient is not None
+
     def test_import_from_root(self):
         """All public APIs should also be importable from root tfmx"""
         from tfmx import TEIClient, TEIClients, TEIClientsWithStats
@@ -55,8 +65,10 @@ class TestPackageImports:
         from tfmx import GPUFanController, GPUPowerController
         from tfmx import PerfTracker, IdleFillingScheduler
         from tfmx import LSHConverter
+        from tfmx import QWNClient, QWNComposer, QWNBenchmark
 
         assert TEIClient is not None
+        assert QWNClient is not None
 
     def test_gpus_submodules(self):
         """GPU submodule files should be importable"""
@@ -82,6 +94,15 @@ class TestPackageImports:
 
         assert client is not None
         assert router is not None
+
+    def test_qwns_submodules(self):
+        """QWN submodule files should be importable"""
+        from tfmx.qwns import benchmark, client, clients, compose, scheduler
+        from tfmx.qwns import perf_tracker, performance
+        from tfmx.qwns import cli, machine, router
+
+        assert client is not None
+        assert machine is not None
 
     def test_utils_submodules(self):
         """Utils submodule files should be importable"""
@@ -156,6 +177,22 @@ class TestModuleStructure:
         assert (qvls_dir / "clients_cli.py").exists()
         assert (qvls_dir / "clients_stats.py").exists()
         assert (qvls_dir / "router.py").exists()
+
+    def test_qwns_directory_exists(self):
+        import tfmx.qwns
+        from pathlib import Path
+
+        qwns_dir = Path(tfmx.qwns.__file__).parent
+        assert (qwns_dir / "client.py").exists()
+        assert (qwns_dir / "clients.py").exists()
+        assert (qwns_dir / "compose.py").exists()
+        assert (qwns_dir / "scheduler.py").exists()
+        assert (qwns_dir / "machine.py").exists()
+        assert (qwns_dir / "perf_tracker.py").exists()
+        assert (qwns_dir / "performance.py").exists()
+        assert (qwns_dir / "benchmark.py").exists()
+        assert (qwns_dir / "router.py").exists()
+        assert (qwns_dir / "cli.py").exists()
 
     def test_utils_directory_exists(self):
         import tfmx.utils

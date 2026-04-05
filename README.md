@@ -49,3 +49,13 @@ Run tei benchmark:
 ```sh
 tei_benchmark run -E "http://localhost:28800" -n 100000
 ```
+
+Run qwn compose, machine, and benchmark:
+
+```sh
+qwn compose up --gpu-configs "0:4b:4bit"
+qwn compose up --gpu-layout uniform-awq
+qwn machine run -b
+qwn client chat "你好，请做个自我介绍"
+qwn benchmark run -E "http://localhost:27800" -n 100
+```
