@@ -1,12 +1,14 @@
 """QWN client helpers for single-endpoint text chat services."""
 
 import argparse
+import time
+
 import httpx
 import orjson
 
 from dataclasses import dataclass, field
 from tclogger import dict_to_lines, logger, logstr
-from typing import Optional
+from typing import Callable, Optional
 
 from .compose import MACHINE_PORT as PORT
 
@@ -114,6 +116,20 @@ class ChatResponse:
 
 
 @dataclass
+class StreamChatResult:
+    text: str = ""
+    usage: ChatUsage = field(default_factory=ChatUsage)
+    elapsed_sec: float = 0.0
+
+    @property
+    def token_per_second(self) -> float:
+        if self.elapsed_sec <= 0:
+            return 0.0
+        token_count = self.usage.completion_tokens or self.usage.total_tokens
+        return token_count / self.elapsed_sec if token_count > 0 else 0.0
+
+
+@dataclass
 class InstanceInfo:
     name: str
     endpoint: str
@@ -185,6 +201,65 @@ def build_text_messages(
         messages.append({"role": "system", "content": system_prompt})
     messages.append({"role": "user", "content": prompt})
     return messages
+
+
+def _build_chat_payload(
+    messages: list[dict],
+    model: str = "",
+    max_tokens: int = 512,
+    temperature: float = 0.7,
+    top_p: float = 0.9,
+    stream: bool = False,
+    enable_thinking: bool = False,
+) -> dict:
+    payload = {
+        "messages": messages,
+        "max_tokens": max_tokens,
+        "temperature": temperature,
+        "top_p": top_p,
+        "stream": stream,
+        "chat_template_kwargs": {"enable_thinking": enable_thinking},
+    }
+    if model:
+        payload["model"] = model
+    return payload
+
+
+def format_elapsed_time(elapsed_sec: float) -> str:
+    total_seconds = max(0.0, elapsed_sec)
+    minutes = int(total_seconds // 60)
+    seconds = total_seconds - minutes * 60
+    if minutes > 0:
+        return f"{minutes}min {seconds:.1f}s"
+    return f"{seconds:.1f}s"
+
+
+def _iter_text_parts(content: object) -> list[str]:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, str):
+                parts.append(item)
+            elif isinstance(item, dict) and item.get("type") == "text":
+                text = item.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return parts
+    if isinstance(content, dict):
+        text = content.get("text")
+        if isinstance(text, str):
+            return [text]
+    return []
+
+
+def _extract_stream_text(chunk: dict) -> str:
+    fragments: list[str] = []
+    for choice in chunk.get("choices", []):
+        delta = choice.get("delta") or choice.get("message") or {}
+        fragments.extend(_iter_text_parts(delta.get("content")))
+    return "".join(fragments)
 
 
 class QWNClient:
@@ -294,16 +369,17 @@ class QWNClient:
         temperature: float = 0.7,
         top_p: float = 0.9,
         stream: bool = False,
+        enable_thinking: bool = False,
     ) -> ChatResponse:
-        payload = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": stream,
-        }
-        if model:
-            payload["model"] = model
+        payload = _build_chat_payload(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=stream,
+            enable_thinking=enable_thinking,
+        )
 
         try:
             response = self.client.post(
@@ -322,6 +398,74 @@ class QWNClient:
             self._log_fail("chat", exc)
             raise
 
+    def stream_chat(
+        self,
+        messages: list[dict],
+        model: str = "",
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        on_text: Callable[[str], None] | None = None,
+        enable_thinking: bool = False,
+    ) -> StreamChatResult:
+        payload = _build_chat_payload(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=True,
+            enable_thinking=enable_thinking,
+        )
+        payload["stream_options"] = {"include_usage": True}
+
+        text_fragments: list[str] = []
+        usage = ChatUsage()
+        started_at = time.perf_counter()
+        try:
+            with self.client.stream(
+                "POST",
+                f"{self.endpoint}/v1/chat/completions",
+                json=payload,
+            ) as response:
+                response.raise_for_status()
+                for line in response.iter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = orjson.loads(data)
+                    if "error" in chunk:
+                        detail = chunk["error"].get("message", str(chunk["error"]))
+                        raise ValueError(f"Chat failed: {detail}")
+
+                    chunk_text = _extract_stream_text(chunk)
+                    if chunk_text:
+                        text_fragments.append(chunk_text)
+                        if on_text:
+                            on_text(chunk_text)
+
+                    chunk_usage = chunk.get("usage")
+                    if isinstance(chunk_usage, dict):
+                        usage = ChatUsage.from_dict(chunk_usage)
+
+            elapsed_sec = time.perf_counter() - started_at
+            result = StreamChatResult(
+                text="".join(text_fragments),
+                usage=usage,
+                elapsed_sec=elapsed_sec,
+            )
+            self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
+            return result
+        except httpx.HTTPStatusError as exc:
+            detail = self._extract_error_detail(exc)
+            self._log_fail("stream_chat", detail)
+            raise ValueError(f"Chat failed: {detail}") from exc
+        except Exception as exc:
+            self._log_fail("stream_chat", exc)
+            raise
+
     def generate(
         self,
         prompt: str,
@@ -330,6 +474,7 @@ class QWNClient:
         temperature: float = 0.7,
         top_p: float = 0.9,
         model: str = "",
+        enable_thinking: bool = False,
     ) -> str:
         messages = build_text_messages(prompt=prompt, system_prompt=system_prompt)
         response = self.chat(
@@ -338,6 +483,7 @@ class QWNClient:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            enable_thinking=enable_thinking,
         )
         return response.text
 
@@ -426,16 +572,17 @@ class AsyncQWNClient:
         temperature: float = 0.7,
         top_p: float = 0.9,
         stream: bool = False,
+        enable_thinking: bool = False,
     ) -> ChatResponse:
-        payload = {
-            "messages": messages,
-            "max_tokens": max_tokens,
-            "temperature": temperature,
-            "top_p": top_p,
-            "stream": stream,
-        }
-        if model:
-            payload["model"] = model
+        payload = _build_chat_payload(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=stream,
+            enable_thinking=enable_thinking,
+        )
 
         client = await self._get_client()
         try:
@@ -464,6 +611,7 @@ class AsyncQWNClient:
         temperature: float = 0.7,
         top_p: float = 0.9,
         model: str = "",
+        enable_thinking: bool = False,
     ) -> str:
         messages = build_text_messages(prompt=prompt, system_prompt=system_prompt)
         response = await self.chat(
@@ -472,6 +620,7 @@ class AsyncQWNClient:
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            enable_thinking=enable_thinking,
         )
         return response.text
 
@@ -481,6 +630,7 @@ Examples:
   qwn client health
   qwn client models
   qwn client chat "你好，介绍一下自己"
+    qwn client chat "你好" --no-stream
   qwn client generate --prompt "请总结一下 Docker 部署步骤"
   qwn client -e http://localhost:27880 models
 """
@@ -516,6 +666,16 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     chat_parser.add_argument("--temperature", type=float, default=0.7)
     chat_parser.add_argument("--top-p", type=float, default=0.9)
     chat_parser.add_argument("-s", "--system", default=None, help="System prompt")
+    chat_parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="Enable model thinking-mode output",
+    )
+    chat_parser.add_argument(
+        "--no-stream",
+        action="store_true",
+        help="Disable streaming terminal output",
+    )
 
     generate_parser = subparsers.add_parser(
         "generate", help="Generate text from a prompt"
@@ -526,6 +686,11 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     generate_parser.add_argument("--temperature", type=float, default=0.7)
     generate_parser.add_argument("--top-p", type=float, default=0.9)
     generate_parser.add_argument("-s", "--system", default=None, help="System prompt")
+    generate_parser.add_argument(
+        "--thinking",
+        action="store_true",
+        help="Enable model thinking-mode output",
+    )
 
 
 def run_from_args(args: argparse.Namespace) -> None:
@@ -556,15 +721,37 @@ def run_from_args(args: argparse.Namespace) -> None:
             for line in dict_to_lines(info.stats.__dict__).splitlines():
                 logger.mesg(f"  {line}")
         elif args.client_action == "chat":
-            result = client.generate(
-                prompt=args.text,
-                system_prompt=args.system,
-                max_tokens=args.max_tokens,
-                temperature=args.temperature,
-                top_p=args.top_p,
-                model=args.model,
-            )
-            print(result)
+            if args.no_stream:
+                result = client.generate(
+                    prompt=args.text,
+                    system_prompt=args.system,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    model=args.model,
+                    enable_thinking=args.thinking,
+                )
+                print(result)
+            else:
+                messages = build_text_messages(
+                    prompt=args.text,
+                    system_prompt=args.system,
+                )
+                stream_result = client.stream_chat(
+                    messages=messages,
+                    model=args.model,
+                    max_tokens=args.max_tokens,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                    on_text=lambda chunk: print(chunk, end="", flush=True),
+                    enable_thinking=args.thinking,
+                )
+                if stream_result.text and not stream_result.text.endswith("\n"):
+                    print()
+                elapsed_text = format_elapsed_time(stream_result.elapsed_sec)
+                print(
+                    f"elapsed: {elapsed_text} | {stream_result.token_per_second:.1f} token/s"
+                )
         elif args.client_action == "generate":
             result = client.generate(
                 prompt=args.prompt,
@@ -573,6 +760,7 @@ def run_from_args(args: argparse.Namespace) -> None:
                 temperature=args.temperature,
                 top_p=args.top_p,
                 model=args.model,
+                enable_thinking=args.thinking,
             )
             print(result)
         else:

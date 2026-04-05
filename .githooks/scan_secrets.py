@@ -10,6 +10,7 @@ import sys
 
 from dataclasses import dataclass
 from pathlib import Path
+from tclogger import logstr
 
 
 IGNORE_MARKER = "scan-secrets: ignore"
@@ -142,6 +143,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         findings = scan_paths(paths)
     if not findings:
+        print(logstr.okay(f"Sensitive information scan passed."))
         return 0
 
     print("Potential sensitive literals detected:", file=sys.stderr)

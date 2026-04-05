@@ -1,5 +1,7 @@
 """Tests for tfmx.qwns.client."""
 
+from unittest.mock import MagicMock
+
 from tfmx.qwns.client import AsyncQWNClient
 from tfmx.qwns.client import ChatChoice
 from tfmx.qwns.client import ChatMessage
@@ -9,6 +11,7 @@ from tfmx.qwns.client import InfoResponse
 from tfmx.qwns.client import ModelInfo
 from tfmx.qwns.client import QWNClient
 from tfmx.qwns.client import build_text_messages
+from tfmx.qwns.client import format_elapsed_time
 
 
 class TestBuildTextMessages:
@@ -20,6 +23,14 @@ class TestBuildTextMessages:
         messages = build_text_messages("Hello", system_prompt="Be helpful")
         assert messages[0]["role"] == "system"
         assert messages[1]["role"] == "user"
+
+
+class TestFormatElapsedTime:
+    def test_seconds_only(self):
+        assert format_elapsed_time(8.34) == "8.3s"
+
+    def test_minutes_and_seconds(self):
+        assert format_elapsed_time(75.25) == "1min 15.2s"
 
 
 class TestChatResponse:
@@ -69,6 +80,64 @@ class TestQWNClient:
     def test_custom_endpoint(self):
         client = QWNClient(endpoint="http://myhost:29999")
         assert client.endpoint == "http://myhost:29999"
+        client.close()
+
+    def test_stream_chat_collects_text_and_usage(self):
+        client = QWNClient(endpoint="http://localhost:27800")
+
+        stream_response = MagicMock()
+        stream_response.iter_lines.return_value = iter(
+            [
+                'data: {"choices":[{"delta":{"reasoning_content":"先想一下"}}]}',
+                'data: {"choices":[{"delta":{"content":"你"}}]}',
+                'data: {"choices":[{"delta":{"content":"好"}}]}',
+                'data: {"choices":[],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}',
+                "data: [DONE]",
+            ]
+        )
+        stream_response.raise_for_status.return_value = None
+
+        stream_context = MagicMock()
+        stream_context.__enter__.return_value = stream_response
+        stream_context.__exit__.return_value = None
+        client.client.stream = MagicMock(return_value=stream_context)
+
+        chunks: list[str] = []
+        result = client.stream_chat(
+            messages=build_text_messages("你好"),
+            on_text=chunks.append,
+        )
+
+        assert result.text == "你好"
+        assert chunks == ["你", "好"]
+        assert result.usage.total_tokens == 5
+        stream_kwargs = client.client.stream.call_args.kwargs
+        assert stream_kwargs["json"]["chat_template_kwargs"] == {
+            "enable_thinking": False
+        }
+        client.close()
+
+    def test_stream_chat_can_enable_thinking(self):
+        client = QWNClient(endpoint="http://localhost:27800")
+
+        stream_response = MagicMock()
+        stream_response.iter_lines.return_value = iter(["data: [DONE]"])
+        stream_response.raise_for_status.return_value = None
+
+        stream_context = MagicMock()
+        stream_context.__enter__.return_value = stream_response
+        stream_context.__exit__.return_value = None
+        client.client.stream = MagicMock(return_value=stream_context)
+
+        client.stream_chat(
+            messages=build_text_messages("你好"),
+            enable_thinking=True,
+        )
+
+        stream_kwargs = client.client.stream.call_args.kwargs
+        assert stream_kwargs["json"]["chat_template_kwargs"] == {
+            "enable_thinking": True
+        }
         client.close()
 
 

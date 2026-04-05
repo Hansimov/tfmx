@@ -13,7 +13,9 @@ from .client import InstanceInfo
 from .client import MachineStats
 from .client import ModelInfo
 from .client import QWNClient
+from .client import StreamChatResult
 from .client import build_text_messages
+from .client import format_elapsed_time
 from .clients import QWNClients
 from .clients_core import ClientsHealthResponse
 from .clients_core import MachineScheduler
