@@ -89,9 +89,12 @@ class ChatCompletionRequest(BaseModel):
 
     model: str = Field(default="", description="Model label or shortcut")
     messages: list[ChatMessage] = Field(..., description="OpenAI chat messages")
-    max_tokens: int = Field(
-        default=DEFAULT_MAX_TOKENS,
-        description="Maximum tokens to generate",
+    max_tokens: Optional[int] = Field(
+        default=None,
+        description=(
+            "Maximum tokens to generate; omitted by default so OpenAI-compatible "
+            "clients do not accidentally request the full model context length"
+        ),
     )
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
@@ -1103,8 +1106,12 @@ class QWNMachineServer:
         text: str = Form(..., description="Prompt text"),
         system_prompt: str = Form(default="", description="Optional system prompt"),
         model: str = Form(default="", description="Model label"),
-        max_tokens: int = Form(
-            default=DEFAULT_MAX_TOKENS, description="Maximum tokens"
+        max_tokens: Optional[int] = Form(
+            default=None,
+            description=(
+                "Maximum tokens; omitted by default so prompts still leave room "
+                "for input context"
+            ),
         ),
         temperature: float = Form(default=0.7, description="Temperature"),
         top_p: float = Form(default=0.9, description="Top-p"),
@@ -1113,15 +1120,15 @@ class QWNMachineServer:
         if system_prompt:
             messages.append({"role": "system", "content": system_prompt})
         messages.append({"role": "user", "content": text})
-        body = orjson.dumps(
-            {
-                "model": model,
-                "messages": messages,
-                "max_tokens": max_tokens,
-                "temperature": temperature,
-                "top_p": top_p,
-            }
-        )
+        payload = {
+            "model": model,
+            "messages": messages,
+            "temperature": temperature,
+            "top_p": top_p,
+        }
+        if max_tokens is not None:
+            payload["max_tokens"] = max_tokens
+        body = orjson.dumps(payload)
         return await self._forward_chat(
             body,
             self._resolve_requested_model_field(model),

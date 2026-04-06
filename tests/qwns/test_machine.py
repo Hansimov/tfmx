@@ -14,6 +14,7 @@ from fastapi import HTTPException
 from tfmx.qwns.machine import ModelInfo
 from tfmx.qwns.machine import ModelsResponse
 from tfmx.qwns.machine import ChatCompletionRequest
+from tfmx.qwns.machine import ChatCompletionResponse
 from tfmx.qwns.machine import QWNInstance
 from tfmx.qwns.machine import QWNInstanceDiscovery
 from tfmx.qwns.machine import QWNMachineDaemon
@@ -104,7 +105,53 @@ class TestQWNMachineServer:
             ]
         )
         assert request.messages[0].content[1].type == "image_url"
-        assert request.max_tokens == 8192
+        assert request.max_tokens is None
+
+    def test_chat_completions_omits_max_tokens_when_not_provided(self):
+        server = QWNMachineServer(instances=[])
+        server._forward_chat = AsyncMock(return_value=ChatCompletionResponse())
+
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hello"}],
+        )
+        asyncio.run(server.chat_completions(request))
+
+        body = server._forward_chat.call_args.args[0]
+        payload = orjson.loads(body)
+        assert "max_tokens" not in payload
+
+    def test_chat_completions_preserves_explicit_max_tokens(self):
+        server = QWNMachineServer(instances=[])
+        server._forward_chat = AsyncMock(return_value=ChatCompletionResponse())
+
+        request = ChatCompletionRequest(
+            messages=[{"role": "user", "content": "hello"}],
+            max_tokens=256,
+        )
+        asyncio.run(server.chat_completions(request))
+
+        body = server._forward_chat.call_args.args[0]
+        payload = orjson.loads(body)
+        assert payload["max_tokens"] == 256
+
+    def test_chat_form_omits_max_tokens_when_not_provided(self):
+        server = QWNMachineServer(instances=[])
+        server._forward_chat = AsyncMock(return_value=ChatCompletionResponse())
+
+        asyncio.run(
+            server.chat_form(
+                text="hello",
+                system_prompt="",
+                model="",
+                max_tokens=None,
+                temperature=0.7,
+                top_p=0.9,
+            )
+        )
+
+        body = server._forward_chat.call_args.args[0]
+        payload = orjson.loads(body)
+        assert "max_tokens" not in payload
 
     def test_get_model_label(self):
         instance = QWNInstance(
