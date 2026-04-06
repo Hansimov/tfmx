@@ -117,6 +117,9 @@ qwn compose up \
 - 当前 `qwn machine` 的实例打分不再只看“还有几个空闲槽位”，而是同时综合：活动并发、GPU 压力、近期请求延迟、近期首 token 延迟、近期生成 tok/s、近期失败/冷却状态，以及最近 60 秒请求倾斜度
 - 这类设计的目标不是做严格公平分发，而是在“无热点时尽量快、出现热点时尽量稳、恢复后尽量快回到正常状态”之间取平衡
 - `qwn client info` 中的 `score` 越低越容易被选中；如果你看到某张卡的 `pressure`、`lat`、`ttft`、`tokps` 或 `fail/cooldown` 突然恶化，通常它的 `score` 也会同步变差
+- 现在调度器还会在基础权重之上做轻量级自动调权：当最近窗口里出现热点 GPU、明显的吞吐差异、异常 TTFT 或失败率抬升时，`gpu_pressure`、`throughput`、`failures` 等分量会被临时放大，热点缓解后再逐步回落到基础权重
+- `GET /info` 和 `qwn client info` 会同时展示 `weights` 与 `base_weights`；`GET /metrics` 则会把这两组权重以 `kind="effective|base"` 的标签暴露出来，便于直接接 Prometheus / Grafana 做长期观察
+- 2026-04-06 的一次实测中，GPU2 上的 TEI `/embed` 压力把该卡利用率打到 `78-98%` 时，调度器会把 `gpu_pressure` 权重从基础值 `0.24` 临时抬到约 `0.34-0.36`，同时把 `load` 权重从 `0.32` 下调到约 `0.26-0.27`；在同样 `120` 个 `qwn` 请求下仍保持 `24.64 req/s`、`0` 错误，热点结束后权重又自动回落到接近基础值
 
 ## 突发实例故障与 failover
 

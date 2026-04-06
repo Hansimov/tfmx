@@ -16,7 +16,7 @@ import uvicorn
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from fastapi import FastAPI, Form, HTTPException, Request
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pathlib import Path
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
@@ -30,9 +30,12 @@ from .router import InstanceDescriptor, QWNRouter, parse_model_spec
 from .adaptive_routing import DEFAULT_FAILURE_COOLDOWN_SEC
 from .adaptive_routing import InstanceTelemetry
 from .adaptive_routing import RECENT_WINDOW_SEC
+from .adaptive_routing import SchedulerTuningConfig
+from .adaptive_routing import SchedulerTuningResult
 from .adaptive_routing import SchedulerWeights
 from .adaptive_routing import compute_candidate_score
 from .adaptive_routing import get_peer_baseline
+from .adaptive_routing import tune_scheduler_weights
 
 
 PORT = MACHINE_PORT
@@ -204,6 +207,8 @@ class SchedulerInfo(BaseModel):
     last_health_refresh_age_sec: float | None = Field(None)
     last_gpu_refresh_age_sec: float | None = Field(None)
     weights: dict[str, float] = Field(default_factory=dict)
+    base_weights: dict[str, float] = Field(default_factory=dict)
+    tuning: dict[str, object] = Field(default_factory=dict)
 
 
 class InfoResponse(BaseModel):
@@ -470,7 +475,8 @@ class QWNMachineServer:
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
         self.router = QWNRouter()
-        self.scheduler_weights = SchedulerWeights()
+        self.scheduler_base_weights = SchedulerWeights()
+        self.scheduler_tuning_config = SchedulerTuningConfig()
         self._capacity_cond: Optional[asyncio.Condition] = None
         self._last_health_refresh_monotonic: float = 0.0
         self._last_gpu_refresh_monotonic: float = 0.0
@@ -539,11 +545,80 @@ class QWNMachineServer:
             candidates = [instance for instance in candidates if instance.is_idle]
         return candidates
 
+    def _get_peer_instances_for_instance(
+        self,
+        instance: QWNInstance,
+        healthy_instances: list[QWNInstance],
+    ) -> list[QWNInstance]:
+        if not healthy_instances:
+            return []
+        if not instance.model_name:
+            return healthy_instances
+        peer_instances = [
+            peer
+            for peer in healthy_instances
+            if peer.model_name == instance.model_name
+            and peer.quant_level == instance.quant_level
+        ]
+        return peer_instances or healthy_instances
+
+    def _get_effective_scheduler_weights(
+        self,
+        peer_instances: list[QWNInstance],
+        now: float,
+    ) -> SchedulerTuningResult:
+        if not peer_instances:
+            return SchedulerTuningResult(
+                weights=self.scheduler_base_weights,
+                signals={},
+            )
+
+        active_ratios = [
+            instance._active_requests / max(MAX_CONCURRENT, 1)
+            for instance in peer_instances
+        ]
+        gpu_pressures = [instance.routing_pressure for instance in peer_instances]
+        latencies_ms = [
+            instance.telemetry.latency_ema_ms for instance in peer_instances
+        ]
+        ttfts_ms = [instance.telemetry.ttft_ema_ms for instance in peer_instances]
+        throughputs_tokens_per_second = [
+            instance.telemetry.tokens_per_second_ema for instance in peer_instances
+        ]
+        recent_requests = [
+            instance.telemetry.recent_requests(now) for instance in peer_instances
+        ]
+        failure_rates = []
+        consecutive_failures = []
+        for instance in peer_instances:
+            recent_request_count = instance.telemetry.recent_requests(now)
+            recent_failure_count = instance.telemetry.recent_failures(now)
+            failure_rates.append(
+                recent_failure_count / recent_request_count
+                if recent_request_count > 0
+                else 0.0
+            )
+            consecutive_failures.append(instance.telemetry.consecutive_failures)
+
+        return tune_scheduler_weights(
+            base_weights=self.scheduler_base_weights,
+            active_ratios=active_ratios,
+            gpu_pressures=gpu_pressures,
+            latencies_ms=latencies_ms,
+            ttfts_ms=ttfts_ms,
+            throughputs_tokens_per_second=throughputs_tokens_per_second,
+            recent_requests=recent_requests,
+            failure_rates=failure_rates,
+            consecutive_failures=consecutive_failures,
+            config=self.scheduler_tuning_config,
+        )
+
     def _score_instance(
         self,
         instance: QWNInstance,
         peer_instances: list[QWNInstance],
         now: float,
+        weights: SchedulerWeights,
     ) -> tuple[float, dict[str, float]]:
         telemetry = instance.telemetry.snapshot(now)
         recent_requests = telemetry["recent_requests"]
@@ -585,7 +660,7 @@ class QWNMachineServer:
             failure_rate=failure_rate,
             consecutive_failures=instance.telemetry.consecutive_failures,
             cooldown_remaining_sec=instance.telemetry.cooldown_remaining_sec(now),
-            weights=self.scheduler_weights,
+            weights=weights,
         )
 
     def _build_instance_scheduler_info(
@@ -593,12 +668,18 @@ class QWNMachineServer:
         instance: QWNInstance,
         peer_instances: list[QWNInstance],
         now: float,
+        weights: SchedulerWeights,
     ) -> InstanceSchedulerInfo:
         telemetry = instance.telemetry.snapshot(now)
         score = None
         components: dict[str, float] = {}
         if instance.healthy and peer_instances:
-            score, components = self._score_instance(instance, peer_instances, now)
+            score, components = self._score_instance(
+                instance,
+                peer_instances,
+                now,
+                weights,
+            )
         return InstanceSchedulerInfo(
             score=round(score, 4) if score is not None else None,
             recent_requests=telemetry["recent_requests"],
@@ -618,6 +699,8 @@ class QWNMachineServer:
 
     def _build_scheduler_summary(self) -> SchedulerInfo:
         now = time.monotonic()
+        healthy_instances = self.get_healthy_instances()
+        tuning = self._get_effective_scheduler_weights(healthy_instances, now)
         return SchedulerInfo(
             algorithm=SCHEDULER_ALGORITHM,
             recent_window_sec=RECENT_WINDOW_SEC,
@@ -638,7 +721,12 @@ class QWNMachineServer:
                 if self._last_gpu_refresh_monotonic > 0
                 else None
             ),
-            weights=self.scheduler_weights.to_dict(),
+            weights=tuning.weights.to_dict(),
+            base_weights=self.scheduler_base_weights.to_dict(),
+            tuning={
+                **self.scheduler_tuning_config.to_dict(),
+                "signals": tuning.signals,
+            },
         )
 
     def _select_idle_instance(
@@ -659,9 +747,15 @@ class QWNMachineServer:
         if not idle_candidates:
             return None, True
         now = time.monotonic()
+        tuning = self._get_effective_scheduler_weights(candidates, now)
         scored_candidates: list[tuple[float, QWNInstance]] = []
         for instance in idle_candidates:
-            score, _ = self._score_instance(instance, candidates, now)
+            score, _ = self._score_instance(
+                instance,
+                candidates,
+                now,
+                tuning.weights,
+            )
             scored_candidates.append((score, instance))
         scored_candidates.sort(
             key=lambda item: (
@@ -753,6 +847,7 @@ class QWNMachineServer:
         app.get("/health", response_model=HealthResponse)(self.health)
         app.get("/v1/models", response_model=ModelsResponse)(self.models)
         app.get("/info", response_model=InfoResponse)(self.info)
+        app.get("/metrics")(self.metrics)
         app.post("/v1/chat/completions", response_model=ChatCompletionResponse)(
             self.chat_completions
         )
@@ -950,8 +1045,18 @@ class QWNMachineServer:
                     model_label=self._get_model_label(instance),
                     scheduler=self._build_instance_scheduler_info(
                         instance,
-                        healthy_instances,
+                        self._get_peer_instances_for_instance(
+                            instance,
+                            healthy_instances,
+                        ),
                         now,
+                        self._get_effective_scheduler_weights(
+                            self._get_peer_instances_for_instance(
+                                instance,
+                                healthy_instances,
+                            ),
+                            now,
+                        ).weights,
                     ),
                 )
                 for instance in self.instances
@@ -1104,6 +1209,416 @@ class QWNMachineServer:
             }
         }
         return f"data: {orjson.dumps(payload).decode()}\n\n"
+
+    @staticmethod
+    def _escape_prometheus_label(value: object) -> str:
+        text = str(value)
+        return text.replace("\\", "\\\\").replace("\n", "\\n").replace('"', '\\"')
+
+    @staticmethod
+    def _format_prometheus_value(value: object) -> str:
+        if value is None:
+            return "NaN"
+        if isinstance(value, bool):
+            return "1" if value else "0"
+        if isinstance(value, int):
+            return str(value)
+        return f"{float(value):.10g}"
+
+    def _append_prometheus_metric(
+        self,
+        lines: list[str],
+        declared: set[str],
+        name: str,
+        value: object,
+        *,
+        labels: dict[str, object] | None = None,
+        help_text: str | None = None,
+        metric_type: str | None = None,
+    ) -> None:
+        if name not in declared:
+            if help_text:
+                lines.append(f"# HELP {name} {help_text}")
+            if metric_type:
+                lines.append(f"# TYPE {name} {metric_type}")
+            declared.add(name)
+        label_text = ""
+        if labels:
+            label_text = (
+                "{"
+                + ",".join(
+                    f'{key}="{self._escape_prometheus_label(label_value)}"'
+                    for key, label_value in sorted(labels.items())
+                )
+                + "}"
+            )
+        lines.append(f"{name}{label_text} {self._format_prometheus_value(value)}")
+
+    def _build_metrics_payload(self) -> str:
+        now = time.monotonic()
+        healthy_instances = self.get_healthy_instances()
+        stats_model = self.stats.to_model()
+        scheduler_summary = self._build_scheduler_summary()
+        tuning = self._get_effective_scheduler_weights(healthy_instances, now)
+
+        lines: list[str] = []
+        declared: set[str] = set()
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_up",
+            True,
+            help_text="Whether the qwn machine process is serving requests.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_instances_total",
+            len(self.instances),
+            help_text="Total number of discovered qwn backend instances.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_instances_healthy_total",
+            len(healthy_instances),
+            help_text="Number of currently healthy qwn backend instances.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_requests_total",
+            stats_model.total_requests,
+            help_text="Total requests handled by qwn machine.",
+            metric_type="counter",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_tokens_total",
+            stats_model.total_tokens,
+            help_text="Total tokens reported by upstream qwn backends.",
+            metric_type="counter",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_errors_total",
+            stats_model.total_errors,
+            help_text="Total proxy-visible qwn machine errors.",
+            metric_type="counter",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_failovers_total",
+            stats_model.total_failovers,
+            help_text="Total pre-response failovers performed by qwn machine.",
+            metric_type="counter",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_active_requests",
+            stats_model.active_requests,
+            help_text="Number of requests currently active in qwn machine.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_wait_events_total",
+            stats_model.total_wait_events,
+            help_text="Total number of instance-capacity wait events observed by qwn machine.",
+            metric_type="counter",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_wait_time_avg_ms",
+            stats_model.avg_wait_time_ms,
+            help_text="Average instance-capacity wait time in milliseconds.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_wait_time_max_ms",
+            stats_model.max_wait_time_ms,
+            help_text="Maximum observed instance-capacity wait time in milliseconds.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_scheduler_auto_tuning_enabled",
+            self.scheduler_tuning_config.enabled,
+            help_text="Whether scheduler auto-tuning is enabled.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_scheduler_refresh_age_seconds",
+            scheduler_summary.last_health_refresh_age_sec,
+            labels={"kind": "health"},
+            help_text="Age of the latest scheduler refresh snapshots.",
+            metric_type="gauge",
+        )
+        self._append_prometheus_metric(
+            lines,
+            declared,
+            "qwn_machine_scheduler_refresh_age_seconds",
+            scheduler_summary.last_gpu_refresh_age_sec,
+            labels={"kind": "gpu"},
+            metric_type="gauge",
+        )
+        for component, weight in scheduler_summary.base_weights.items():
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_scheduler_weight",
+                weight,
+                labels={"kind": "base", "component": component},
+                help_text="Scheduler component weights.",
+                metric_type="gauge",
+            )
+        for component, weight in scheduler_summary.weights.items():
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_scheduler_weight",
+                weight,
+                labels={"kind": "effective", "component": component},
+                metric_type="gauge",
+            )
+        for signal_name, signal_value in tuning.signals.items():
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_scheduler_signal",
+                signal_value,
+                labels={"signal": signal_name},
+                help_text="Recent scheduler auto-tuning signals.",
+                metric_type="gauge",
+            )
+        for (
+            setting_name,
+            setting_value,
+        ) in self.scheduler_tuning_config.to_dict().items():
+            if setting_name == "enabled":
+                continue
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_scheduler_config",
+                setting_value,
+                labels={"setting": setting_name},
+                help_text="Scheduler auto-tuning configuration values.",
+                metric_type="gauge",
+            )
+
+        for instance in self.instances:
+            peer_instances = self._get_peer_instances_for_instance(
+                instance,
+                healthy_instances,
+            )
+            peer_tuning = self._get_effective_scheduler_weights(peer_instances, now)
+            scheduler_info = self._build_instance_scheduler_info(
+                instance,
+                peer_instances,
+                now,
+                peer_tuning.weights,
+            )
+            labels = {
+                "instance": instance.container_name,
+                "endpoint": instance.endpoint,
+                "gpu_id": instance.gpu_id if instance.gpu_id is not None else "unknown",
+                "model": self._get_model_label(instance) or "unknown",
+            }
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_up",
+                instance.healthy,
+                labels=labels,
+                help_text="Whether a qwn backend instance is currently healthy.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_requests_total",
+                self.stats.requests_per_instance.get(instance.container_name, 0),
+                labels=labels,
+                help_text="Total requests routed to a qwn backend instance.",
+                metric_type="counter",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_active_requests",
+                instance._active_requests,
+                labels=labels,
+                help_text="Current active requests for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_available_slots",
+                instance.available_slots,
+                labels=labels,
+                help_text="Currently available request slots for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_gpu_utilization_pct",
+                instance._gpu_utilization_pct,
+                labels=labels,
+                help_text="Current GPU utilization percentage for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_gpu_memory_used_mib",
+                instance._gpu_memory_used_mib,
+                labels=labels,
+                help_text="Current GPU memory used in MiB for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_gpu_memory_total_mib",
+                instance._gpu_memory_total_mib,
+                labels=labels,
+                help_text="Total GPU memory in MiB for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_routing_pressure",
+                instance.routing_pressure,
+                labels=labels,
+                help_text="Current routing pressure for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_scheduler_score",
+                scheduler_info.score,
+                labels=labels,
+                help_text="Current scheduler score for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_recent_requests",
+                scheduler_info.recent_requests,
+                labels=labels,
+                help_text="Recent-window requests seen by a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_recent_successes",
+                scheduler_info.recent_successes,
+                labels=labels,
+                help_text="Recent-window successful requests for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_recent_failures",
+                scheduler_info.recent_failures,
+                labels=labels,
+                help_text="Recent-window failed requests for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_success_rate",
+                scheduler_info.success_rate,
+                labels=labels,
+                help_text="Recent-window success rate for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_latency_ema_ms",
+                scheduler_info.latency_ema_ms,
+                labels=labels,
+                help_text="Latency EMA in milliseconds for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_ttft_ema_ms",
+                scheduler_info.ttft_ema_ms,
+                labels=labels,
+                help_text="TTFT EMA in milliseconds for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_tokens_per_second_ema",
+                scheduler_info.tokens_per_second_ema,
+                labels=labels,
+                help_text="Generation tokens-per-second EMA for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_cooldown_remaining_seconds",
+                scheduler_info.cooldown_remaining_sec,
+                labels=labels,
+                help_text="Remaining scheduler cooldown for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            self._append_prometheus_metric(
+                lines,
+                declared,
+                "qwn_machine_instance_consecutive_failures",
+                scheduler_info.consecutive_failures,
+                labels=labels,
+                help_text="Current consecutive failure count for a qwn backend instance.",
+                metric_type="gauge",
+            )
+            for component, component_value in scheduler_info.score_components.items():
+                self._append_prometheus_metric(
+                    lines,
+                    declared,
+                    "qwn_machine_instance_scheduler_component",
+                    component_value,
+                    labels={**labels, "component": component},
+                    help_text="Per-component scheduler penalties for a qwn backend instance.",
+                    metric_type="gauge",
+                )
+
+        return "\n".join(lines) + "\n"
+
+    async def metrics(self) -> PlainTextResponse:
+        return PlainTextResponse(
+            self._build_metrics_payload(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     async def _forward_stream(
         self, body: bytes, model_field: str = ""

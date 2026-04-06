@@ -49,13 +49,15 @@ qwn machine restart
 - `GET /v1/models`
 - `GET /health`
 - `GET /info`
+- `GET /metrics`
 - `POST /chat`
 
 ### 调度观测
 
-- `GET /info` 现在除了实例列表和累计统计外，还会返回顶层 `scheduler` 摘要，包含当前算法名、近期窗口长度、实例获取超时、最近健康刷新年龄和权重配置
+- `GET /info` 现在除了实例列表和累计统计外，还会返回顶层 `scheduler` 摘要，包含当前算法名、近期窗口长度、实例获取超时、最近健康刷新年龄、基础权重、实时生效权重，以及自动调权配置与最近窗口信号
 - 每个实例的 `scheduler` 字段会暴露 `score`、`recent_requests`、`recent_failures`、`latency_ema_ms`、`ttft_ema_ms`、`tokens_per_second_ema`、`cooldown_remaining_sec` 等实时调度指标
-- `qwn client info` 会把这些关键字段整理成更易读的终端输出，例如 `active=已用/总槽位`、`score=...`、`lat=...`、`ttft=...`、`tokps=...`、`recent=...`
+- `GET /metrics` 会额外输出 Prometheus 文本格式指标，当前重点包括：`qwn_machine_scheduler_weight`、`qwn_machine_scheduler_signal`、`qwn_machine_instance_scheduler_score`，以及请求量、token、错误、failover、等待事件等运行时计数器
+- `qwn client info` 会把这些关键字段整理成更易读的终端输出，例如 `active=已用/总槽位`、`score=...`、`lat=...`、`ttft=...`、`tokps=...`、`recent=...`，并直接展示当前 `weights`、`base_weights` 与 `tuning.signals`
 
 ## `qwn client`
 

@@ -26,6 +26,34 @@ class SchedulerWeights:
     failures: float = 0.08
     skew: float = 0.02
 
+    @classmethod
+    def components(cls) -> tuple[str, ...]:
+        return (
+            "load",
+            "gpu_pressure",
+            "latency",
+            "ttft",
+            "throughput",
+            "failures",
+            "skew",
+        )
+
+    def raw_dict(self) -> dict[str, float]:
+        return {
+            "load": self.load,
+            "gpu_pressure": self.gpu_pressure,
+            "latency": self.latency,
+            "ttft": self.ttft,
+            "throughput": self.throughput,
+            "failures": self.failures,
+            "skew": self.skew,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict[str, float]) -> "SchedulerWeights":
+        normalized = _normalize_weight_map(data)
+        return cls(**normalized)
+
     def to_dict(self) -> dict[str, float]:
         return {
             "load": round(self.load, 4),
@@ -36,6 +64,36 @@ class SchedulerWeights:
             "failures": round(self.failures, 4),
             "skew": round(self.skew, 4),
         }
+
+
+@dataclass(frozen=True)
+class SchedulerTuningConfig:
+    enabled: bool = True
+    target_latency_ms: float = 900.0
+    target_ttft_ms: float = 300.0
+    hot_gpu_pressure: float = 0.72
+    saturation_active_ratio: float = 0.65
+    throughput_cv_threshold: float = 0.08
+    failure_rate_threshold: float = 0.03
+    request_cv_threshold: float = 0.20
+
+    def to_dict(self) -> dict[str, float | bool]:
+        return {
+            "enabled": self.enabled,
+            "target_latency_ms": round(self.target_latency_ms, 2),
+            "target_ttft_ms": round(self.target_ttft_ms, 2),
+            "hot_gpu_pressure": round(self.hot_gpu_pressure, 4),
+            "saturation_active_ratio": round(self.saturation_active_ratio, 4),
+            "throughput_cv_threshold": round(self.throughput_cv_threshold, 4),
+            "failure_rate_threshold": round(self.failure_rate_threshold, 4),
+            "request_cv_threshold": round(self.request_cv_threshold, 4),
+        }
+
+
+@dataclass(frozen=True)
+class SchedulerTuningResult:
+    weights: SchedulerWeights
+    signals: dict[str, float] = field(default_factory=dict)
 
 
 def _new_history() -> deque[float]:
@@ -192,6 +250,135 @@ def get_peer_baseline(values: list[float], fallback: float) -> float:
     if not positives:
         return fallback
     return max(fallback * 0.5, sum(positives) / len(positives))
+
+
+def _normalize_weight_map(values: dict[str, float]) -> dict[str, float]:
+    components = SchedulerWeights.components()
+    cleaned = {name: max(0.0, float(values.get(name, 0.0))) for name in components}
+    total = sum(cleaned.values())
+    if total <= 0:
+        default_weights = SchedulerWeights().raw_dict()
+        total = sum(default_weights.values())
+        return {name: default_weights[name] / total for name in components}
+    return {name: cleaned[name] / total for name in components}
+
+
+def _mean(values: list[float]) -> float:
+    if not values:
+        return 0.0
+    return sum(values) / len(values)
+
+
+def _coefficient_of_variation(values: list[float]) -> float:
+    positives = [value for value in values if value > 0]
+    if len(positives) < 2:
+        return 0.0
+    mean_value = _mean(positives)
+    if mean_value <= 0:
+        return 0.0
+    variance = sum((value - mean_value) ** 2 for value in positives) / len(positives)
+    return (variance**0.5) / mean_value
+
+
+def tune_scheduler_weights(
+    *,
+    base_weights: SchedulerWeights,
+    active_ratios: list[float],
+    gpu_pressures: list[float],
+    latencies_ms: list[float],
+    ttfts_ms: list[float],
+    throughputs_tokens_per_second: list[float],
+    recent_requests: list[int],
+    failure_rates: list[float],
+    consecutive_failures: list[int],
+    config: SchedulerTuningConfig,
+) -> SchedulerTuningResult:
+    if not config.enabled:
+        return SchedulerTuningResult(weights=base_weights, signals={})
+
+    active_values = [max(0.0, value) for value in active_ratios]
+    gpu_values = [min(max(value, 0.0), 1.0) for value in gpu_pressures]
+    latency_values = [value for value in latencies_ms if value > 0]
+    ttft_values = [value for value in ttfts_ms if value > 0]
+    throughput_values = [value for value in throughputs_tokens_per_second if value > 0]
+    request_values = [max(0, int(value)) for value in recent_requests]
+    failure_values = [min(max(value, 0.0), 1.0) for value in failure_rates]
+    consecutive_values = [max(0, int(value)) for value in consecutive_failures]
+
+    avg_active_ratio = _mean(active_values)
+    max_active_ratio = max(active_values) if active_values else 0.0
+    avg_gpu_pressure = _mean(gpu_values)
+    max_gpu_pressure = max(gpu_values) if gpu_values else 0.0
+    gpu_pressure_cv = _coefficient_of_variation(gpu_values)
+    avg_latency_ms = _mean(latency_values)
+    max_latency_ms = max(latency_values) if latency_values else 0.0
+    avg_ttft_ms = _mean(ttft_values)
+    max_ttft_ms = max(ttft_values) if ttft_values else 0.0
+    avg_throughput = _mean(throughput_values)
+    min_throughput = min(throughput_values) if throughput_values else 0.0
+    throughput_cv = _coefficient_of_variation(throughput_values)
+    avg_failure_rate = _mean(failure_values)
+    max_failure_rate = max(failure_values) if failure_values else 0.0
+    max_consecutive_failures = max(consecutive_values) if consecutive_values else 0
+    request_cv = _coefficient_of_variation([float(value) for value in request_values])
+
+    active_saturation = max(0.0, avg_active_ratio - config.saturation_active_ratio)
+    hot_gpu_excess = max(0.0, max_gpu_pressure - config.hot_gpu_pressure)
+    latency_excess = max(0.0, avg_latency_ms / config.target_latency_ms - 1.0)
+    ttft_excess = max(0.0, avg_ttft_ms / config.target_ttft_ms - 1.0)
+    throughput_cv_excess = max(0.0, throughput_cv - config.throughput_cv_threshold)
+    failure_excess = max(0.0, avg_failure_rate - config.failure_rate_threshold)
+    request_cv_excess = max(0.0, request_cv - config.request_cv_threshold)
+
+    throughput_floor_penalty = 0.0
+    if avg_throughput > 0 and min_throughput > 0:
+        throughput_floor_penalty = max(0.0, 1.0 - (min_throughput / avg_throughput))
+
+    factors = {name: 1.0 for name in SchedulerWeights.components()}
+    factors["load"] += active_saturation * 1.2 + max(0.0, max_active_ratio - 0.85) * 0.8
+    factors["gpu_pressure"] += (
+        max(0.0, avg_gpu_pressure - 0.45) * 0.8
+        + hot_gpu_excess * 1.8
+        + gpu_pressure_cv * 0.4
+    )
+    factors["latency"] += (
+        latency_excess * 0.9
+        + max(0.0, max_latency_ms / config.target_latency_ms - 1.4) * 0.5
+    )
+    factors["ttft"] += (
+        ttft_excess * 1.0 + max(0.0, max_ttft_ms / config.target_ttft_ms - 1.5) * 0.4
+    )
+    factors["throughput"] += throughput_cv_excess * 1.2 + throughput_floor_penalty * 0.6
+    factors["failures"] += (
+        failure_excess * 2.5
+        + max(0.0, max_failure_rate - config.failure_rate_threshold) * 3.0
+        + max_consecutive_failures * 0.18
+    )
+    factors["skew"] += request_cv_excess * 1.0
+
+    adjusted = {
+        component: base_weights.raw_dict()[component] * factors[component]
+        for component in SchedulerWeights.components()
+    }
+    tuned_weights = SchedulerWeights.from_dict(adjusted)
+    signals = {
+        "avg_active_ratio": round(avg_active_ratio, 4),
+        "max_active_ratio": round(max_active_ratio, 4),
+        "avg_gpu_pressure": round(avg_gpu_pressure, 4),
+        "max_gpu_pressure": round(max_gpu_pressure, 4),
+        "avg_latency_ms": round(avg_latency_ms, 2),
+        "max_latency_ms": round(max_latency_ms, 2),
+        "avg_ttft_ms": round(avg_ttft_ms, 2),
+        "max_ttft_ms": round(max_ttft_ms, 2),
+        "avg_throughput_tps": round(avg_throughput, 2),
+        "min_throughput_tps": round(min_throughput, 2),
+        "throughput_cv": round(throughput_cv, 4),
+        "avg_failure_rate": round(avg_failure_rate, 4),
+        "max_failure_rate": round(max_failure_rate, 4),
+        "max_consecutive_failures": float(max_consecutive_failures),
+        "request_cv": round(request_cv, 4),
+    }
+    return SchedulerTuningResult(weights=tuned_weights, signals=signals)
 
 
 def _metric_penalty(value: float, baseline: float) -> float:

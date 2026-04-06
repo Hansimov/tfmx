@@ -149,6 +149,11 @@ class TestInfoResponse:
                 "scheduler": {
                     "algorithm": "adaptive_pressure_v2",
                     "recent_window_sec": 60.0,
+                    "base_weights": {"load": 0.32},
+                    "tuning": {
+                        "enabled": True,
+                        "signals": {"avg_gpu_pressure": 0.31},
+                    },
                 },
             }
         )
@@ -159,6 +164,9 @@ class TestInfoResponse:
         assert info.instances[0].scheduler.score == 0.42
         assert info.stats.total_wait_events == 2
         assert info.scheduler.algorithm == "adaptive_pressure_v2"
+        assert info.scheduler.base_weights["load"] == 0.32
+        assert info.scheduler.tuning.enabled is True
+        assert info.scheduler.tuning.signals["avg_gpu_pressure"] == 0.31
 
 
 class TestQWNClient:

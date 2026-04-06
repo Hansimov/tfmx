@@ -343,6 +343,42 @@ class TestQWNMachineServer:
         assert result.instances[0].scheduler.latency_ema_ms == 1200.0
         assert result.instances[0].active_requests == 0
 
+    def test_metrics_payload_includes_scheduler_and_instance_metrics(self):
+        now = time.monotonic()
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+            model_name="4b:4bit",
+            gpu_id=0,
+        )
+        instance._gpu_utilization_pct = 33.0
+        instance._gpu_memory_used_mib = 10240.0
+        instance._gpu_memory_total_mib = 20480.0
+        instance.telemetry.record_dispatch(now=now)
+        instance.telemetry.record_success(
+            latency_ms=800.0,
+            ttft_ms=240.0,
+            completion_tokens=32,
+            now=now,
+        )
+        server = QWNMachineServer(instances=[instance])
+        server.stats.total_requests = 3
+        server.stats.total_tokens = 128
+        server.stats.requests_per_instance[instance.container_name] = 3
+        server._last_health_refresh_monotonic = now
+        server._last_gpu_refresh_monotonic = now
+
+        payload = server._build_metrics_payload()
+
+        assert "qwn_machine_requests_total 3" in payload
+        assert (
+            'qwn_machine_scheduler_weight{component="load",kind="effective"}' in payload
+        )
+        assert "qwn_machine_instance_scheduler_score{" in payload
+        assert "qwn_machine_instance_tokens_per_second_ema{" in payload
+
     def test_acquire_instance_does_not_fallback_to_wrong_requested_model(self):
         primary = QWNInstance(
             container_name="qwn-multi--gpu0",

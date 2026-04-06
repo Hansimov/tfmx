@@ -318,6 +318,46 @@ class MachineStats:
 
 
 @dataclass
+class SchedulerTuningInfo:
+    enabled: bool = False
+    target_latency_ms: float = 0.0
+    target_ttft_ms: float = 0.0
+    hot_gpu_pressure: float = 0.0
+    saturation_active_ratio: float = 0.0
+    throughput_cv_threshold: float = 0.0
+    failure_rate_threshold: float = 0.0
+    request_cv_threshold: float = 0.0
+    signals: dict[str, float] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SchedulerTuningInfo":
+        return cls(
+            enabled=data.get("enabled", False),
+            target_latency_ms=data.get("target_latency_ms", 0.0),
+            target_ttft_ms=data.get("target_ttft_ms", 0.0),
+            hot_gpu_pressure=data.get("hot_gpu_pressure", 0.0),
+            saturation_active_ratio=data.get("saturation_active_ratio", 0.0),
+            throughput_cv_threshold=data.get("throughput_cv_threshold", 0.0),
+            failure_rate_threshold=data.get("failure_rate_threshold", 0.0),
+            request_cv_threshold=data.get("request_cv_threshold", 0.0),
+            signals=data.get("signals", {}),
+        )
+
+    def to_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "target_latency_ms": self.target_latency_ms,
+            "target_ttft_ms": self.target_ttft_ms,
+            "hot_gpu_pressure": self.hot_gpu_pressure,
+            "saturation_active_ratio": self.saturation_active_ratio,
+            "throughput_cv_threshold": self.throughput_cv_threshold,
+            "failure_rate_threshold": self.failure_rate_threshold,
+            "request_cv_threshold": self.request_cv_threshold,
+            "signals": self.signals,
+        }
+
+
+@dataclass
 class SchedulerInfo:
     algorithm: str = ""
     recent_window_sec: float = 0.0
@@ -325,6 +365,8 @@ class SchedulerInfo:
     last_health_refresh_age_sec: float | None = None
     last_gpu_refresh_age_sec: float | None = None
     weights: dict[str, float] = field(default_factory=dict)
+    base_weights: dict[str, float] = field(default_factory=dict)
+    tuning: SchedulerTuningInfo = field(default_factory=SchedulerTuningInfo)
 
     @classmethod
     def from_dict(cls, data: dict) -> "SchedulerInfo":
@@ -335,7 +377,21 @@ class SchedulerInfo:
             last_health_refresh_age_sec=data.get("last_health_refresh_age_sec"),
             last_gpu_refresh_age_sec=data.get("last_gpu_refresh_age_sec"),
             weights=data.get("weights", {}),
+            base_weights=data.get("base_weights", {}),
+            tuning=SchedulerTuningInfo.from_dict(data.get("tuning", {})),
         )
+
+    def to_dict(self) -> dict:
+        return {
+            "algorithm": self.algorithm,
+            "recent_window_sec": self.recent_window_sec,
+            "acquire_timeout_sec": self.acquire_timeout_sec,
+            "last_health_refresh_age_sec": self.last_health_refresh_age_sec,
+            "last_gpu_refresh_age_sec": self.last_gpu_refresh_age_sec,
+            "weights": self.weights,
+            "base_weights": self.base_weights,
+            "tuning": self.tuning.to_dict(),
+        }
 
 
 @dataclass
@@ -1310,7 +1366,7 @@ def run_from_args(args: argparse.Namespace) -> None:
             for line in dict_to_lines(info.stats.__dict__).splitlines():
                 logger.mesg(f"  {line}")
             logger.note("Scheduler:")
-            for line in dict_to_lines(info.scheduler.__dict__).splitlines():
+            for line in dict_to_lines(info.scheduler.to_dict()).splitlines():
                 logger.mesg(f"  {line}")
         elif args.client_action == "chat":
             messages = build_multimodal_messages(
