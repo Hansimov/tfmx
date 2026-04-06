@@ -43,9 +43,17 @@ qwn machine stop
 qwn machine restart
 ```
 
+- `qwn machine` 默认监听 `0.0.0.0:27800`，因此同局域网其他机器可以直接访问这台宿主机的 LAN IP
+- 对 OpenAI 兼容客户端，推荐把 base URL 指到 `http://<host>:27800`，实际请求路径使用 `/v1/chat/completions`
+- 当前代理也会兼容一部分旧的 thinking 扩展字段写法：若客户端发送顶层 `thinking` 或 `enable_thinking`，代理会自动归一化为 Qwen3.5/vLLM 需要的 `chat_template_kwargs.enable_thinking`
+- 若请求里不传 `model`，`qwn machine` 会稳定回落到当前默认模型，而不是在多模型部署里跨模型随机挑选
+- 当前同时支持 `/v1/chat/completions`、`/v1/models` 与无版本前缀的 `/chat/completions`、`/models` 兼容别名，便于不同第三方客户端直接接入
+
 ### OpenAI 兼容接口
 
+- `POST /chat/completions`
 - `POST /v1/chat/completions`
+- `GET /models`
 - `GET /v1/models`
 - `GET /health`
 - `GET /info`
@@ -85,6 +93,7 @@ qwn client -e http://localhost:27880 models
 - 当前默认会显式关闭 Qwen thinking 模式，只输出最终回答；如需保留思维链输出，可加 `--thinking`
 - `--thinking` 打开后，终端流式输出会在前后补上 `<thinking>` 与 `</thinking>` 包裹，便于肉眼区分思考段与正文
 - 当前 `qwn client chat` 与 `qwn client generate` 的默认 `--max-tokens` 为 `8192`，但实际可生成上限仍受当前服务端 `--max-model-len=8192` 约束
+- 由于后端 vLLM 已启用 `--reasoning-parser qwen3`，当前开启 thinking 后，OpenAI 兼容响应会尽量把思考过程放进结构化 `reasoning` / `reasoning_content` 字段，外部客户端也更容易正确解析
 
 ### 多图多文本消息
 

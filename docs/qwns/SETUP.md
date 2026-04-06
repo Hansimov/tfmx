@@ -81,6 +81,13 @@ qwn machine status
 qwn machine logs
 ```
 
+说明：
+
+- `qwn machine` 当前默认监听 `0.0.0.0:27800`，不仅是 `localhost`
+- 同机可用 `http://127.0.0.1:27800` 或 `http://localhost:27800` 访问；局域网内其他机器可直接用这台机器的 LAN IP，例如 `http://192.168.x.x:27800`
+- 若局域网机器仍无法访问，优先检查宿主机防火墙、安全组或上层路由策略，而不是 `qwn machine` 本身的 bind 地址
+- 对 OpenAI 兼容客户端，若 base URL 写成 `http://host:27800/v1`，可直接走标准 `/chat/completions` 与 `/models`；若 base URL 写成 `http://host:27800`，当前也额外兼容 `/chat/completions` 与 `/models` 这组无版本前缀别名
+
 ### 4. 验证服务并发起对话
 
 ```bash
@@ -96,6 +103,7 @@ python debugs/qwn_multimodal_probe.py
 - 这并不等于“无条件保证可以额外生成 8192 token”，因为当前部署的 `qwn compose` 默认 `--max-model-len` 也是 `8192`，实际可生成上限仍然受 `提示词 token + 输出 token <= 8192` 约束
 - 在当前 20GB RTX 3080 的实测环境里，5 个健康实例空闲时每卡显存大约在 `14.5-14.9 GiB / 20 GiB`；对单个后端发起 `max_tokens=8192` 的长输出请求时，`nvidia-smi` 观测到显存占用没有高于这一已预留水位，说明当前风险点不在“客户端默认值从 512 提到 8192”本身，而在于如果你要把服务端 `--max-model-len` 再继续往上加，才更可能触发 KV cache 带来的 OOM
 - 如果你确实需要在带较长 prompt 的情况下稳定生成接近 `8192` 个 token，应先评估是否要把服务端 `--max-model-len` 提高到 `12288` 或 `16384`；这在 20GB 卡上通常需要同步降低 `--max-num-seqs` 或 `--gpu-memory-utilization`
+- 当前 compose 启动的 vLLM 实例会带上 `--reasoning-parser qwen3`，因此当开启 thinking 模式时，返回体会尽量把思考过程放进结构化 `reasoning` / `reasoning_content` 字段，而不是只能混在正文字符串中
 
 ### 5. 运行 benchmark
 
@@ -108,7 +116,7 @@ qwn benchmark run -E http://localhost:27800 -n 100 -o runs/qwns/results/latest.j
 | 服务 | 端口 | 说明 |
 | --- | --- | --- |
 | vLLM 容器 | `27880+` | 每张 GPU 一个实例 |
-| qwn machine | `27800` | OpenAI 兼容代理 |
+| qwn machine | `27800` | OpenAI 兼容代理，默认监听 `0.0.0.0` |
 
 ## 后台服务文件
 

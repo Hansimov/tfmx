@@ -830,6 +830,8 @@ class ComposeFileGenerator:
             gpu_config.vllm_model_arg,
             "--served-model-name",
             gpu_config.served_model_name,
+            "--reasoning-parser",
+            "qwen3",
             "--max-model-len",
             str(self.max_model_len),
             "--max-num-seqs",

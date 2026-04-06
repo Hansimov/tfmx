@@ -109,6 +109,7 @@ class TestComposeFileGenerator:
         compose_text = generator.generate()
         assert "qwn-gpu0" in compose_text
         assert "--served-model-name" in compose_text
+        assert "--reasoning-parser qwen3" in compose_text
         assert DEFAULT_AWQ_MODEL in compose_text
         assert "PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/simple" in compose_text
         assert "HF_ENDPOINT=https://hf-mirror.com" in compose_text

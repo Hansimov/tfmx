@@ -497,6 +497,21 @@ class QWNMachineServer:
                 )
             )
 
+    def _get_default_route_descriptor(self) -> InstanceDescriptor | None:
+        return self.router.route()
+
+    def _get_default_model_field(self) -> str:
+        descriptor = self._get_default_route_descriptor()
+        if descriptor is None:
+            return ""
+        return descriptor.label or descriptor.model_name or ""
+
+    def _resolve_requested_model_field(self, model_field: str = "") -> str:
+        model_field = (model_field or "").strip()
+        if model_field:
+            return model_field
+        return self._get_default_model_field()
+
     def get_healthy_instances(self) -> list[QWNInstance]:
         return [instance for instance in self.instances if instance.healthy]
 
@@ -524,6 +539,10 @@ class QWNMachineServer:
         require_idle: bool = False,
     ) -> list[QWNInstance]:
         excluded_instances = excluded_instances or set()
+        if not model and not quant:
+            default_model_field = self._get_default_model_field()
+            if default_model_field:
+                model, quant = parse_model_spec(default_model_field)
         if model or quant:
             descriptors = self.router.find_instances(model, quant)
             endpoints = {descriptor.endpoint for descriptor in descriptors}
@@ -806,7 +825,9 @@ class QWNMachineServer:
             description=(
                 "Load-balanced proxy for Qwen 3.5 text vLLM instances.\n\n"
                 "- POST /v1/chat/completions: OpenAI-compatible chat API\n"
+                "- POST /chat/completions: OpenAI-compatible chat API alias\n"
                 "- GET /v1/models: list available models\n"
+                "- GET /models: list available models alias\n"
                 "- POST /chat: simplified form chat endpoint\n"
                 "- GET /health: instance health summary\n"
                 "- GET /info: machine stats and instance metadata"
@@ -845,9 +866,13 @@ class QWNMachineServer:
             )
 
         app.get("/health", response_model=HealthResponse)(self.health)
+        app.get("/models", response_model=ModelsResponse)(self.models)
         app.get("/v1/models", response_model=ModelsResponse)(self.models)
         app.get("/info", response_model=InfoResponse)(self.info)
         app.get("/metrics")(self.metrics)
+        app.post("/chat/completions", response_model=ChatCompletionResponse)(
+            self.chat_completions
+        )
         app.post("/v1/chat/completions", response_model=ChatCompletionResponse)(
             self.chat_completions
         )
@@ -1067,10 +1092,11 @@ class QWNMachineServer:
         )
 
     async def chat_completions(self, request: ChatCompletionRequest):
+        requested_model = self._resolve_requested_model_field(request.model)
         body = orjson.dumps(request.model_dump(exclude_none=True))
         if request.stream:
-            return await self._forward_stream(body, request.model)
-        return await self._forward_chat(body, request.model)
+            return await self._forward_stream(body, requested_model)
+        return await self._forward_chat(body, requested_model)
 
     async def chat_form(
         self,
@@ -1096,7 +1122,10 @@ class QWNMachineServer:
                 "top_p": top_p,
             }
         )
-        return await self._forward_chat(body, model)
+        return await self._forward_chat(
+            body,
+            self._resolve_requested_model_field(model),
+        )
 
     async def _acquire_instance(
         self,
@@ -1152,11 +1181,40 @@ class QWNMachineServer:
                 waited_sec += time.perf_counter() - wait_started_at
 
     def _rewrite_model_in_body(self, body: bytes, instance: QWNInstance) -> bytes:
-        if not instance.model_name:
-            return body
         try:
             payload = orjson.loads(body)
-            payload["model"] = instance.model_name
+            if instance.model_name:
+                payload["model"] = instance.model_name
+
+            chat_template_kwargs = payload.get("chat_template_kwargs")
+            if not isinstance(chat_template_kwargs, dict):
+                chat_template_kwargs = {}
+
+            if "enable_thinking" not in chat_template_kwargs:
+                normalized_enable_thinking = None
+                if isinstance(payload.get("enable_thinking"), bool):
+                    normalized_enable_thinking = payload["enable_thinking"]
+                else:
+                    thinking_config = payload.get("thinking")
+                    if isinstance(thinking_config, bool):
+                        normalized_enable_thinking = thinking_config
+                    elif isinstance(thinking_config, dict):
+                        thinking_type = (
+                            str(thinking_config.get("type", "")).strip().lower()
+                        )
+                        if thinking_type in {"enabled", "enable", "true", "on"}:
+                            normalized_enable_thinking = True
+                        elif thinking_type in {"disabled", "disable", "false", "off"}:
+                            normalized_enable_thinking = False
+
+                if normalized_enable_thinking is not None:
+                    chat_template_kwargs["enable_thinking"] = normalized_enable_thinking
+
+            if chat_template_kwargs:
+                payload["chat_template_kwargs"] = chat_template_kwargs
+
+            payload.pop("enable_thinking", None)
+            payload.pop("thinking", None)
             return orjson.dumps(payload)
         except Exception:
             return body

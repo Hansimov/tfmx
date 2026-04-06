@@ -12,6 +12,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tclogger import dict_to_lines, logger, logstr
 from typing import Callable, Optional
+from urllib.parse import urlsplit, urlunsplit
 
 from .compose import MACHINE_PORT as PORT, MAX_MODEL_LEN
 
@@ -33,6 +34,48 @@ _PROMPT_CHARS_PATTERN = re.compile(
     r"prompt contains\s*(\d+)\s+characters",
     re.IGNORECASE,
 )
+_ENDPOINT_ROUTE_SUFFIXES = (
+    "/v1/chat/completions",
+    "/chat/completions",
+    "/v1/models",
+    "/models",
+    "/health",
+    "/info",
+    "/metrics",
+)
+
+
+def _normalize_service_endpoint_root(endpoint: str) -> str:
+    normalized = endpoint.rstrip("/")
+    parsed = urlsplit(normalized)
+    path = parsed.path or ""
+
+    for suffix in _ENDPOINT_ROUTE_SUFFIXES:
+        if path.endswith(suffix):
+            path = path[: -len(suffix)]
+            break
+    else:
+        if path.endswith("/v1"):
+            path = path[: -len("/v1")]
+
+    normalized_path = path.rstrip("/")
+    return urlunsplit(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            normalized_path,
+            parsed.query,
+            parsed.fragment,
+        )
+    ).rstrip("/")
+
+
+def _join_endpoint_route(endpoint: str, route: str) -> str:
+    return f"{endpoint}{route}"
+
+
+def _extract_message_text(value: object) -> str:
+    return "".join(_iter_text_parts(value))
 
 
 @dataclass
@@ -65,15 +108,20 @@ class ModelInfo:
 class ChatMessage:
     role: str
     content: object
+    reasoning: object = ""
 
     def to_dict(self) -> dict:
-        return {"role": self.role, "content": self.content}
+        payload = {"role": self.role, "content": self.content}
+        if self.reasoning:
+            payload["reasoning"] = self.reasoning
+        return payload
 
     @classmethod
     def from_dict(cls, data: dict) -> "ChatMessage":
         return cls(
             role=data.get("role", "assistant"),
             content=data.get("content", ""),
+            reasoning=data.get("reasoning_content", data.get("reasoning", "")),
         )
 
 
@@ -131,7 +179,16 @@ class ChatResponse:
     def text(self) -> str:
         if not self.choices:
             return ""
-        return self.choices[0].message.content
+        message = self.choices[0].message
+        content_text = _extract_message_text(message.content)
+        reasoning_text = _extract_message_text(message.reasoning)
+        if reasoning_text and content_text:
+            return (
+                f"{THINKING_OPEN_TAG}{reasoning_text}{THINKING_CLOSE_TAG}{content_text}"
+            )
+        if reasoning_text:
+            return f"{THINKING_OPEN_TAG}{reasoning_text}{THINKING_CLOSE_TAG}"
+        return content_text
 
 
 @dataclass
@@ -671,9 +728,20 @@ class QWNClient:
         port: int = PORT,
         verbose: bool = False,
     ):
-        self.endpoint = endpoint.rstrip("/") if endpoint else f"http://{host}:{port}"
+        raw_endpoint = endpoint.rstrip("/") if endpoint else f"http://{host}:{port}"
+        self.endpoint = _normalize_service_endpoint_root(raw_endpoint)
+        self.chat_endpoint = _join_endpoint_route(self.endpoint, "/v1/chat/completions")
+        self.chat_alias_endpoint = _join_endpoint_route(
+            self.endpoint, "/chat/completions"
+        )
+        self.models_endpoint = _join_endpoint_route(self.endpoint, "/v1/models")
+        self.models_alias_endpoint = _join_endpoint_route(self.endpoint, "/models")
+        self.health_endpoint = _join_endpoint_route(self.endpoint, "/health")
+        self.info_endpoint = _join_endpoint_route(self.endpoint, "/info")
         self.verbose = verbose
         self.client = httpx.Client(timeout=httpx.Timeout(120.0))
+        self._cached_models: list[str] | None = None
+        self._cached_default_model: str = ""
 
     def close(self) -> None:
         if self.client is not None:
@@ -763,20 +831,60 @@ class QWNClient:
         except Exception:
             return False
 
-    def models(self) -> ModelInfo:
+    def _cache_models(self, models: list[str]) -> None:
+        self._cached_models = list(models)
+        if models:
+            self._cached_default_model = models[0]
+
+    def _resolve_model(self, model: str = "") -> str:
+        explicit_model = (model or "").strip()
+        if explicit_model:
+            return explicit_model
+        if self._cached_default_model:
+            return self._cached_default_model
         try:
-            response = self.client.get(f"{self.endpoint}/v1/models")
-            response.raise_for_status()
-            result = ModelInfo.from_dict(response.json())
-            self._log_okay("models", f"count={len(result.models)}")
-            return result
-        except Exception as exc:
-            self._log_fail("models", exc)
-            raise
+            result = self.models()
+        except Exception:
+            return ""
+        if result.models:
+            self._cached_default_model = result.models[0]
+            return self._cached_default_model
+        return ""
+
+    def models(self) -> ModelInfo:
+        last_exc: Exception | None = None
+        candidate_urls = [self.models_endpoint, self.models_alias_endpoint]
+        seen_urls: set[str] = set()
+        for url in candidate_urls:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                response = self.client.get(url)
+                response.raise_for_status()
+                result = ModelInfo.from_dict(response.json())
+                self._cache_models(result.models)
+                self._log_okay("models", f"count={len(result.models)}")
+                return result
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code in (404, 405):
+                    continue
+                self._log_fail("models", exc)
+                raise
+            except Exception as exc:
+                last_exc = exc
+                self._log_fail("models", exc)
+                raise
+
+        if last_exc is not None:
+            self._log_fail("models", last_exc)
+            raise last_exc
+        raise RuntimeError("No models endpoint available")
 
     def info(self) -> InfoResponse:
         try:
-            response = self.client.get(f"{self.endpoint}/info")
+            response = self.client.get(self.info_endpoint)
             response.raise_for_status()
             result = InfoResponse.from_dict(response.json())
             self._log_okay("info", f"instances={len(result.instances)}")
@@ -795,9 +903,10 @@ class QWNClient:
         stream: bool = False,
         enable_thinking: bool = False,
     ) -> ChatResponse:
+        resolved_model = self._resolve_model(model)
         payload = _build_chat_payload(
             messages=messages,
-            model=model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -808,7 +917,7 @@ class QWNClient:
         for attempt in range(3):
             try:
                 response = self.client.post(
-                    f"{self.endpoint}/v1/chat/completions",
+                    self.chat_endpoint,
                     json=payload,
                 )
                 response.raise_for_status()
@@ -843,9 +952,10 @@ class QWNClient:
         enable_thinking: bool = False,
         include_thinking_tags: bool = False,
     ) -> StreamChatResult:
+        resolved_model = self._resolve_model(model)
         payload = _build_chat_payload(
             messages=messages,
-            model=model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -867,7 +977,7 @@ class QWNClient:
             try:
                 with self.client.stream(
                     "POST",
-                    f"{self.endpoint}/v1/chat/completions",
+                    self.chat_endpoint,
                     json=payload,
                 ) as response:
                     response.raise_for_status()
@@ -961,9 +1071,19 @@ class AsyncQWNClient:
         port: int = PORT,
         verbose: bool = False,
     ):
-        self.endpoint = endpoint.rstrip("/") if endpoint else f"http://{host}:{port}"
+        raw_endpoint = endpoint.rstrip("/") if endpoint else f"http://{host}:{port}"
+        self.endpoint = _normalize_service_endpoint_root(raw_endpoint)
+        self.chat_endpoint = _join_endpoint_route(self.endpoint, "/v1/chat/completions")
+        self.chat_alias_endpoint = _join_endpoint_route(
+            self.endpoint, "/chat/completions"
+        )
+        self.models_endpoint = _join_endpoint_route(self.endpoint, "/v1/models")
+        self.models_alias_endpoint = _join_endpoint_route(self.endpoint, "/models")
+        self.health_endpoint = _join_endpoint_route(self.endpoint, "/health")
         self.verbose = verbose
         self._client: httpx.AsyncClient | None = None
+        self._cached_models: list[str] | None = None
+        self._cached_default_model: str = ""
 
     async def _get_client(self) -> httpx.AsyncClient:
         if self._client is None:
@@ -1030,7 +1150,7 @@ class AsyncQWNClient:
     async def health(self) -> HealthResponse:
         client = await self._get_client()
         try:
-            response = await client.get(f"{self.endpoint}/health")
+            response = await client.get(self.health_endpoint)
             response.raise_for_status()
             try:
                 payload = response.json()
@@ -1052,6 +1172,58 @@ class AsyncQWNClient:
             self._log_fail("health", exc)
             raise
 
+    def _cache_models(self, models: list[str]) -> None:
+        self._cached_models = list(models)
+        if models:
+            self._cached_default_model = models[0]
+
+    async def models(self) -> ModelInfo:
+        client = await self._get_client()
+        last_exc: Exception | None = None
+        candidate_urls = [self.models_endpoint, self.models_alias_endpoint]
+        seen_urls: set[str] = set()
+        for url in candidate_urls:
+            if url in seen_urls:
+                continue
+            seen_urls.add(url)
+            try:
+                response = await client.get(url)
+                response.raise_for_status()
+                result = ModelInfo.from_dict(response.json())
+                self._cache_models(result.models)
+                self._log_okay("models", f"count={len(result.models)}")
+                return result
+            except httpx.HTTPStatusError as exc:
+                last_exc = exc
+                if exc.response.status_code in (404, 405):
+                    continue
+                self._log_fail("models", exc)
+                raise
+            except Exception as exc:
+                last_exc = exc
+                self._log_fail("models", exc)
+                raise
+
+        if last_exc is not None:
+            self._log_fail("models", last_exc)
+            raise last_exc
+        raise RuntimeError("No models endpoint available")
+
+    async def _resolve_model(self, model: str = "") -> str:
+        explicit_model = (model or "").strip()
+        if explicit_model:
+            return explicit_model
+        if self._cached_default_model:
+            return self._cached_default_model
+        try:
+            result = await self.models()
+        except Exception:
+            return ""
+        if result.models:
+            self._cached_default_model = result.models[0]
+            return self._cached_default_model
+        return ""
+
     async def chat(
         self,
         messages: list[dict],
@@ -1062,9 +1234,10 @@ class AsyncQWNClient:
         stream: bool = False,
         enable_thinking: bool = False,
     ) -> ChatResponse:
+        resolved_model = await self._resolve_model(model)
         payload = _build_chat_payload(
             messages=messages,
-            model=model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -1076,7 +1249,7 @@ class AsyncQWNClient:
         for attempt in range(3):
             try:
                 response = await client.post(
-                    f"{self.endpoint}/v1/chat/completions",
+                    self.chat_endpoint,
                     content=orjson.dumps(payload),
                     headers={"Content-Type": "application/json"},
                 )
@@ -1112,9 +1285,10 @@ class AsyncQWNClient:
         enable_thinking: bool = False,
         include_thinking_tags: bool = False,
     ) -> StreamChatResult:
+        resolved_model = await self._resolve_model(model)
         payload = _build_chat_payload(
             messages=messages,
-            model=model,
+            model=resolved_model,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -1138,7 +1312,7 @@ class AsyncQWNClient:
             try:
                 async with client.stream(
                     "POST",
-                    f"{self.endpoint}/v1/chat/completions",
+                    self.chat_endpoint,
                     content=orjson.dumps(payload),
                     headers={"Content-Type": "application/json"},
                 ) as response:

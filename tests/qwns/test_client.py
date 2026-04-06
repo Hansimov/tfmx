@@ -1,9 +1,13 @@
 """Tests for tfmx.qwns.client."""
 
+import asyncio
+import itertools
+
 import httpx
+import orjson
 import pytest
 
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tfmx.qwns.client import AsyncQWNClient
 from tfmx.qwns.client import ChatChoice
@@ -180,8 +184,91 @@ class TestQWNClient:
         assert client.endpoint == "http://myhost:29999"
         client.close()
 
+    def test_custom_endpoint_with_v1_suffix_normalizes_root(self):
+        client = QWNClient(endpoint="http://myhost:29999/v1")
+        assert client.endpoint == "http://myhost:29999"
+        assert client.chat_endpoint == "http://myhost:29999/v1/chat/completions"
+        assert client.models_endpoint == "http://myhost:29999/v1/models"
+        client.close()
+
+    def test_models_fallback_to_alias_endpoint(self):
+        client = QWNClient(endpoint="http://localhost:27800")
+
+        missing = MagicMock()
+        missing.status_code = 404
+        missing.raise_for_status.side_effect = httpx.HTTPStatusError(
+            "not found",
+            request=MagicMock(),
+            response=missing,
+        )
+
+        ok = MagicMock()
+        ok.raise_for_status.return_value = None
+        ok.json.return_value = {
+            "object": "list",
+            "data": [{"id": "4b:4bit"}],
+        }
+
+        def get_side_effect(url, *args, **kwargs):
+            if url.endswith("/v1/models"):
+                return missing
+            return ok
+
+        client.client.get = MagicMock(side_effect=get_side_effect)
+
+        result = client.models()
+
+        assert result.models == ["4b:4bit"]
+        assert client._cached_default_model == "4b:4bit"
+        client.close()
+
+    def test_chat_resolves_default_model_when_omitted(self):
+        client = QWNClient(endpoint="http://localhost:27800")
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "object": "list",
+            "data": [{"id": "4b:4bit"}],
+        }
+
+        chat_response = MagicMock()
+        chat_response.raise_for_status.return_value = None
+        chat_response.json.return_value = {
+            "id": "ok",
+            "model": "4b:4bit",
+            "choices": [
+                {
+                    "index": 0,
+                    "message": {"role": "assistant", "content": "ok"},
+                    "finish_reason": "stop",
+                }
+            ],
+            "usage": {"prompt_tokens": 3, "completion_tokens": 1, "total_tokens": 4},
+        }
+
+        seen_requests: list[tuple[str, dict]] = []
+
+        def get_side_effect(url, *args, **kwargs):
+            return models_response
+
+        def post_side_effect(url, *args, **kwargs):
+            seen_requests.append((url, kwargs["json"]))
+            return chat_response
+
+        client.client.get = MagicMock(side_effect=get_side_effect)
+        client.client.post = MagicMock(side_effect=post_side_effect)
+
+        result = client.chat(messages=build_text_messages("你好"), model="")
+
+        assert result.text == "ok"
+        assert seen_requests[0][0].endswith("/v1/chat/completions")
+        assert seen_requests[0][1]["model"] == "4b:4bit"
+        client.close()
+
     def test_stream_chat_collects_text_and_usage(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
 
         stream_response = MagicMock()
         stream_response.iter_lines.return_value = iter(
@@ -218,6 +305,7 @@ class TestQWNClient:
 
     def test_stream_chat_ignores_whitespace_for_ttft(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
 
         stream_response = MagicMock()
         stream_response.iter_lines.return_value = iter(
@@ -236,7 +324,7 @@ class TestQWNClient:
 
         with patch(
             "tfmx.qwns.client.time.perf_counter",
-            side_effect=[10.0, 11.2, 11.5],
+            side_effect=itertools.chain([10.0, 11.2, 11.5], itertools.repeat(11.5)),
         ):
             result = client.stream_chat(messages=build_text_messages("你好"))
 
@@ -245,6 +333,7 @@ class TestQWNClient:
 
     def test_stream_chat_can_enable_thinking(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
 
         stream_response = MagicMock()
         stream_response.iter_lines.return_value = iter(["data: [DONE]"])
@@ -268,6 +357,7 @@ class TestQWNClient:
 
     def test_stream_chat_can_render_thinking_tags(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
 
         stream_response = MagicMock()
         stream_response.iter_lines.return_value = iter(
@@ -300,6 +390,7 @@ class TestQWNClient:
 
     def test_stream_chat_retries_when_machine_returns_sse_max_token_error(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
         seen_max_tokens: list[int] = []
 
         first_response = MagicMock()
@@ -350,6 +441,7 @@ class TestQWNClient:
 
     def test_stream_chat_retries_twice_for_context_window_error(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
         seen_max_tokens: list[int] = []
 
         first_response = MagicMock()
@@ -410,6 +502,7 @@ class TestQWNClient:
 
     def test_chat_retries_when_http_error_reports_max_token_limit(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
         seen_max_tokens: list[int] = []
 
         first_response = MagicMock()
@@ -455,8 +548,36 @@ class TestQWNClient:
         assert seen_max_tokens == [8192, 4096]
         client.close()
 
+    def test_chat_response_text_includes_non_stream_reasoning(self):
+        response = ChatResponse.from_dict(
+            {
+                "id": "chat-1",
+                "model": "4b:4bit",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {
+                            "role": "assistant",
+                            "reasoning": "先想一下",
+                            "content": "答案",
+                        },
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 1,
+                    "completion_tokens": 2,
+                    "total_tokens": 3,
+                },
+            }
+        )
+
+        assert response.text.startswith("<thinking>\n先想一下")
+        assert response.text.endswith("答案")
+
     def test_default_max_tokens_matches_model_len(self):
         client = QWNClient(endpoint="http://localhost:27800")
+        client._cached_default_model = "4b:4bit"
 
         stream_response = MagicMock()
         stream_response.iter_lines.return_value = iter(["data: [DONE]"])
@@ -479,3 +600,54 @@ class TestAsyncQWNClient:
         client = AsyncQWNClient(endpoint="http://localhost:27800")
         client.reset()
         assert client._client is None
+
+    def test_async_endpoint_with_v1_suffix_normalizes_root(self):
+        client = AsyncQWNClient(endpoint="http://localhost:27800/v1")
+        assert client.endpoint == "http://localhost:27800"
+        assert client.models_endpoint == "http://localhost:27800/v1/models"
+
+    def test_async_chat_resolves_default_model_when_omitted(self):
+        client = AsyncQWNClient(endpoint="http://localhost:27800")
+
+        models_response = MagicMock()
+        models_response.raise_for_status.return_value = None
+        models_response.json.return_value = {
+            "object": "list",
+            "data": [{"id": "4b:4bit"}],
+        }
+
+        chat_response = MagicMock()
+        chat_response.raise_for_status.return_value = None
+        chat_response.content = orjson.dumps(
+            {
+                "id": "ok",
+                "model": "4b:4bit",
+                "choices": [
+                    {
+                        "index": 0,
+                        "message": {"role": "assistant", "content": "ok"},
+                        "finish_reason": "stop",
+                    }
+                ],
+                "usage": {
+                    "prompt_tokens": 3,
+                    "completion_tokens": 1,
+                    "total_tokens": 4,
+                },
+            }
+        )
+
+        mock_client = MagicMock()
+        mock_client.get = AsyncMock(return_value=models_response)
+        mock_client.post = AsyncMock(return_value=chat_response)
+        client._client = mock_client
+
+        result = asyncio.run(
+            client.chat(messages=build_text_messages("你好"), model="")
+        )
+
+        assert result.text == "ok"
+        post_kwargs = mock_client.post.call_args.kwargs
+        assert post_kwargs["content"]
+        payload = orjson.loads(post_kwargs["content"])
+        assert payload["model"] == "4b:4bit"

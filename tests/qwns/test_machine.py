@@ -129,6 +129,71 @@ class TestQWNMachineServer:
         rewritten = server._rewrite_model_in_body(body, instance)
         assert b"4b:4bit" in rewritten
 
+    def test_rewrite_model_in_body_normalizes_thinking_payload(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            model_name="4b:4bit",
+        )
+        server = QWNMachineServer(instances=[instance])
+        body = b'{"model":"4b","messages":[{"role":"user","content":"hello"}],"thinking":{"type":"disabled"}}'
+
+        rewritten = server._rewrite_model_in_body(body, instance)
+        payload = orjson.loads(rewritten)
+
+        assert payload["model"] == "4b:4bit"
+        assert payload["chat_template_kwargs"]["enable_thinking"] is False
+        assert "thinking" not in payload
+
+    def test_blank_model_requests_use_stable_default_model(self):
+        default_a = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            gpu_id=0,
+            healthy=True,
+            model_name="Qwen/Qwen3.5-4B-AWQ-4bit",
+            quant_level="4bit",
+        )
+        default_b = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            gpu_id=2,
+            healthy=True,
+            model_name="Qwen/Qwen3.5-4B-AWQ-4bit",
+            quant_level="4bit",
+        )
+        other = QWNInstance(
+            container_name="qwn-multi--gpu3",
+            host="localhost",
+            port=27883,
+            gpu_id=3,
+            healthy=True,
+            model_name="Qwen/Qwen3-8B",
+        )
+
+        server = QWNMachineServer(instances=[default_a, default_b, other])
+        server._build_router()
+
+        candidates = server._get_candidate_instances()
+
+        assert {instance.container_name for instance in candidates} == {
+            "qwn-multi--gpu0",
+            "qwn-multi--gpu2",
+        }
+        assert server._resolve_requested_model_field("") == "4b:4bit"
+
+    def test_app_exposes_openai_compat_aliases(self):
+        server = QWNMachineServer(instances=[])
+        route_paths = {route.path for route in server.app.routes}
+
+        assert "/models" in route_paths
+        assert "/v1/models" in route_paths
+        assert "/chat/completions" in route_paths
+        assert "/v1/chat/completions" in route_paths
+
     def test_get_idle_instance_prefers_lower_gpu_pressure(self):
         busy_gpu = QWNInstance(
             container_name="qwn-multi--gpu0",
