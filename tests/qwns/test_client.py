@@ -135,15 +135,30 @@ class TestInfoResponse:
                         "name": "qwn--gpu0",
                         "endpoint": "http://localhost:27880",
                         "healthy": True,
+                        "active_requests": 1,
+                        "available_slots": 7,
+                        "scheduler": {
+                            "score": 0.42,
+                            "recent_requests": 10,
+                            "latency_ema_ms": 1234.5,
+                        },
                     }
                 ],
-                "stats": {"total_requests": 1},
+                "stats": {"total_requests": 1, "total_wait_events": 2},
                 "available_models": ["4b:4bit"],
+                "scheduler": {
+                    "algorithm": "adaptive_pressure_v2",
+                    "recent_window_sec": 60.0,
+                },
             }
         )
         assert info.port == 27800
         assert len(info.instances) == 1
         assert info.available_models == ["4b:4bit"]
+        assert info.instances[0].active_requests == 1
+        assert info.instances[0].scheduler.score == 0.42
+        assert info.stats.total_wait_events == 2
+        assert info.scheduler.algorithm == "adaptive_pressure_v2"
 
 
 class TestQWNClient:

@@ -27,6 +27,12 @@ from .compose import MACHINE_PORT, MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
 from .compose import get_display_shortcut, get_model_shortcut, normalize_model_key
 from .gpu_runtime import GPURuntimeStats, query_gpu_runtime_stats
 from .router import InstanceDescriptor, QWNRouter, parse_model_spec
+from .adaptive_routing import DEFAULT_FAILURE_COOLDOWN_SEC
+from .adaptive_routing import InstanceTelemetry
+from .adaptive_routing import RECENT_WINDOW_SEC
+from .adaptive_routing import SchedulerWeights
+from .adaptive_routing import compute_candidate_score
+from .adaptive_routing import get_peer_baseline
 
 
 PORT = MACHINE_PORT
@@ -37,6 +43,8 @@ DEFAULT_NAME_PATTERN = r"qwn[-_]"
 HEALTH_REFRESH_INTERVAL_SEC = 5
 HEALTH_REQUEST_TIMEOUT_SEC = 5.0
 MODEL_DISCOVERY_TIMEOUT_SEC = 10.0
+INSTANCE_ACQUIRE_TIMEOUT_SEC = 5.0
+SCHEDULER_ALGORITHM = "adaptive_pressure_v2"
 
 
 class TextContent(BaseModel):
@@ -144,6 +152,21 @@ class ModelsResponse(BaseModel):
     data: list[ModelInfo] = Field(default_factory=list)
 
 
+class InstanceSchedulerInfo(BaseModel):
+    score: float | None = Field(None)
+    recent_requests: int = Field(0)
+    recent_successes: int = Field(0)
+    recent_failures: int = Field(0)
+    success_rate: float | None = Field(None)
+    latency_ema_ms: float | None = Field(None)
+    ttft_ema_ms: float | None = Field(None)
+    tokens_per_second_ema: float | None = Field(None)
+    cooldown_remaining_sec: float = Field(0.0)
+    consecutive_failures: int = Field(0)
+    score_components: dict[str, float] = Field(default_factory=dict)
+    last_error: str = Field(default="")
+
+
 class InstanceInfo(BaseModel):
     name: str = Field(...)
     endpoint: str = Field(...)
@@ -153,10 +176,13 @@ class InstanceInfo(BaseModel):
     quant_method: str = Field(default="")
     quant_level: str = Field(default="")
     model_label: str = Field(default="")
+    active_requests: int = Field(0)
+    available_slots: int = Field(0)
     gpu_utilization_pct: float | None = Field(None)
     gpu_memory_used_mib: float | None = Field(None)
     gpu_memory_total_mib: float | None = Field(None)
     routing_pressure: float | None = Field(None)
+    scheduler: InstanceSchedulerInfo = Field(default_factory=InstanceSchedulerInfo)
 
 
 class MachineStats(BaseModel):
@@ -166,6 +192,18 @@ class MachineStats(BaseModel):
     total_failovers: int = 0
     active_requests: int = 0
     requests_per_instance: dict[str, int] = Field(default_factory=dict)
+    total_wait_events: int = 0
+    avg_wait_time_ms: float | None = Field(None)
+    max_wait_time_ms: float | None = Field(None)
+
+
+class SchedulerInfo(BaseModel):
+    algorithm: str = Field(default=SCHEDULER_ALGORITHM)
+    recent_window_sec: float = Field(default=RECENT_WINDOW_SEC)
+    acquire_timeout_sec: float = Field(default=INSTANCE_ACQUIRE_TIMEOUT_SEC)
+    last_health_refresh_age_sec: float | None = Field(None)
+    last_gpu_refresh_age_sec: float | None = Field(None)
+    weights: dict[str, float] = Field(default_factory=dict)
 
 
 class InfoResponse(BaseModel):
@@ -173,6 +211,7 @@ class InfoResponse(BaseModel):
     instances: list[InstanceInfo] = Field(default_factory=list)
     stats: MachineStats = Field(default_factory=MachineStats)
     available_models: list[str] = Field(default_factory=list)
+    scheduler: SchedulerInfo = Field(default_factory=SchedulerInfo)
 
 
 @dataclass
@@ -190,6 +229,7 @@ class QWNInstance:
     _gpu_utilization_pct: float = 0.0
     _gpu_memory_used_mib: float = 0.0
     _gpu_memory_total_mib: float = 0.0
+    telemetry: InstanceTelemetry = field(default_factory=InstanceTelemetry)
 
     @property
     def endpoint(self) -> str:
@@ -243,7 +283,11 @@ class QWNInstance:
         self._gpu_memory_used_mib = snapshot.memory_used_mib
         self._gpu_memory_total_mib = snapshot.memory_total_mib
 
-    def to_info(self) -> InstanceInfo:
+    def to_info(
+        self,
+        model_label: str = "",
+        scheduler: InstanceSchedulerInfo | None = None,
+    ) -> InstanceInfo:
         return InstanceInfo(
             name=self.container_name,
             endpoint=self.endpoint,
@@ -252,11 +296,14 @@ class QWNInstance:
             model_name=self.model_name,
             quant_method=self.quant_method,
             quant_level=self.quant_level,
-            model_label=self.model_name,
+            model_label=model_label or self.model_name,
+            active_requests=self._active_requests,
+            available_slots=self.available_slots,
             gpu_utilization_pct=round(self._gpu_utilization_pct, 2),
             gpu_memory_used_mib=round(self._gpu_memory_used_mib, 2),
             gpu_memory_total_mib=round(self._gpu_memory_total_mib, 2),
             routing_pressure=round(self.routing_pressure, 4),
+            scheduler=scheduler or InstanceSchedulerInfo(),
         )
 
 
@@ -268,15 +315,36 @@ class QWNStatsData:
     total_failovers: int = 0
     active_requests: int = 0
     requests_per_instance: dict[str, int] = field(default_factory=dict)
+    total_wait_events: int = 0
+    total_wait_time_ms: float = 0.0
+    max_wait_time_ms: float = 0.0
+
+    def record_wait(self, wait_ms: float) -> None:
+        wait_ms = max(wait_ms, 0.0)
+        if wait_ms <= 0:
+            return
+        self.total_wait_events += 1
+        self.total_wait_time_ms += wait_ms
+        self.max_wait_time_ms = max(self.max_wait_time_ms, wait_ms)
 
     def to_model(self) -> MachineStats:
+        avg_wait_time_ms = None
+        if self.total_wait_events > 0:
+            avg_wait_time_ms = self.total_wait_time_ms / self.total_wait_events
         return MachineStats(
             total_requests=self.total_requests,
             total_tokens=self.total_tokens,
             total_errors=self.total_errors,
             total_failovers=self.total_failovers,
             active_requests=self.active_requests,
-            requests_per_instance=self.requests_per_instance,
+            requests_per_instance=dict(self.requests_per_instance),
+            total_wait_events=self.total_wait_events,
+            avg_wait_time_ms=(
+                round(avg_wait_time_ms, 2) if avg_wait_time_ms is not None else None
+            ),
+            max_wait_time_ms=(
+                round(self.max_wait_time_ms, 2) if self.max_wait_time_ms > 0 else None
+            ),
         )
 
 
@@ -402,7 +470,10 @@ class QWNMachineServer:
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
         self.router = QWNRouter()
-        self._rr_lock: Optional[asyncio.Lock] = None
+        self.scheduler_weights = SchedulerWeights()
+        self._capacity_cond: Optional[asyncio.Condition] = None
+        self._last_health_refresh_monotonic: float = 0.0
+        self._last_gpu_refresh_monotonic: float = 0.0
         self.app = self._create_app()
 
     def _build_router(self) -> None:
@@ -423,12 +494,29 @@ class QWNMachineServer:
     def get_healthy_instances(self) -> list[QWNInstance]:
         return [instance for instance in self.instances if instance.healthy]
 
-    def _get_idle_instance(
+    def _ensure_scheduler_primitives(self) -> None:
+        if self._capacity_cond is None:
+            self._capacity_cond = asyncio.Condition()
+
+    async def _notify_capacity_changed(self) -> None:
+        self._ensure_scheduler_primitives()
+        async with self._capacity_cond:
+            self._capacity_cond.notify_all()
+
+    def _notify_capacity_changed_soon(self) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self._notify_capacity_changed())
+
+    def _get_candidate_instances(
         self,
         model: str = "",
         quant: str = "",
         excluded_instances: set[str] | None = None,
-    ) -> Optional[QWNInstance]:
+        require_idle: bool = False,
+    ) -> list[QWNInstance]:
         excluded_instances = excluded_instances or set()
         if model or quant:
             descriptors = self.router.find_instances(model, quant)
@@ -437,7 +525,6 @@ class QWNMachineServer:
                 instance
                 for instance in self.instances
                 if instance.healthy
-                and instance.is_idle
                 and instance.endpoint in endpoints
                 and instance.container_name not in excluded_instances
             ]
@@ -446,21 +533,178 @@ class QWNMachineServer:
                 instance
                 for instance in self.instances
                 if instance.healthy
-                and instance.is_idle
                 and instance.container_name not in excluded_instances
             ]
+        if require_idle:
+            candidates = [instance for instance in candidates if instance.is_idle]
+        return candidates
 
+    def _score_instance(
+        self,
+        instance: QWNInstance,
+        peer_instances: list[QWNInstance],
+        now: float,
+    ) -> tuple[float, dict[str, float]]:
+        telemetry = instance.telemetry.snapshot(now)
+        recent_requests = telemetry["recent_requests"]
+        recent_failures = telemetry["recent_failures"]
+        failure_rate = recent_failures / recent_requests if recent_requests > 0 else 0.0
+        latency_values = [
+            peer.telemetry.latency_ema_ms
+            for peer in peer_instances
+            if peer.telemetry.latency_ema_ms > 0
+        ]
+        ttft_values = [
+            peer.telemetry.ttft_ema_ms
+            for peer in peer_instances
+            if peer.telemetry.ttft_ema_ms > 0
+        ]
+        throughput_values = [
+            peer.telemetry.tokens_per_second_ema
+            for peer in peer_instances
+            if peer.telemetry.tokens_per_second_ema > 0
+        ]
+        total_recent_requests = sum(
+            peer.telemetry.recent_requests(now) for peer in peer_instances
+        )
+        return compute_candidate_score(
+            active_ratio=instance._active_requests / max(MAX_CONCURRENT, 1),
+            gpu_pressure=instance.routing_pressure,
+            latency_ms=instance.telemetry.latency_ema_ms,
+            latency_baseline_ms=get_peer_baseline(latency_values, 2500.0),
+            ttft_ms=instance.telemetry.ttft_ema_ms,
+            ttft_baseline_ms=get_peer_baseline(ttft_values, 1500.0),
+            throughput_tokens_per_second=instance.telemetry.tokens_per_second_ema,
+            throughput_baseline_tokens_per_second=get_peer_baseline(
+                throughput_values,
+                40.0,
+            ),
+            recent_requests=recent_requests,
+            total_recent_requests=total_recent_requests,
+            healthy_candidates=len(peer_instances),
+            failure_rate=failure_rate,
+            consecutive_failures=instance.telemetry.consecutive_failures,
+            cooldown_remaining_sec=instance.telemetry.cooldown_remaining_sec(now),
+            weights=self.scheduler_weights,
+        )
+
+    def _build_instance_scheduler_info(
+        self,
+        instance: QWNInstance,
+        peer_instances: list[QWNInstance],
+        now: float,
+    ) -> InstanceSchedulerInfo:
+        telemetry = instance.telemetry.snapshot(now)
+        score = None
+        components: dict[str, float] = {}
+        if instance.healthy and peer_instances:
+            score, components = self._score_instance(instance, peer_instances, now)
+        return InstanceSchedulerInfo(
+            score=round(score, 4) if score is not None else None,
+            recent_requests=telemetry["recent_requests"],
+            recent_successes=telemetry["recent_successes"],
+            recent_failures=telemetry["recent_failures"],
+            success_rate=telemetry["success_rate"],
+            latency_ema_ms=telemetry["latency_ema_ms"],
+            ttft_ema_ms=telemetry["ttft_ema_ms"],
+            tokens_per_second_ema=telemetry["tokens_per_second_ema"],
+            cooldown_remaining_sec=telemetry["cooldown_remaining_sec"],
+            consecutive_failures=telemetry["consecutive_failures"],
+            score_components={
+                key: round(value, 4) for key, value in components.items()
+            },
+            last_error=telemetry["last_error"],
+        )
+
+    def _build_scheduler_summary(self) -> SchedulerInfo:
+        now = time.monotonic()
+        return SchedulerInfo(
+            algorithm=SCHEDULER_ALGORITHM,
+            recent_window_sec=RECENT_WINDOW_SEC,
+            acquire_timeout_sec=INSTANCE_ACQUIRE_TIMEOUT_SEC,
+            last_health_refresh_age_sec=(
+                round(
+                    now - self._last_health_refresh_monotonic,
+                    2,
+                )
+                if self._last_health_refresh_monotonic > 0
+                else None
+            ),
+            last_gpu_refresh_age_sec=(
+                round(
+                    now - self._last_gpu_refresh_monotonic,
+                    2,
+                )
+                if self._last_gpu_refresh_monotonic > 0
+                else None
+            ),
+            weights=self.scheduler_weights.to_dict(),
+        )
+
+    def _select_idle_instance(
+        self,
+        model: str = "",
+        quant: str = "",
+        excluded_instances: set[str] | None = None,
+    ) -> tuple[QWNInstance | None, bool]:
+        candidates = self._get_candidate_instances(
+            model=model,
+            quant=quant,
+            excluded_instances=excluded_instances,
+            require_idle=False,
+        )
         if not candidates:
-            return None
-        candidates.sort(
-            key=lambda instance: (
-                -instance.available_slots,
-                instance.routing_pressure,
-                instance._latency_ms if instance._latency_ms > 0 else float("inf"),
-                instance.gpu_id if instance.gpu_id is not None else 999,
+            return None, False
+        idle_candidates = [instance for instance in candidates if instance.is_idle]
+        if not idle_candidates:
+            return None, True
+        now = time.monotonic()
+        scored_candidates: list[tuple[float, QWNInstance]] = []
+        for instance in idle_candidates:
+            score, _ = self._score_instance(instance, candidates, now)
+            scored_candidates.append((score, instance))
+        scored_candidates.sort(
+            key=lambda item: (
+                item[0],
+                -item[1].available_slots,
+                item[1].routing_pressure,
+                item[1].gpu_id if item[1].gpu_id is not None else 999,
             )
         )
-        return candidates[0]
+        return scored_candidates[0][1], True
+
+    def _reserve_idle_instance_locked(
+        self,
+        model: str = "",
+        quant: str = "",
+        excluded_instances: set[str] | None = None,
+    ) -> tuple[QWNInstance | None, bool]:
+        instance, has_candidates = self._select_idle_instance(
+            model=model,
+            quant=quant,
+            excluded_instances=excluded_instances,
+        )
+        if instance is None:
+            return None, has_candidates
+        instance._active_requests += 1
+        self.stats.requests_per_instance[instance.container_name] = (
+            self.stats.requests_per_instance.get(instance.container_name, 0) + 1
+        )
+        instance.telemetry.record_dispatch()
+        return instance, True
+
+    def _get_idle_instance(
+        self,
+        model: str = "",
+        quant: str = "",
+        excluded_instances: set[str] | None = None,
+    ) -> Optional[QWNInstance]:
+        instance, _ = self._select_idle_instance(
+            model=model,
+            quant=quant,
+            excluded_instances=excluded_instances,
+        )
+        return instance
 
     def _create_app(self) -> FastAPI:
         app = FastAPI(
@@ -518,7 +762,7 @@ class QWNMachineServer:
     @asynccontextmanager
     async def _lifespan(self, app: FastAPI):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
-        self._rr_lock = asyncio.Lock()
+        self._ensure_scheduler_primitives()
 
         await self.health_check_all()
         await self._discover_instance_models()
@@ -561,6 +805,8 @@ class QWNMachineServer:
         await self._refresh_gpu_runtime_metrics()
         await self._discover_instance_models()
         self._build_router()
+        self._last_health_refresh_monotonic = time.monotonic()
+        await self._notify_capacity_changed()
 
     async def _refresh_gpu_runtime_metrics(self) -> None:
         gpu_ids = [
@@ -575,8 +821,10 @@ class QWNMachineServer:
             if instance.gpu_id is None:
                 continue
             instance.apply_gpu_runtime(snapshots.get(instance.gpu_id))
+        self._last_gpu_refresh_monotonic = time.monotonic()
 
     async def _check_instance_health(self, instance: QWNInstance) -> bool:
+        was_healthy = instance.healthy
         try:
             started_at = time.perf_counter()
             response = await self._client.get(
@@ -587,43 +835,55 @@ class QWNMachineServer:
             instance._latency_ms = (
                 (time.perf_counter() - started_at) * 1000 if instance.healthy else 0.0
             )
+            if instance.healthy and not was_healthy:
+                instance.telemetry.record_recovery()
+                await self._notify_capacity_changed()
+            elif not instance.healthy and was_healthy:
+                instance.telemetry.record_failure("health check failed")
+                await self._notify_capacity_changed()
             return instance.healthy
         except Exception:
             instance.healthy = False
             instance._latency_ms = 0.0
+            if was_healthy:
+                instance.telemetry.record_failure("health check failed")
+                await self._notify_capacity_changed()
             return False
+
+    async def _discover_instance_model(self, instance: QWNInstance) -> None:
+        try:
+            response = await self._client.get(
+                instance.models_url,
+                timeout=httpx.Timeout(MODEL_DISCOVERY_TIMEOUT_SEC),
+            )
+            if response.status_code != 200:
+                return
+            payload = response.json()
+            models = payload.get("data", [])
+            if not models:
+                return
+            model_id = models[0].get("id", "")
+            instance.model_name = model_id
+            base_model, quant_level = parse_model_spec(model_id)
+            if quant_level:
+                instance.quant_method = "awq"
+                instance.quant_level = quant_level
+            elif "awq" in model_id.lower():
+                instance.quant_method = "awq"
+            logger.mesg(f"[qwn_machine] {instance.container_name}: model={model_id}")
+        except Exception:
+            pass
 
     async def _discover_instance_models(self) -> None:
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(10.0))
-
-        for instance in self.instances:
-            if not instance.healthy or instance.model_name:
-                continue
-            try:
-                response = await self._client.get(
-                    instance.models_url,
-                    timeout=httpx.Timeout(MODEL_DISCOVERY_TIMEOUT_SEC),
-                )
-                if response.status_code != 200:
-                    continue
-                payload = response.json()
-                models = payload.get("data", [])
-                if not models:
-                    continue
-                model_id = models[0].get("id", "")
-                instance.model_name = model_id
-                base_model, quant_level = parse_model_spec(model_id)
-                if quant_level:
-                    instance.quant_method = "awq"
-                    instance.quant_level = quant_level
-                elif "awq" in model_id.lower():
-                    instance.quant_method = "awq"
-                logger.mesg(
-                    f"[qwn_machine] {instance.container_name}: model={model_id}"
-                )
-            except Exception:
-                pass
+        pending = [
+            self._discover_instance_model(instance)
+            for instance in self.instances
+            if instance.healthy and not instance.model_name
+        ]
+        if pending:
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def _get_model_label(self, instance: QWNInstance) -> str:
         if instance.model_name and ":" in instance.model_name:
@@ -681,11 +941,24 @@ class QWNMachineServer:
         return ModelsResponse(data=data)
 
     async def info(self) -> InfoResponse:
+        now = time.monotonic()
+        healthy_instances = self.get_healthy_instances()
         return InfoResponse(
             port=self.port,
-            instances=[instance.to_info() for instance in self.instances],
+            instances=[
+                instance.to_info(
+                    model_label=self._get_model_label(instance),
+                    scheduler=self._build_instance_scheduler_info(
+                        instance,
+                        healthy_instances,
+                        now,
+                    ),
+                )
+                for instance in self.instances
+            ],
             stats=self.stats.to_model(),
             available_models=self.router.get_available_models(),
+            scheduler=self._build_scheduler_summary(),
         )
 
     async def chat_completions(self, request: ChatCompletionRequest):
@@ -730,35 +1003,48 @@ class QWNMachineServer:
         requested_quant = ""
         if model_field:
             requested_model, requested_quant = parse_model_spec(model_field)
+        self._ensure_scheduler_primitives()
+        waited_sec = 0.0
+        deadline = time.perf_counter() + INSTANCE_ACQUIRE_TIMEOUT_SEC
 
-        instance = self._get_idle_instance(
-            model=requested_model,
-            quant=requested_quant,
-            excluded_instances=excluded_instances,
-        )
-        if instance is None:
-            for _ in range(10):
-                await asyncio.sleep(0.1)
-                instance = self._get_idle_instance(
+        async with self._capacity_cond:
+            while True:
+                instance, has_candidates = self._reserve_idle_instance_locked(
                     model=requested_model,
                     quant=requested_quant,
                     excluded_instances=excluded_instances,
                 )
                 if instance is not None:
-                    break
+                    if waited_sec > 0:
+                        self.stats.record_wait(waited_sec * 1000.0)
+                    return instance, requested_model, requested_quant
 
-        if instance is None and not (requested_model or requested_quant):
-            instance = self._get_idle_instance(excluded_instances=excluded_instances)
+                remaining = deadline - time.perf_counter()
+                if remaining <= 0:
+                    if waited_sec > 0:
+                        self.stats.record_wait(waited_sec * 1000.0)
+                    detail = "All QWN instances are busy"
+                    if model_field:
+                        detail = f"All QWN instances for requested model '{model_field}' are busy"
+                    raise HTTPException(status_code=503, detail=detail)
 
-        if instance is None:
-            detail = "No available QWN instances"
-            if model_field:
-                detail = (
-                    f"No available QWN instances for requested model '{model_field}'"
-                )
-            raise HTTPException(status_code=503, detail=detail)
+                if not has_candidates:
+                    if waited_sec > 0:
+                        self.stats.record_wait(waited_sec * 1000.0)
+                    detail = "No available QWN instances"
+                    if model_field:
+                        detail = f"No available QWN instances for requested model '{model_field}'"
+                    raise HTTPException(status_code=503, detail=detail)
 
-        return instance, requested_model, requested_quant
+                wait_started_at = time.perf_counter()
+                try:
+                    await asyncio.wait_for(
+                        self._capacity_cond.wait(),
+                        timeout=min(remaining, 0.5),
+                    )
+                except asyncio.TimeoutError:
+                    pass
+                waited_sec += time.perf_counter() - wait_started_at
 
     def _rewrite_model_in_body(self, body: bytes, instance: QWNInstance) -> bytes:
         if not instance.model_name:
@@ -786,13 +1072,23 @@ class QWNMachineServer:
     def _mark_instance_unhealthy(
         self, instance: QWNInstance, reason: Exception | str
     ) -> None:
+        reason_text = str(reason)
         if instance.healthy:
             logger.warn(
-                f"× Marking {instance.container_name} unhealthy for failover: {reason}"
+                f"× Marking {instance.container_name} unhealthy for failover: {reason_text}"
             )
+        instance.telemetry.record_failure(
+            reason_text,
+            cooldown_sec=DEFAULT_FAILURE_COOLDOWN_SEC,
+        )
         instance.healthy = False
         instance._latency_ms = 0.0
         self._build_router()
+        self._notify_capacity_changed_soon()
+
+    async def _release_instance(self, instance: QWNInstance) -> None:
+        instance._active_requests = max(0, instance._active_requests - 1)
+        await self._notify_capacity_changed()
 
     def _build_stream_error_chunk(
         self,
@@ -842,14 +1138,12 @@ class QWNMachineServer:
                         return
 
                     attempted_instances.add(instance.container_name)
-                    instance._active_requests += 1
-                    self.stats.requests_per_instance[instance.container_name] = (
-                        self.stats.requests_per_instance.get(instance.container_name, 0)
-                        + 1
-                    )
                     model_label = self._get_model_label(instance)
                     attempt_body = self._rewrite_model_in_body(body, instance)
                     started_stream = False
+                    started_at = time.perf_counter()
+                    first_chunk_latency_ms = 0.0
+                    completion_tokens = 0
 
                     try:
                         async with self._client.stream(
@@ -889,8 +1183,21 @@ class QWNMachineServer:
                                 if line.startswith("data: "):
                                     payload = line[6:].strip()
                                     if payload == "[DONE]":
+                                        if started_stream:
+                                            instance.telemetry.record_success(
+                                                latency_ms=(
+                                                    time.perf_counter() - started_at
+                                                )
+                                                * 1000.0,
+                                                ttft_ms=first_chunk_latency_ms,
+                                                completion_tokens=completion_tokens,
+                                            )
                                         yield "data: [DONE]\n\n"
                                         return
+                                    if first_chunk_latency_ms <= 0:
+                                        first_chunk_latency_ms = (
+                                            time.perf_counter() - started_at
+                                        ) * 1000.0
                                     try:
                                         chunk = orjson.loads(payload)
                                         if model_label:
@@ -899,6 +1206,10 @@ class QWNMachineServer:
                                         if usage:
                                             self.stats.total_tokens += usage.get(
                                                 "total_tokens", 0
+                                            )
+                                            completion_tokens = usage.get(
+                                                "completion_tokens",
+                                                completion_tokens,
                                             )
                                         started_stream = True
                                         yield (
@@ -920,6 +1231,11 @@ class QWNMachineServer:
                                     instance, last_retryable_error
                                 )
                                 continue
+                            instance.telemetry.record_success(
+                                latency_ms=(time.perf_counter() - started_at) * 1000.0,
+                                ttft_ms=first_chunk_latency_ms,
+                                completion_tokens=completion_tokens,
+                            )
                             return
                     except Exception as exc:
                         if (
@@ -940,9 +1256,7 @@ class QWNMachineServer:
                         yield "data: [DONE]\n\n"
                         return
                     finally:
-                        instance._active_requests = max(
-                            0, instance._active_requests - 1
-                        )
+                        await self._release_instance(instance)
             except Exception as exc:
                 self.stats.total_errors += 1
                 logger.warn(f"× Stream error: {exc}")
@@ -992,13 +1306,10 @@ class QWNMachineServer:
                     raise
 
                 attempted_instances.add(instance.container_name)
-                instance._active_requests += 1
-                self.stats.requests_per_instance[instance.container_name] = (
-                    self.stats.requests_per_instance.get(instance.container_name, 0) + 1
-                )
                 attempt_body = self._rewrite_model_in_body(body, instance)
 
                 try:
+                    started_at = time.perf_counter()
                     response = await self._client.post(
                         instance.chat_url,
                         content=attempt_body,
@@ -1024,6 +1335,10 @@ class QWNMachineServer:
                     payload = orjson.loads(response.content)
                     usage = payload.get("usage", {})
                     self.stats.total_tokens += usage.get("total_tokens", 0)
+                    instance.telemetry.record_success(
+                        latency_ms=(time.perf_counter() - started_at) * 1000.0,
+                        completion_tokens=usage.get("completion_tokens", 0),
+                    )
                     return ChatCompletionResponse(
                         id=payload.get("id", ""),
                         object=payload.get("object", "chat.completion"),
@@ -1048,7 +1363,7 @@ class QWNMachineServer:
                     logger.warn(f"× Chat completion error: {exc}")
                     raise HTTPException(status_code=500, detail=str(exc))
                 finally:
-                    instance._active_requests = max(0, instance._active_requests - 1)
+                    await self._release_instance(instance)
         except HTTPException:
             raise
         finally:

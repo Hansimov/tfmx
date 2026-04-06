@@ -51,6 +51,12 @@ qwn machine restart
 - `GET /info`
 - `POST /chat`
 
+### 调度观测
+
+- `GET /info` 现在除了实例列表和累计统计外，还会返回顶层 `scheduler` 摘要，包含当前算法名、近期窗口长度、实例获取超时、最近健康刷新年龄和权重配置
+- 每个实例的 `scheduler` 字段会暴露 `score`、`recent_requests`、`recent_failures`、`latency_ema_ms`、`ttft_ema_ms`、`tokens_per_second_ema`、`cooldown_remaining_sec` 等实时调度指标
+- `qwn client info` 会把这些关键字段整理成更易读的终端输出，例如 `active=已用/总槽位`、`score=...`、`lat=...`、`ttft=...`、`tokps=...`、`recent=...`
+
 ## `qwn client`
 
 ```bash
@@ -64,6 +70,8 @@ qwn client chat "请展示详细推理过程" --thinking
 qwn client generate --prompt "总结一下 qwn compose 的作用"
 qwn client -e http://localhost:27880 models
 ```
+
+`qwn client info` 现在除了基础实例信息外，还会显示调度器的实时画像，便于快速判断某张卡当前是否因为 GPU 压力、近期延迟、近期 tok/s 或冷却期而被降权。
 
 ### 流式输出说明
 

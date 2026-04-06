@@ -219,6 +219,39 @@ class _StreamRenderState:
 
 
 @dataclass
+class InstanceSchedulerInfo:
+    score: float | None = None
+    recent_requests: int = 0
+    recent_successes: int = 0
+    recent_failures: int = 0
+    success_rate: float | None = None
+    latency_ema_ms: float | None = None
+    ttft_ema_ms: float | None = None
+    tokens_per_second_ema: float | None = None
+    cooldown_remaining_sec: float = 0.0
+    consecutive_failures: int = 0
+    score_components: dict[str, float] = field(default_factory=dict)
+    last_error: str = ""
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "InstanceSchedulerInfo":
+        return cls(
+            score=data.get("score"),
+            recent_requests=data.get("recent_requests", 0),
+            recent_successes=data.get("recent_successes", 0),
+            recent_failures=data.get("recent_failures", 0),
+            success_rate=data.get("success_rate"),
+            latency_ema_ms=data.get("latency_ema_ms"),
+            ttft_ema_ms=data.get("ttft_ema_ms"),
+            tokens_per_second_ema=data.get("tokens_per_second_ema"),
+            cooldown_remaining_sec=data.get("cooldown_remaining_sec", 0.0),
+            consecutive_failures=data.get("consecutive_failures", 0),
+            score_components=data.get("score_components", {}),
+            last_error=data.get("last_error", ""),
+        )
+
+
+@dataclass
 class InstanceInfo:
     name: str
     endpoint: str
@@ -228,10 +261,13 @@ class InstanceInfo:
     quant_method: str = ""
     quant_level: str = ""
     model_label: str = ""
+    active_requests: int = 0
+    available_slots: int = 0
     gpu_utilization_pct: float | None = None
     gpu_memory_used_mib: float | None = None
     gpu_memory_total_mib: float | None = None
     routing_pressure: float | None = None
+    scheduler: InstanceSchedulerInfo = field(default_factory=InstanceSchedulerInfo)
 
     @classmethod
     def from_dict(cls, data: dict) -> "InstanceInfo":
@@ -244,10 +280,13 @@ class InstanceInfo:
             quant_method=data.get("quant_method", ""),
             quant_level=data.get("quant_level", ""),
             model_label=data.get("model_label", ""),
+            active_requests=data.get("active_requests", 0),
+            available_slots=data.get("available_slots", 0),
             gpu_utilization_pct=data.get("gpu_utilization_pct"),
             gpu_memory_used_mib=data.get("gpu_memory_used_mib"),
             gpu_memory_total_mib=data.get("gpu_memory_total_mib"),
             routing_pressure=data.get("routing_pressure"),
+            scheduler=InstanceSchedulerInfo.from_dict(data.get("scheduler", {})),
         )
 
 
@@ -259,6 +298,9 @@ class MachineStats:
     total_failovers: int = 0
     active_requests: int = 0
     requests_per_instance: dict[str, int] = field(default_factory=dict)
+    total_wait_events: int = 0
+    avg_wait_time_ms: float | None = None
+    max_wait_time_ms: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "MachineStats":
@@ -269,6 +311,30 @@ class MachineStats:
             total_failovers=data.get("total_failovers", 0),
             active_requests=data.get("active_requests", 0),
             requests_per_instance=data.get("requests_per_instance", {}),
+            total_wait_events=data.get("total_wait_events", 0),
+            avg_wait_time_ms=data.get("avg_wait_time_ms"),
+            max_wait_time_ms=data.get("max_wait_time_ms"),
+        )
+
+
+@dataclass
+class SchedulerInfo:
+    algorithm: str = ""
+    recent_window_sec: float = 0.0
+    acquire_timeout_sec: float = 0.0
+    last_health_refresh_age_sec: float | None = None
+    last_gpu_refresh_age_sec: float | None = None
+    weights: dict[str, float] = field(default_factory=dict)
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "SchedulerInfo":
+        return cls(
+            algorithm=data.get("algorithm", ""),
+            recent_window_sec=data.get("recent_window_sec", 0.0),
+            acquire_timeout_sec=data.get("acquire_timeout_sec", 0.0),
+            last_health_refresh_age_sec=data.get("last_health_refresh_age_sec"),
+            last_gpu_refresh_age_sec=data.get("last_gpu_refresh_age_sec"),
+            weights=data.get("weights", {}),
         )
 
 
@@ -278,6 +344,7 @@ class InfoResponse:
     instances: list[InstanceInfo] = field(default_factory=list)
     stats: MachineStats = field(default_factory=MachineStats)
     available_models: list[str] = field(default_factory=list)
+    scheduler: SchedulerInfo = field(default_factory=SchedulerInfo)
 
     @classmethod
     def from_dict(cls, data: dict) -> "InfoResponse":
@@ -288,6 +355,7 @@ class InfoResponse:
             ],
             stats=MachineStats.from_dict(data.get("stats", {})),
             available_models=data.get("available_models", []),
+            scheduler=SchedulerInfo.from_dict(data.get("scheduler", {})),
         )
 
 
@@ -1201,6 +1269,9 @@ def run_from_args(args: argparse.Namespace) -> None:
                 details = [instance.model_label] if instance.model_label else []
                 if instance.gpu_id is not None:
                     details.append(f"GPU{instance.gpu_id}")
+                details.append(
+                    f"active={instance.active_requests}/{instance.active_requests + instance.available_slots}"
+                )
                 if instance.gpu_utilization_pct is not None:
                     details.append(f"util={instance.gpu_utilization_pct:.0f}%")
                 if (
@@ -1213,10 +1284,33 @@ def run_from_args(args: argparse.Namespace) -> None:
                     )
                 if instance.routing_pressure is not None:
                     details.append(f"pressure={instance.routing_pressure:.2f}")
+                if instance.scheduler.score is not None:
+                    details.append(f"score={instance.scheduler.score:.2f}")
+                if instance.scheduler.latency_ema_ms is not None:
+                    details.append(f"lat={instance.scheduler.latency_ema_ms:.0f}ms")
+                if instance.scheduler.ttft_ema_ms is not None:
+                    details.append(f"ttft={instance.scheduler.ttft_ema_ms:.0f}ms")
+                if instance.scheduler.tokens_per_second_ema is not None:
+                    details.append(
+                        f"tokps={instance.scheduler.tokens_per_second_ema:.1f}"
+                    )
+                if instance.scheduler.recent_requests > 0:
+                    details.append(f"recent={instance.scheduler.recent_requests}")
+                if instance.scheduler.recent_failures > 0:
+                    details.append(f"fail={instance.scheduler.recent_failures}")
+                if instance.scheduler.cooldown_remaining_sec > 0:
+                    details.append(
+                        f"cooldown={instance.scheduler.cooldown_remaining_sec:.1f}s"
+                    )
                 detail_text = ", ".join(details)
                 logger.mesg(f"  - {instance.name}: {instance.endpoint} ({detail_text})")
+                if instance.scheduler.last_error:
+                    logger.warn(f"    last_error: {instance.scheduler.last_error}")
             logger.note("Stats:")
             for line in dict_to_lines(info.stats.__dict__).splitlines():
+                logger.mesg(f"  {line}")
+            logger.note("Scheduler:")
+            for line in dict_to_lines(info.scheduler.__dict__).splitlines():
                 logger.mesg(f"  {line}")
         elif args.client_action == "chat":
             messages = build_multimodal_messages(

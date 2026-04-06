@@ -4,6 +4,7 @@ import asyncio
 import httpx
 import orjson
 import pytest
+import time
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -44,6 +45,7 @@ class TestQWNInstance:
         info = instance.to_info()
         assert info.healthy is True
         assert info.model_name == "4b:4bit"
+        assert info.available_slots >= 0
 
 
 class TestQWNStatsData:
@@ -55,10 +57,13 @@ class TestQWNStatsData:
             total_failovers=2,
             active_requests=2,
         )
+        stats.record_wait(42.0)
         model = stats.to_model()
         assert model.total_requests == 3
         assert model.total_failovers == 2
         assert model.active_requests == 2
+        assert model.total_wait_events == 1
+        assert model.avg_wait_time_ms == 42.0
 
 
 class TestQWNInstanceDiscovery:
@@ -151,6 +156,92 @@ class TestQWNMachineServer:
         chosen = server._get_idle_instance()
         assert chosen is cool_gpu
 
+    def test_get_idle_instance_penalizes_recent_failures(self):
+        now = time.monotonic()
+        unstable = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            gpu_id=0,
+            healthy=True,
+        )
+        stable = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            gpu_id=2,
+            healthy=True,
+        )
+        unstable.telemetry.record_dispatch(now=now)
+        unstable.telemetry.record_failure("boom", now=now)
+        stable.telemetry.record_dispatch(now=now)
+        stable.telemetry.record_success(latency_ms=900.0, now=now)
+
+        server = QWNMachineServer(instances=[unstable, stable])
+
+        chosen = server._get_idle_instance()
+        assert chosen is stable
+
+    def test_get_idle_instance_penalizes_high_recent_latency(self):
+        now = time.monotonic()
+        slow = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            gpu_id=0,
+            healthy=True,
+        )
+        fast = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            gpu_id=2,
+            healthy=True,
+        )
+        slow.telemetry.record_dispatch(now=now)
+        slow.telemetry.record_success(latency_ms=6800.0, now=now)
+        fast.telemetry.record_dispatch(now=now)
+        fast.telemetry.record_success(latency_ms=900.0, now=now)
+
+        server = QWNMachineServer(instances=[slow, fast])
+
+        chosen = server._get_idle_instance()
+        assert chosen is fast
+
+    def test_get_idle_instance_prefers_higher_observed_throughput(self):
+        now = time.monotonic()
+        slower = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            gpu_id=0,
+            healthy=True,
+        )
+        faster = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            gpu_id=2,
+            healthy=True,
+        )
+        slower.telemetry.record_dispatch(now=now)
+        slower.telemetry.record_success(
+            latency_ms=1200.0,
+            completion_tokens=48,
+            now=now,
+        )
+        faster.telemetry.record_dispatch(now=now)
+        faster.telemetry.record_success(
+            latency_ms=600.0,
+            completion_tokens=48,
+            now=now,
+        )
+
+        server = QWNMachineServer(instances=[slower, faster])
+
+        chosen = server._get_idle_instance()
+        assert chosen is faster
+
     def test_models_endpoint(self):
         instance = QWNInstance(
             container_name="qwn-multi--gpu0",
@@ -198,6 +289,59 @@ class TestQWNMachineServer:
         timeout = server._client.get.call_args.kwargs["timeout"]
         assert timeout.connect == 10.0
         assert instance.model_name == "4b:4bit"
+
+    def test_acquire_instance_waits_for_capacity_release(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+        )
+        instance._active_requests = 8
+        server = QWNMachineServer(instances=[instance])
+
+        async def scenario():
+            async def release_later():
+                await asyncio.sleep(0.05)
+                instance._active_requests = 7
+                await server._notify_capacity_changed()
+
+            release_task = asyncio.create_task(release_later())
+            try:
+                reserved, _, _ = await server._acquire_instance()
+            finally:
+                await release_task
+            return reserved
+
+        chosen = asyncio.run(scenario())
+        assert chosen is instance
+        assert server.stats.total_wait_events == 1
+
+    def test_info_includes_scheduler_snapshot(self):
+        now = time.monotonic()
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+            model_name="4b:4bit",
+        )
+        instance.telemetry.record_dispatch(now=now)
+        instance.telemetry.record_success(
+            latency_ms=1200.0,
+            ttft_ms=450.0,
+            completion_tokens=32,
+            now=now,
+        )
+        server = QWNMachineServer(instances=[instance])
+        server._last_health_refresh_monotonic = now
+        server._last_gpu_refresh_monotonic = now
+
+        result = asyncio.run(server.info())
+
+        assert result.scheduler.algorithm == "adaptive_pressure_v2"
+        assert result.instances[0].scheduler.latency_ema_ms == 1200.0
+        assert result.instances[0].active_requests == 0
 
     def test_acquire_instance_does_not_fallback_to_wrong_requested_model(self):
         primary = QWNInstance(
