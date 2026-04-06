@@ -38,6 +38,7 @@ qwn --help
 - Hugging Face 下载走 `https://hf-mirror.com`
 - `pip` 下载走 `https://mirrors.ustc.edu.cn/pypi/simple`
 - 若环境中存在 `QWN_PROXY`、`TFMX_QWN_PROXY` 或系统代理变量，则 Docker build 会自动复用它们
+- 如果模型和多模态预处理文件已经在共享 Hugging Face cache 中，runtime 容器会自动切到离线模式，避免启动时再次因为容器内 DNS 或外网波动而失败
 
 ## 快速开始
 
@@ -86,6 +87,7 @@ qwn machine logs
 qwn client health
 qwn client models
 qwn client chat "你好，请用三句话介绍你的能力。"
+python debugs/qwn_multimodal_probe.py
 ```
 
 ### 5. 运行 benchmark

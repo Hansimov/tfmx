@@ -677,6 +677,7 @@ class ComposeFileGenerator:
         self.gpu_memory_utilization = gpu_memory_utilization
         self.gpu_configs = gpu_configs or []
         self._gpu_config_map = {config.gpu_id: config for config in self.gpu_configs}
+        self.model_config_manager = ModelConfigManager(cache_hf_hub=self.cache_hf_hub)
 
     def _get_gpu_config(self, gpu: GPUInfo) -> GpuModelConfig:
         if gpu.index in self._gpu_config_map:
@@ -690,6 +691,26 @@ class ComposeFileGenerator:
             quant_method=quant_method,
             quant_level=quant_level,
         )
+
+    def _uses_runtime_offline_cache(self) -> bool:
+        model_ids = {self._get_gpu_config(gpu).vllm_model_arg for gpu in self.gpus}
+        if not model_ids:
+            return False
+
+        for model_id in model_ids:
+            snapshot_dir = self.model_config_manager.get_model_snapshot_dir(model_id)
+            if snapshot_dir is None:
+                return False
+            if not any(
+                (snapshot_dir / filename).exists()
+                for filename in (
+                    "config.json",
+                    "preprocessor_config.json",
+                    "processor_config.json",
+                )
+            ):
+                return False
+        return True
 
     def generate(self) -> str:
         lines = self._generate_header()
@@ -746,6 +767,14 @@ class ComposeFileGenerator:
                 "    - VLLM_WORKER_MULTIPROC_METHOD=spawn",
             ]
         )
+
+        if self._uses_runtime_offline_cache():
+            lines.extend(
+                [
+                    "    - HF_HUB_OFFLINE=1",
+                    "    - TRANSFORMERS_OFFLINE=1",
+                ]
+            )
 
         if self.network_config.runtime_http_proxy:
             lines.extend(

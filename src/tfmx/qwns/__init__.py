@@ -14,8 +14,12 @@ from .client import MachineStats
 from .client import ModelInfo
 from .client import QWNClient
 from .client import StreamChatResult
+from .client import build_multimodal_messages
 from .client import build_text_messages
+from .client import format_stream_stats_line
 from .client import format_elapsed_time
+from .client import join_prompt_texts
+from .client import normalize_image_url
 from .clients import QWNClients
 from .clients_core import ClientsHealthResponse
 from .clients_core import MachineScheduler
@@ -35,6 +39,8 @@ from .networking import DEFAULT_PIP_TRUSTED_HOST
 from .networking import QWNNetworkConfig
 from .networking import detect_default_proxy
 from .networking import is_loopback_proxy
+from .gpu_runtime import GPURuntimeStats
+from .gpu_runtime import query_gpu_runtime_stats
 from .compose import AWQ_MODELS
 from .compose import AWQ_QUANT_LEVELS
 from .compose import AWQ_REPO_MAP

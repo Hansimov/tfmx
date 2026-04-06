@@ -25,6 +25,7 @@ from webu import setup_swagger_ui
 
 from .compose import MACHINE_PORT, MAX_CONCURRENT_REQUESTS
 from .compose import get_display_shortcut, get_model_shortcut, normalize_model_key
+from .gpu_runtime import GPURuntimeStats, query_gpu_runtime_stats
 from .router import InstanceDescriptor, QWNRouter, parse_model_spec
 
 
@@ -32,6 +33,7 @@ PORT = MACHINE_PORT
 MAX_CONCURRENT = MAX_CONCURRENT_REQUESTS
 QWN_CONTAINER_IMAGE_PATTERN = "vllm"
 DEFAULT_NAME_PATTERN = r"qwn[-_]"
+HEALTH_REFRESH_INTERVAL_SEC = 5
 
 
 class TextContent(BaseModel):
@@ -39,14 +41,33 @@ class TextContent(BaseModel):
     text: str = Field(..., description="Text content")
 
 
-ContentPart = Union[TextContent]
+class ImageURL(BaseModel):
+    url: str = Field(
+        ...,
+        description="Image URL or base64 data URI (data:image/png;base64,...)",
+    )
+    detail: str = Field(default="auto", description="Detail level: auto, low, high")
+
+
+class ImageContent(BaseModel):
+    type: Literal["image_url"] = "image_url"
+    image_url: ImageURL
+
+
+ContentPart = Union[TextContent, ImageContent]
 
 
 class ChatMessage(BaseModel):
     role: Literal["system", "user", "assistant"] = Field(
         ..., description="Message role"
     )
-    content: Union[str, list[ContentPart]] = Field(..., description="Message content")
+    content: Union[str, list[ContentPart]] = Field(
+        ...,
+        description=(
+            "Message content: plain text string, or a list of text/image_url parts "
+            "for multimodal inputs"
+        ),
+    )
 
 
 class ChatCompletionRequest(BaseModel):
@@ -89,6 +110,13 @@ class InstanceHealthDetail(BaseModel):
     active_requests: int = Field(0, description="Current active requests")
     model_label: str = Field(default="", description="Model label")
     gpu_id: int | None = Field(None, description="GPU ID")
+    gpu_utilization_pct: float | None = Field(None, description="GPU utilization")
+    gpu_memory_used_mib: float | None = Field(None, description="GPU memory used")
+    gpu_memory_total_mib: float | None = Field(None, description="GPU memory total")
+    routing_pressure: float | None = Field(
+        None,
+        description="Scheduler pressure score (lower is better)",
+    )
 
 
 class HealthResponse(BaseModel):
@@ -119,6 +147,10 @@ class InstanceInfo(BaseModel):
     quant_method: str = Field(default="")
     quant_level: str = Field(default="")
     model_label: str = Field(default="")
+    gpu_utilization_pct: float | None = Field(None)
+    gpu_memory_used_mib: float | None = Field(None)
+    gpu_memory_total_mib: float | None = Field(None)
+    routing_pressure: float | None = Field(None)
 
 
 class MachineStats(BaseModel):
@@ -148,6 +180,9 @@ class QWNInstance:
     quant_method: str = ""
     quant_level: str = ""
     _latency_ms: float = 0.0
+    _gpu_utilization_pct: float = 0.0
+    _gpu_memory_used_mib: float = 0.0
+    _gpu_memory_total_mib: float = 0.0
 
     @property
     def endpoint(self) -> str:
@@ -179,6 +214,28 @@ class QWNInstance:
         model_text = f" [{self.model_name}]" if self.model_name else ""
         return f"QWNInstance({status} {self.container_name} @ {self.endpoint}, {gpu_text}{model_text})"
 
+    @property
+    def gpu_memory_utilization_pct(self) -> float:
+        if self._gpu_memory_total_mib <= 0:
+            return 0.0
+        return self._gpu_memory_used_mib / self._gpu_memory_total_mib * 100.0
+
+    @property
+    def routing_pressure(self) -> float:
+        util_ratio = min(max(self._gpu_utilization_pct, 0.0), 100.0) / 100.0
+        memory_ratio = min(max(self.gpu_memory_utilization_pct, 0.0), 100.0) / 100.0
+        return util_ratio * 0.8 + memory_ratio * 0.2
+
+    def apply_gpu_runtime(self, snapshot: GPURuntimeStats | None) -> None:
+        if snapshot is None:
+            self._gpu_utilization_pct = 0.0
+            self._gpu_memory_used_mib = 0.0
+            self._gpu_memory_total_mib = 0.0
+            return
+        self._gpu_utilization_pct = snapshot.utilization_gpu_pct
+        self._gpu_memory_used_mib = snapshot.memory_used_mib
+        self._gpu_memory_total_mib = snapshot.memory_total_mib
+
     def to_info(self) -> InstanceInfo:
         return InstanceInfo(
             name=self.container_name,
@@ -189,6 +246,10 @@ class QWNInstance:
             quant_method=self.quant_method,
             quant_level=self.quant_level,
             model_label=self.model_name,
+            gpu_utilization_pct=round(self._gpu_utilization_pct, 2),
+            gpu_memory_used_mib=round(self._gpu_memory_used_mib, 2),
+            gpu_memory_total_mib=round(self._gpu_memory_total_mib, 2),
+            routing_pressure=round(self.routing_pressure, 4),
         )
 
 
@@ -375,7 +436,14 @@ class QWNMachineServer:
 
         if not candidates:
             return None
-        candidates.sort(key=lambda instance: instance.available_slots, reverse=True)
+        candidates.sort(
+            key=lambda instance: (
+                -instance.available_slots,
+                instance.routing_pressure,
+                instance._latency_ms if instance._latency_ms > 0 else float("inf"),
+                instance.gpu_id if instance.gpu_id is not None else 999,
+            )
+        )
         return candidates[0]
 
     def _create_app(self) -> FastAPI:
@@ -464,7 +532,7 @@ class QWNMachineServer:
 
     async def _periodic_health_check(self) -> None:
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(HEALTH_REFRESH_INTERVAL_SEC)
             await self.health_check_all()
 
     async def health_check_all(self) -> None:
@@ -474,10 +542,23 @@ class QWNMachineServer:
             *[self._check_instance_health(instance) for instance in self.instances],
             return_exceptions=True,
         )
+        await self._refresh_gpu_runtime_metrics()
+        await self._discover_instance_models()
+        self._build_router()
+
+    async def _refresh_gpu_runtime_metrics(self) -> None:
+        gpu_ids = [
+            instance.gpu_id
+            for instance in self.instances
+            if instance.gpu_id is not None
+        ]
+        if not gpu_ids:
+            return
+        snapshots = await asyncio.to_thread(query_gpu_runtime_stats, gpu_ids)
         for instance in self.instances:
-            for descriptor in self.router.instances:
-                if descriptor.endpoint == instance.endpoint:
-                    descriptor.healthy = instance.healthy
+            if instance.gpu_id is None:
+                continue
+            instance.apply_gpu_runtime(snapshots.get(instance.gpu_id))
 
     async def _check_instance_health(self, instance: QWNInstance) -> bool:
         try:
@@ -550,6 +631,10 @@ class QWNMachineServer:
                     active_requests=instance._active_requests,
                     model_label=self._get_model_label(instance),
                     gpu_id=instance.gpu_id,
+                    gpu_utilization_pct=round(instance._gpu_utilization_pct, 2),
+                    gpu_memory_used_mib=round(instance._gpu_memory_used_mib, 2),
+                    gpu_memory_total_mib=round(instance._gpu_memory_total_mib, 2),
+                    routing_pressure=round(instance.routing_pressure, 4),
                 )
                 for instance in self.instances
             ],

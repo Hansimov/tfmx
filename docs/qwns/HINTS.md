@@ -14,6 +14,7 @@
 - `docker build --progress=plain` 已经默认开启，所以构建时不会再出现“看起来卡住但其实在下载”的情况
 - Hugging Face 默认使用 `hf-mirror.com`，`pip` 默认使用 USTC mirror
 - 若环境中存在 `QWN_PROXY`、`TFMX_QWN_PROXY` 或系统代理，构建镜像时会自动复用
+- 如果共享 Hugging Face cache 已经包含模型和预处理配置，runtime 容器会自动打开 `HF_HUB_OFFLINE=1` 与 `TRANSFORMERS_OFFLINE=1`，避免多实例启动时因容器 DNS 抖动而反复访问远端
 
 手动重建示例：
 
@@ -86,10 +87,18 @@ qwn compose up \
 
 - `qwn client chat "..."` 现在默认以流式方式输出
 - 默认会传入 `chat_template_kwargs.enable_thinking=false`，避免把模型思维链直接打印到终端
-- 最后一行会附带统计信息，例如：`elapsed: 1min 12.4s | 38.7 token/s`
+- 最后一行会附带统计信息，例如：`stats elapsed=1min 12.4s | ttft=0.8s | rate=38.7 token/s | out=512 tok`
 - 若分钟数为 `0`，则只显示秒，例如：`elapsed: 8.3s | 41.7 token/s`
 - 如需旧的非流式输出，显式加 `--no-stream`
 - 如果你确实想观察 thinking 输出，再显式加 `--thinking`
+
+## 与 TEI 共卡时的调度行为
+
+- `qwn machine` 现在会周期性采样每张 GPU 的运行时利用率与显存占用，并把这些指标纳入实例选择
+- 在没有外部负载时，5 个健康实例可以保持接近均匀的分发
+- 当某张卡上的 TEI embedding 实例被持续打满时，`qwn machine` 会降低向该卡对应 LLM 实例分发新请求的优先级
+- 这不是硬隔离，也不是跨服务统一调度器；它属于轻量级的“避让”策略，目标是减少同卡热点，而不是保证严格 QoS
+- 当前机器上的一次实测结果是：5 个健康 `qwn` 实例在无干扰时，180 个请求平均落到每卡 36 个；在 GPU2 上持续施加 TEI embedding 压力后，GPU2 对应 `qwn` 实例只接到 24 个请求，而其他卡大致落在 36 到 40 个之间
 
 ## 常见问题
 

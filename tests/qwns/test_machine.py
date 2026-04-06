@@ -3,10 +3,11 @@
 import asyncio
 
 from pathlib import Path
-from unittest.mock import MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock, patch
 
 from tfmx.qwns.machine import ModelInfo
 from tfmx.qwns.machine import ModelsResponse
+from tfmx.qwns.machine import ChatCompletionRequest
 from tfmx.qwns.machine import QWNInstance
 from tfmx.qwns.machine import QWNInstanceDiscovery
 from tfmx.qwns.machine import QWNMachineDaemon
@@ -71,6 +72,24 @@ class TestQWNInstanceDiscovery:
 
 
 class TestQWNMachineServer:
+    def test_chat_completion_request_accepts_multimodal_content(self):
+        request = ChatCompletionRequest(
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "先看这张图"},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": "data:image/png;base64,AAA"},
+                        },
+                        {"type": "text", "text": "再回答"},
+                    ],
+                }
+            ]
+        )
+        assert request.messages[0].content[1].type == "image_url"
+
     def test_get_model_label(self):
         instance = QWNInstance(
             container_name="qwn-multi--gpu0",
@@ -94,6 +113,33 @@ class TestQWNMachineServer:
         rewritten = server._rewrite_model_in_body(body, instance)
         assert b"4b:4bit" in rewritten
 
+    def test_get_idle_instance_prefers_lower_gpu_pressure(self):
+        busy_gpu = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            gpu_id=0,
+            healthy=True,
+        )
+        cool_gpu = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            gpu_id=2,
+            healthy=True,
+        )
+        busy_gpu._gpu_utilization_pct = 95.0
+        busy_gpu._gpu_memory_used_mib = 18000.0
+        busy_gpu._gpu_memory_total_mib = 20480.0
+        cool_gpu._gpu_utilization_pct = 12.0
+        cool_gpu._gpu_memory_used_mib = 14000.0
+        cool_gpu._gpu_memory_total_mib = 20480.0
+
+        server = QWNMachineServer(instances=[busy_gpu, cool_gpu])
+
+        chosen = server._get_idle_instance()
+        assert chosen is cool_gpu
+
     def test_models_endpoint(self):
         instance = QWNInstance(
             container_name="qwn-multi--gpu0",
@@ -106,6 +152,33 @@ class TestQWNMachineServer:
         result = asyncio.run(server.models())
         assert isinstance(result, ModelsResponse)
         assert result.data[0].id == "4b:4bit"
+
+    @patch.object(
+        QWNMachineServer, "_refresh_gpu_runtime_metrics", new_callable=AsyncMock
+    )
+    @patch.object(QWNMachineServer, "_discover_instance_models", new_callable=AsyncMock)
+    @patch.object(QWNMachineServer, "_check_instance_health", new_callable=AsyncMock)
+    def test_health_check_all_rebuilds_router_for_newly_healthy_instances(
+        self,
+        mock_check_health,
+        mock_discover_models,
+        mock_refresh_gpu,
+    ):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+        )
+        server = QWNMachineServer(instances=[instance])
+        server._client = MagicMock()
+
+        with patch.object(server, "_build_router") as mock_build_router:
+            asyncio.run(server.health_check_all())
+
+        mock_refresh_gpu.assert_awaited_once()
+        mock_discover_models.assert_awaited_once()
+        mock_build_router.assert_called_once()
 
 
 class TestQWNMachineDaemon:

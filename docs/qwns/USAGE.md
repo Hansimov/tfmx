@@ -58,6 +58,7 @@ qwn client health
 qwn client models
 qwn client info
 qwn client chat "解释一下 AWQ 量化的用途"
+qwn client chat -i image_a.png -i image_b.png "先看第一张图" "再比较第二张图"
 qwn client chat "你好" --no-stream
 qwn client chat "请展示详细推理过程" --thinking
 qwn client generate --prompt "总结一下 qwn compose 的作用"
@@ -67,10 +68,16 @@ qwn client -e http://localhost:27880 models
 ### 流式输出说明
 
 - `qwn client chat "..."` 现在默认以流式方式在终端打印增量文本
-- 结束后会追加统计信息，格式为：`elapsed: Nmin N.Ns | M.M token/s`
-- 若分钟数为 `0`，只显示秒，例如：`elapsed: 8.3s | 41.7 token/s`
+- 结束后会追加统计信息，格式类似：`stats elapsed=8.3s | ttft=0.5s | rate=120.7 token/s | out=103 tok`
+- 若分钟数为 `0`，则 `elapsed` 只显示秒，例如：`stats elapsed=8.3s | ttft=0.5s | rate=41.7 token/s | out=64 tok`
 - 若你需要旧的非流式行为，可以加 `--no-stream`
 - 当前默认会显式关闭 Qwen thinking 模式，只输出最终回答；如需保留思维链输出，可加 `--thinking`
+
+### 多图多文本消息
+
+- `qwn client chat` 支持重复传入 `-i/--image`，并支持多个文本片段
+- 多个文本片段会与图片按顺序交错组成一个 OpenAI 兼容的 multimodal user message
+- 图片参数既可以是本地文件路径，也可以是 URL 或 `data:` URI
 
 ## `qwn benchmark`
 

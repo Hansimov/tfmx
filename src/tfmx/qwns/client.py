@@ -1,12 +1,14 @@
 """QWN client helpers for single-endpoint text chat services."""
 
 import argparse
+import base64
 import time
 
 import httpx
 import orjson
 
 from dataclasses import dataclass, field
+from pathlib import Path
 from tclogger import dict_to_lines, logger, logstr
 from typing import Callable, Optional
 
@@ -45,7 +47,7 @@ class ModelInfo:
 @dataclass
 class ChatMessage:
     role: str
-    content: str
+    content: object
 
     def to_dict(self) -> dict:
         return {"role": self.role, "content": self.content}
@@ -120,6 +122,7 @@ class StreamChatResult:
     text: str = ""
     usage: ChatUsage = field(default_factory=ChatUsage)
     elapsed_sec: float = 0.0
+    first_token_latency_sec: float = 0.0
 
     @property
     def token_per_second(self) -> float:
@@ -139,6 +142,10 @@ class InstanceInfo:
     quant_method: str = ""
     quant_level: str = ""
     model_label: str = ""
+    gpu_utilization_pct: float | None = None
+    gpu_memory_used_mib: float | None = None
+    gpu_memory_total_mib: float | None = None
+    routing_pressure: float | None = None
 
     @classmethod
     def from_dict(cls, data: dict) -> "InstanceInfo":
@@ -151,6 +158,10 @@ class InstanceInfo:
             quant_method=data.get("quant_method", ""),
             quant_level=data.get("quant_level", ""),
             model_label=data.get("model_label", ""),
+            gpu_utilization_pct=data.get("gpu_utilization_pct"),
+            gpu_memory_used_mib=data.get("gpu_memory_used_mib"),
+            gpu_memory_total_mib=data.get("gpu_memory_total_mib"),
+            routing_pressure=data.get("routing_pressure"),
         )
 
 
@@ -203,6 +214,67 @@ def build_text_messages(
     return messages
 
 
+def join_prompt_texts(texts: list[str] | tuple[str, ...] | str) -> str:
+    if isinstance(texts, str):
+        return texts.strip()
+    return "\n\n".join(part.strip() for part in texts if part and part.strip())
+
+
+def _encode_image_to_data_url(image_path: str) -> str:
+    path = Path(image_path)
+    if not path.exists():
+        raise FileNotFoundError(f"Image not found: {image_path}")
+
+    mime_map = {
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".png": "image/png",
+        ".gif": "image/gif",
+        ".webp": "image/webp",
+        ".bmp": "image/bmp",
+    }
+    mime_type = mime_map.get(path.suffix.lower(), "image/png")
+    data = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{data}"
+
+
+def normalize_image_url(image: str) -> str:
+    if image.startswith(("http://", "https://", "data:")):
+        return image
+    return _encode_image_to_data_url(image)
+
+
+def build_multimodal_messages(
+    texts: list[str],
+    images: list[str] | None = None,
+    system_prompt: str | None = None,
+) -> list[dict]:
+    normalized_texts = [text.strip() for text in texts if text and text.strip()]
+    normalized_images = [normalize_image_url(image) for image in images or []]
+
+    if not normalized_images:
+        return build_text_messages(join_prompt_texts(normalized_texts), system_prompt)
+
+    content_parts: list[dict] = []
+    total_parts = max(len(normalized_texts), len(normalized_images))
+    for index in range(total_parts):
+        if index < len(normalized_texts):
+            content_parts.append({"type": "text", "text": normalized_texts[index]})
+        if index < len(normalized_images):
+            content_parts.append(
+                {
+                    "type": "image_url",
+                    "image_url": {"url": normalized_images[index]},
+                }
+            )
+
+    messages: list[dict] = []
+    if system_prompt:
+        messages.append({"role": "system", "content": system_prompt})
+    messages.append({"role": "user", "content": content_parts})
+    return messages
+
+
 def _build_chat_payload(
     messages: list[dict],
     model: str = "",
@@ -232,6 +304,32 @@ def format_elapsed_time(elapsed_sec: float) -> str:
     if minutes > 0:
         return f"{minutes}min {seconds:.1f}s"
     return f"{seconds:.1f}s"
+
+
+def format_stream_stats_line(result: StreamChatResult) -> str:
+    elapsed_text = logstr.okay(format_elapsed_time(result.elapsed_sec))
+    ttft_value = (
+        format_elapsed_time(result.first_token_latency_sec)
+        if result.first_token_latency_sec > 0
+        else "n/a"
+    )
+    ttft_text = (
+        logstr.mesg(ttft_value)
+        if result.first_token_latency_sec > 0
+        else logstr.warn(ttft_value)
+    )
+    rate_value = f"{result.token_per_second:.1f} token/s"
+    rate_text = (
+        logstr.okay(rate_value)
+        if result.token_per_second > 0
+        else logstr.mesg(rate_value)
+    )
+    token_count = result.usage.completion_tokens or result.usage.total_tokens
+    token_text = logstr.mesg(f"{token_count} tok")
+    return (
+        f"{logstr.mesg('stats')} elapsed={elapsed_text} | "
+        f"ttft={ttft_text} | rate={rate_text} | out={token_text}"
+    )
 
 
 def _iter_text_parts(content: object) -> list[str]:
@@ -422,6 +520,7 @@ class QWNClient:
         text_fragments: list[str] = []
         usage = ChatUsage()
         started_at = time.perf_counter()
+        first_token_latency_sec = 0.0
         try:
             with self.client.stream(
                 "POST",
@@ -442,6 +541,8 @@ class QWNClient:
 
                     chunk_text = _extract_stream_text(chunk)
                     if chunk_text:
+                        if first_token_latency_sec <= 0:
+                            first_token_latency_sec = time.perf_counter() - started_at
                         text_fragments.append(chunk_text)
                         if on_text:
                             on_text(chunk_text)
@@ -455,6 +556,7 @@ class QWNClient:
                 text="".join(text_fragments),
                 usage=usage,
                 elapsed_sec=elapsed_sec,
+                first_token_latency_sec=first_token_latency_sec,
             )
             self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
             return result
@@ -629,7 +731,8 @@ CLI_EPILOG = """
 Examples:
   qwn client health
   qwn client models
-  qwn client chat "你好，介绍一下自己"
+    qwn client chat "你好，介绍一下自己"
+    qwn client chat -i photo_a.png -i photo_b.png "先看第一张图" "再比较第二张图"
     qwn client chat "你好" --no-stream
   qwn client generate --prompt "请总结一下 Docker 部署步骤"
   qwn client -e http://localhost:27880 models
@@ -660,12 +763,19 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     subparsers.add_parser("info", help="Show machine info")
 
     chat_parser = subparsers.add_parser("chat", help="Send a chat completion")
-    chat_parser.add_argument("text", help="Prompt text")
+    chat_parser.add_argument("text", nargs="+", help="Prompt text segment(s)")
     chat_parser.add_argument("--model", default="", help="Model label")
     chat_parser.add_argument("--max-tokens", type=int, default=512)
     chat_parser.add_argument("--temperature", type=float, default=0.7)
     chat_parser.add_argument("--top-p", type=float, default=0.9)
     chat_parser.add_argument("-s", "--system", default=None, help="System prompt")
+    chat_parser.add_argument(
+        "-i",
+        "--image",
+        action="append",
+        default=[],
+        help="Image path, URL, or data URI. Repeat for multi-image prompts.",
+    )
     chat_parser.add_argument(
         "--thinking",
         action="store_true",
@@ -714,29 +824,43 @@ def run_from_args(args: argparse.Namespace) -> None:
             logger.note(f"Port: {info.port}")
             logger.note("Instances:")
             for instance in info.instances:
-                logger.mesg(
-                    f"  - {instance.name}: {instance.endpoint} ({instance.model_label})"
-                )
+                details = [instance.model_label] if instance.model_label else []
+                if instance.gpu_id is not None:
+                    details.append(f"GPU{instance.gpu_id}")
+                if instance.gpu_utilization_pct is not None:
+                    details.append(f"util={instance.gpu_utilization_pct:.0f}%")
+                if (
+                    instance.gpu_memory_used_mib is not None
+                    and instance.gpu_memory_total_mib is not None
+                    and instance.gpu_memory_total_mib > 0
+                ):
+                    details.append(
+                        f"mem={instance.gpu_memory_used_mib:.0f}/{instance.gpu_memory_total_mib:.0f}MiB"
+                    )
+                if instance.routing_pressure is not None:
+                    details.append(f"pressure={instance.routing_pressure:.2f}")
+                detail_text = ", ".join(details)
+                logger.mesg(f"  - {instance.name}: {instance.endpoint} ({detail_text})")
             logger.note("Stats:")
             for line in dict_to_lines(info.stats.__dict__).splitlines():
                 logger.mesg(f"  {line}")
         elif args.client_action == "chat":
+            messages = build_multimodal_messages(
+                texts=args.text,
+                images=args.image,
+                system_prompt=args.system,
+            )
             if args.no_stream:
-                result = client.generate(
-                    prompt=args.text,
-                    system_prompt=args.system,
+                result = client.chat(
+                    messages=messages,
                     max_tokens=args.max_tokens,
                     temperature=args.temperature,
                     top_p=args.top_p,
                     model=args.model,
                     enable_thinking=args.thinking,
                 )
-                print(result)
+                print(result.text)
             else:
-                messages = build_text_messages(
-                    prompt=args.text,
-                    system_prompt=args.system,
-                )
                 stream_result = client.stream_chat(
                     messages=messages,
                     model=args.model,
@@ -748,10 +872,7 @@ def run_from_args(args: argparse.Namespace) -> None:
                 )
                 if stream_result.text and not stream_result.text.endswith("\n"):
                     print()
-                elapsed_text = format_elapsed_time(stream_result.elapsed_sec)
-                print(
-                    f"elapsed: {elapsed_text} | {stream_result.token_per_second:.1f} token/s"
-                )
+                print(format_stream_stats_line(stream_result))
         elif args.client_action == "generate":
             result = client.generate(
                 prompt=args.prompt,

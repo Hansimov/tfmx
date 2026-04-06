@@ -157,6 +157,44 @@ class TestComposeFileGenerator:
         assert "HF_ENDPOINT=https://hf-mirror.example" in compose_text
         assert "PIP_INDEX_URL=https://mirror.example/pypi/simple" in compose_text
 
+    @patch("tfmx.qwns.compose.ModelConfigManager.get_model_snapshot_dir")
+    def test_generate_enables_runtime_offline_when_model_cached(
+        self, mock_snapshot_dir, tmp_path
+    ):
+        snapshot_dir = tmp_path / "snapshot"
+        snapshot_dir.mkdir()
+        (snapshot_dir / "config.json").write_text("{}")
+        (snapshot_dir / "preprocessor_config.json").write_text("{}")
+        mock_snapshot_dir.return_value = snapshot_dir
+
+        generator = ComposeFileGenerator(
+            gpus=[GPUInfo(index=0, compute_cap="8.9")],
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name="qwn-test",
+            data_dir=Path("/tmp/qwn-test"),
+        )
+
+        compose_text = generator.generate()
+        assert "HF_HUB_OFFLINE=1" in compose_text
+        assert "TRANSFORMERS_OFFLINE=1" in compose_text
+
+    @patch("tfmx.qwns.compose.ModelConfigManager.get_model_snapshot_dir")
+    def test_generate_keeps_runtime_online_without_cache(self, mock_snapshot_dir):
+        mock_snapshot_dir.return_value = None
+
+        generator = ComposeFileGenerator(
+            gpus=[GPUInfo(index=0, compute_cap="8.9")],
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name="qwn-test",
+            data_dir=Path("/tmp/qwn-test"),
+        )
+
+        compose_text = generator.generate()
+        assert "HF_HUB_OFFLINE=1" not in compose_text
+        assert "TRANSFORMERS_OFFLINE=1" not in compose_text
+
 
 class TestQWNComposer:
     @patch("tfmx.qwns.compose.GPUDetector.detect")

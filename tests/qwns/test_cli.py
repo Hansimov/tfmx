@@ -28,7 +28,8 @@ class TestQwnCliParser:
         args = parser.parse_args(["client", "chat", "hello"])
         assert args.command == "client"
         assert args.client_action == "chat"
-        assert args.text == "hello"
+        assert args.text == ["hello"]
+        assert args.image == []
 
     def test_benchmark_parse(self):
         parser = build_parser()
