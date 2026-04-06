@@ -23,7 +23,7 @@ from tclogger import logger, logstr
 from typing import Literal, Optional, Union
 from webu import setup_swagger_ui
 
-from .compose import MACHINE_PORT, MAX_CONCURRENT_REQUESTS
+from .compose import MACHINE_PORT, MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
 from .compose import get_display_shortcut, get_model_shortcut, normalize_model_key
 from .gpu_runtime import GPURuntimeStats, query_gpu_runtime_stats
 from .router import InstanceDescriptor, QWNRouter, parse_model_spec
@@ -31,6 +31,7 @@ from .router import InstanceDescriptor, QWNRouter, parse_model_spec
 
 PORT = MACHINE_PORT
 MAX_CONCURRENT = MAX_CONCURRENT_REQUESTS
+DEFAULT_MAX_TOKENS = MAX_MODEL_LEN
 QWN_CONTAINER_IMAGE_PATTERN = "vllm"
 DEFAULT_NAME_PATTERN = r"qwn[-_]"
 HEALTH_REFRESH_INTERVAL_SEC = 5
@@ -75,7 +76,10 @@ class ChatCompletionRequest(BaseModel):
 
     model: str = Field(default="", description="Model label or shortcut")
     messages: list[ChatMessage] = Field(..., description="OpenAI chat messages")
-    max_tokens: int = Field(default=512, description="Maximum tokens to generate")
+    max_tokens: int = Field(
+        default=DEFAULT_MAX_TOKENS,
+        description="Maximum tokens to generate",
+    )
     temperature: float = Field(default=0.7, ge=0.0, le=2.0)
     top_p: float = Field(default=0.9, ge=0.0, le=1.0)
     stream: bool = Field(default=False, description="Enable streaming")
@@ -687,7 +691,9 @@ class QWNMachineServer:
         text: str = Form(..., description="Prompt text"),
         system_prompt: str = Form(default="", description="Optional system prompt"),
         model: str = Form(default="", description="Model label"),
-        max_tokens: int = Form(default=512, description="Maximum tokens"),
+        max_tokens: int = Form(
+            default=DEFAULT_MAX_TOKENS, description="Maximum tokens"
+        ),
         temperature: float = Form(default=0.7, description="Temperature"),
         top_p: float = Form(default=0.9, description="Top-p"),
     ) -> ChatCompletionResponse:

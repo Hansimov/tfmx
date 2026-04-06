@@ -90,6 +90,13 @@ qwn client chat "你好，请用三句话介绍你的能力。"
 python debugs/qwn_multimodal_probe.py
 ```
 
+说明：
+
+- `qwn client chat` 与 `qwn client generate` 现在默认把 `--max-tokens` 提到 `8192`
+- 这并不等于“无条件保证可以额外生成 8192 token”，因为当前部署的 `qwn compose` 默认 `--max-model-len` 也是 `8192`，实际可生成上限仍然受 `提示词 token + 输出 token <= 8192` 约束
+- 在当前 20GB RTX 3080 的实测环境里，5 个健康实例空闲时每卡显存大约在 `14.5-14.9 GiB / 20 GiB`；对单个后端发起 `max_tokens=8192` 的长输出请求时，`nvidia-smi` 观测到显存占用没有高于这一已预留水位，说明当前风险点不在“客户端默认值从 512 提到 8192”本身，而在于如果你要把服务端 `--max-model-len` 再继续往上加，才更可能触发 KV cache 带来的 OOM
+- 如果你确实需要在带较长 prompt 的情况下稳定生成接近 `8192` 个 token，应先评估是否要把服务端 `--max-model-len` 提高到 `12288` 或 `16384`；这在 20GB 卡上通常需要同步降低 `--max-num-seqs` 或 `--gpu-memory-utilization`
+
 ### 5. 运行 benchmark
 
 ```bash

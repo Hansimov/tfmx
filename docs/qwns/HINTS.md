@@ -87,10 +87,11 @@ qwn compose up \
 
 - `qwn client chat "..."` 现在默认以流式方式输出
 - 默认会传入 `chat_template_kwargs.enable_thinking=false`，避免把模型思维链直接打印到终端
-- 最后一行会附带统计信息，例如：`stats elapsed=1min 12.4s | ttft=0.8s | rate=38.7 token/s | out=512 tok`
+- 最后一行会附带统计信息，例如：`[stats] elapsed=1min 12.4s | ttft=0.8s | rate=38.7 token/s | out=512 tok`
 - 若分钟数为 `0`，则只显示秒，例如：`elapsed: 8.3s | 41.7 token/s`
 - 如需旧的非流式输出，显式加 `--no-stream`
 - 如果你确实想观察 thinking 输出，再显式加 `--thinking`
+- `--thinking` 模式下，CLI 会在终端流式输出前后补上 `<thinking>` 与 `</thinking>` 包裹；同时 `ttft` 现在按“首个非空白可见文本”计算，不再被纯换行或空格过早触发
 
 ## 与 TEI 共卡时的调度行为
 

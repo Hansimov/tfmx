@@ -30,6 +30,7 @@ class TestQwnCliParser:
         assert args.client_action == "chat"
         assert args.text == ["hello"]
         assert args.image == []
+        assert args.max_tokens == 8192
 
     def test_benchmark_parse(self):
         parser = build_parser()

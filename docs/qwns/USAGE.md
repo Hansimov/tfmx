@@ -68,10 +68,13 @@ qwn client -e http://localhost:27880 models
 ### 流式输出说明
 
 - `qwn client chat "..."` 现在默认以流式方式在终端打印增量文本
-- 结束后会追加统计信息，格式类似：`stats elapsed=8.3s | ttft=0.5s | rate=120.7 token/s | out=103 tok`
-- 若分钟数为 `0`，则 `elapsed` 只显示秒，例如：`stats elapsed=8.3s | ttft=0.5s | rate=41.7 token/s | out=64 tok`
+- 结束后会追加统计信息，格式类似：`[stats] elapsed=8.3s | ttft=0.5s | rate=120.7 token/s | out=103 tok`
+- 每一项统计现在都会把 `key=value` 当作一个整体着色，便于快速对齐键值
+- 若分钟数为 `0`，则 `elapsed` 只显示秒，例如：`[stats] elapsed=8.3s | ttft=0.5s | rate=41.7 token/s | out=64 tok`
 - 若你需要旧的非流式行为，可以加 `--no-stream`
 - 当前默认会显式关闭 Qwen thinking 模式，只输出最终回答；如需保留思维链输出，可加 `--thinking`
+- `--thinking` 打开后，终端流式输出会在前后补上 `<thinking>` 与 `</thinking>` 包裹，便于肉眼区分思考段与正文
+- 当前 `qwn client chat` 与 `qwn client generate` 的默认 `--max-tokens` 为 `8192`，但实际可生成上限仍受当前服务端 `--max-model-len=8192` 约束
 
 ### 多图多文本消息
 

@@ -7,7 +7,8 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .client import AsyncQWNClient, ChatResponse, QWNClient, StreamChatResult
+from .client import AsyncQWNClient, ChatResponse, DEFAULT_MAX_TOKENS, QWNClient
+from .client import StreamChatResult
 from .client import build_text_messages
 from .compose import MAX_CONCURRENT_REQUESTS
 from .performance import ExplorationConfig
@@ -462,7 +463,7 @@ class _QWNClientsBase(ABC):
         self,
         messages: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> ChatResponse:
@@ -481,7 +482,7 @@ class _QWNClientsBase(ABC):
         self,
         prompt: str,
         system_prompt: str | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         model: str = "",
@@ -503,7 +504,7 @@ class _QWNClientsBase(ABC):
         self,
         requests: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> list[ChatResponse]:
@@ -523,7 +524,7 @@ class _QWNClientsBase(ABC):
         self,
         requests: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         measure_ttft: bool = False,
@@ -622,7 +623,7 @@ class _QWNClientsBase(ABC):
         self,
         prompts: list[str],
         system_prompt: str | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         model: str = "",

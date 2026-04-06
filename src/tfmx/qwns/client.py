@@ -2,6 +2,7 @@
 
 import argparse
 import base64
+import re
 import time
 
 import httpx
@@ -12,10 +13,26 @@ from pathlib import Path
 from tclogger import dict_to_lines, logger, logstr
 from typing import Callable, Optional
 
-from .compose import MACHINE_PORT as PORT
+from .compose import MACHINE_PORT as PORT, MAX_MODEL_LEN
 
 
 HOST = "localhost"
+DEFAULT_MAX_TOKENS = MAX_MODEL_LEN
+THINKING_OPEN_TAG = "<thinking>\n"
+THINKING_CLOSE_TAG = "\n</thinking>\n"
+_MAX_TOKENS_LIMIT_PATTERNS = (
+    re.compile(r"max_total_tokens\s*=\s*(\d+)", re.IGNORECASE),
+    re.compile(r"max_model_len(?:=max_total_tokens)?\s*=\s*(\d+)", re.IGNORECASE),
+    re.compile(r"maximum context length is\s*(\d+)\s*tokens", re.IGNORECASE),
+)
+_REQUESTED_TOKENS_PATTERN = re.compile(
+    r"requested\s+(\d+)\s+tokens\s*\((\d+)\s+in the messages,\s*(\d+)\s+in the completion\)",
+    re.IGNORECASE,
+)
+_PROMPT_CHARS_PATTERN = re.compile(
+    r"prompt contains\s*(\d+)\s+characters",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -130,6 +147,75 @@ class StreamChatResult:
             return 0.0
         token_count = self.usage.completion_tokens or self.usage.total_tokens
         return token_count / self.elapsed_sec if token_count > 0 else 0.0
+
+
+@dataclass
+class _StreamRenderState:
+    started_at: float
+    on_text: Callable[[str], None] | None = None
+    enable_thinking: bool = False
+    include_thinking_tags: bool = False
+    text_fragments: list[str] = field(default_factory=list)
+    first_token_latency_sec: float = 0.0
+    _thinking_tag_open: bool = False
+    _saw_reasoning: bool = False
+
+    def begin(self) -> None:
+        return
+
+    def finish(self) -> None:
+        if self._thinking_tag_open:
+            self._close_thinking_tag()
+
+    def emit_chunk(self, chunk: dict) -> None:
+        for fragment_kind, fragment_text in _extract_stream_fragments(
+            chunk,
+            include_reasoning=self.enable_thinking,
+        ):
+            if not fragment_text:
+                continue
+            if (
+                self.enable_thinking
+                and self.include_thinking_tags
+                and not self._thinking_tag_open
+            ):
+                self._open_thinking_tag()
+            if (
+                fragment_kind == "content"
+                and self._thinking_tag_open
+                and self._saw_reasoning
+            ):
+                self._close_thinking_tag()
+            if fragment_kind == "reasoning":
+                self._saw_reasoning = True
+                if (
+                    self.enable_thinking
+                    and self.include_thinking_tags
+                    and not self._thinking_tag_open
+                ):
+                    self._open_thinking_tag()
+            self._emit(fragment_text)
+
+    def _emit(self, text: str, synthetic: bool = False) -> None:
+        if not text:
+            return
+        self.text_fragments.append(text)
+        if not synthetic and self.first_token_latency_sec <= 0 and text.strip():
+            self.first_token_latency_sec = time.perf_counter() - self.started_at
+        if self.on_text:
+            self.on_text(text)
+
+    def _open_thinking_tag(self) -> None:
+        if self._thinking_tag_open:
+            return
+        self._emit(THINKING_OPEN_TAG, synthetic=True)
+        self._thinking_tag_open = True
+
+    def _close_thinking_tag(self) -> None:
+        if not self._thinking_tag_open:
+            return
+        self._emit(THINKING_CLOSE_TAG, synthetic=True)
+        self._thinking_tag_open = False
 
 
 @dataclass
@@ -280,7 +366,7 @@ def build_multimodal_messages(
 def _build_chat_payload(
     messages: list[dict],
     model: str = "",
-    max_tokens: int = 512,
+    max_tokens: int = DEFAULT_MAX_TOKENS,
     temperature: float = 0.7,
     top_p: float = 0.9,
     stream: bool = False,
@@ -309,28 +395,29 @@ def format_elapsed_time(elapsed_sec: float) -> str:
 
 
 def format_stream_stats_line(result: StreamChatResult) -> str:
-    elapsed_text = logstr.okay(format_elapsed_time(result.elapsed_sec))
+    elapsed_value = format_elapsed_time(result.elapsed_sec)
     ttft_value = (
         format_elapsed_time(result.first_token_latency_sec)
         if result.first_token_latency_sec > 0
         else "n/a"
     )
+    elapsed_text = logstr.okay(f"elapsed={elapsed_value}")
     ttft_text = (
-        logstr.mesg(ttft_value)
+        logstr.mesg(f"ttft={ttft_value}")
         if result.first_token_latency_sec > 0
-        else logstr.warn(ttft_value)
+        else logstr.warn(f"ttft={ttft_value}")
     )
     rate_value = f"{result.token_per_second:.1f} token/s"
     rate_text = (
-        logstr.okay(rate_value)
+        logstr.okay(f"rate={rate_value}")
         if result.token_per_second > 0
-        else logstr.mesg(rate_value)
+        else logstr.mesg(f"rate={rate_value}")
     )
     token_count = result.usage.completion_tokens or result.usage.total_tokens
-    token_text = logstr.mesg(f"{token_count} tok")
+    token_text = logstr.mesg(f"out={token_count} tok")
     return (
-        f"{logstr.mesg('stats')} elapsed={elapsed_text} | "
-        f"ttft={ttft_text} | rate={rate_text} | out={token_text}"
+        f"{logstr.mesg('[stats]')} {elapsed_text} | "
+        f"{ttft_text} | {rate_text} | {token_text}"
     )
 
 
@@ -354,12 +441,102 @@ def _iter_text_parts(content: object) -> list[str]:
     return []
 
 
-def _extract_stream_text(chunk: dict) -> str:
+def _extract_stream_fragments(
+    chunk: dict,
+    include_reasoning: bool = False,
+) -> list[tuple[str, str]]:
     fragments: list[str] = []
     for choice in chunk.get("choices", []):
         delta = choice.get("delta") or choice.get("message") or {}
-        fragments.extend(_iter_text_parts(delta.get("content")))
-    return "".join(fragments)
+        typed_fragments: list[tuple[str, str]] = []
+        if include_reasoning:
+            typed_fragments.extend(
+                ("reasoning", text)
+                for text in _iter_text_parts(delta.get("reasoning_content"))
+            )
+            typed_fragments.extend(
+                ("reasoning", text) for text in _iter_text_parts(delta.get("reasoning"))
+            )
+        typed_fragments.extend(
+            ("content", text) for text in _iter_text_parts(delta.get("content"))
+        )
+        fragments.extend(typed_fragments)
+    return fragments
+
+
+def _extract_stream_text(chunk: dict, include_reasoning: bool = False) -> str:
+    return "".join(
+        text
+        for _, text in _extract_stream_fragments(
+            chunk,
+            include_reasoning=include_reasoning,
+        )
+    )
+
+
+def _normalize_error_detail(detail: object) -> str:
+    if isinstance(detail, dict):
+        if "error" in detail:
+            return _normalize_error_detail(detail["error"])
+        if "message" in detail:
+            return _normalize_error_detail(detail["message"])
+        if "detail" in detail:
+            return _normalize_error_detail(detail["detail"])
+        try:
+            return orjson.dumps(detail).decode("utf-8")
+        except Exception:
+            return str(detail)
+
+    if isinstance(detail, bytes):
+        detail = detail.decode("utf-8", errors="replace")
+
+    if isinstance(detail, str):
+        stripped = detail.strip()
+        if stripped.startswith("{") and stripped.endswith("}"):
+            try:
+                payload = orjson.loads(stripped)
+                return _normalize_error_detail(payload)
+            except Exception:
+                pass
+        return detail
+
+    return str(detail)
+
+
+def _get_retry_max_tokens(detail: str, current_max_tokens: int) -> int | None:
+    if current_max_tokens <= 1:
+        return None
+
+    max_total_tokens: int | None = None
+    for pattern in _MAX_TOKENS_LIMIT_PATTERNS:
+        match = pattern.search(detail)
+        if match:
+            max_total_tokens = int(match.group(1))
+            break
+
+    requested_match = _REQUESTED_TOKENS_PATTERN.search(detail)
+    if requested_match and max_total_tokens is not None:
+        prompt_tokens = int(requested_match.group(2))
+        capped = max(1, max_total_tokens - prompt_tokens)
+        if capped < current_max_tokens:
+            return capped
+
+    prompt_chars_match = _PROMPT_CHARS_PATTERN.search(detail)
+    if (
+        max_total_tokens is not None
+        and prompt_chars_match
+        and "output tokens" in detail.lower()
+    ):
+        max_context_tokens = max_total_tokens
+        prompt_chars = int(prompt_chars_match.group(1))
+        capped = max(1, max_context_tokens - prompt_chars)
+        if capped < current_max_tokens:
+            return capped
+
+    if max_total_tokens is not None and max_total_tokens < current_max_tokens:
+        return max_total_tokens
+
+    return None
 
 
 class QWNClient:
@@ -397,12 +574,35 @@ class QWNClient:
         try:
             payload = exc.response.json()
             if "error" in payload:
-                return payload["error"].get("message", str(exc))
+                return _normalize_error_detail(payload["error"])
             if "detail" in payload:
-                return str(payload["detail"])
-            return str(payload)
+                return _normalize_error_detail(payload["detail"])
+            return _normalize_error_detail(payload)
         except Exception:
             return str(exc)
+
+    def _maybe_retry_with_capped_max_tokens(
+        self,
+        payload: dict,
+        detail: str,
+        action: str,
+        attempt: int,
+    ) -> bool:
+        retry_max_tokens = _get_retry_max_tokens(
+            detail,
+            int(payload.get("max_tokens", 0) or 0),
+        )
+        if retry_max_tokens is None or attempt >= 2:
+            return False
+        self._log_fail(
+            action,
+            (
+                f"requested max_tokens={payload.get('max_tokens')} exceeds backend limit; "
+                f"retrying with max_tokens={retry_max_tokens}"
+            ),
+        )
+        payload["max_tokens"] = retry_max_tokens
+        return True
 
     def health(self) -> HealthResponse:
         try:
@@ -465,7 +665,7 @@ class QWNClient:
         self,
         messages: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         stream: bool = False,
@@ -481,32 +681,43 @@ class QWNClient:
             enable_thinking=enable_thinking,
         )
 
-        try:
-            response = self.client.post(
-                f"{self.endpoint}/v1/chat/completions",
-                json=payload,
-            )
-            response.raise_for_status()
-            result = ChatResponse.from_dict(response.json())
-            self._log_okay("chat", f"tokens={result.usage.total_tokens}")
-            return result
-        except httpx.HTTPStatusError as exc:
-            detail = self._extract_error_detail(exc)
-            self._log_fail("chat", detail)
-            raise ValueError(f"Chat failed: {detail}") from exc
-        except Exception as exc:
-            self._log_fail("chat", exc)
-            raise
+        for attempt in range(3):
+            try:
+                response = self.client.post(
+                    f"{self.endpoint}/v1/chat/completions",
+                    json=payload,
+                )
+                response.raise_for_status()
+                result = ChatResponse.from_dict(response.json())
+                self._log_okay("chat", f"tokens={result.usage.total_tokens}")
+                return result
+            except httpx.HTTPStatusError as exc:
+                detail = self._extract_error_detail(exc)
+                if self._maybe_retry_with_capped_max_tokens(
+                    payload,
+                    detail,
+                    action="chat",
+                    attempt=attempt,
+                ):
+                    continue
+                self._log_fail("chat", detail)
+                raise ValueError(f"Chat failed: {detail}") from exc
+            except Exception as exc:
+                self._log_fail("chat", exc)
+                raise
+
+        raise RuntimeError("unreachable")
 
     def stream_chat(
         self,
         messages: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         on_text: Callable[[str], None] | None = None,
         enable_thinking: bool = False,
+        include_thinking_tags: bool = False,
     ) -> StreamChatResult:
         payload = _build_chat_payload(
             messages=messages,
@@ -518,63 +729,89 @@ class QWNClient:
             enable_thinking=enable_thinking,
         )
         payload["stream_options"] = {"include_usage": True}
-
-        text_fragments: list[str] = []
-        usage = ChatUsage()
-        started_at = time.perf_counter()
-        first_token_latency_sec = 0.0
-        try:
-            with self.client.stream(
-                "POST",
-                f"{self.endpoint}/v1/chat/completions",
-                json=payload,
-            ) as response:
-                response.raise_for_status()
-                for line in response.iter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
-                    chunk = orjson.loads(data)
-                    if "error" in chunk:
-                        detail = chunk["error"].get("message", str(chunk["error"]))
-                        raise ValueError(f"Chat failed: {detail}")
-
-                    chunk_text = _extract_stream_text(chunk)
-                    if chunk_text:
-                        if first_token_latency_sec <= 0:
-                            first_token_latency_sec = time.perf_counter() - started_at
-                        text_fragments.append(chunk_text)
-                        if on_text:
-                            on_text(chunk_text)
-
-                    chunk_usage = chunk.get("usage")
-                    if isinstance(chunk_usage, dict):
-                        usage = ChatUsage.from_dict(chunk_usage)
-
-            elapsed_sec = time.perf_counter() - started_at
-            result = StreamChatResult(
-                text="".join(text_fragments),
-                usage=usage,
-                elapsed_sec=elapsed_sec,
-                first_token_latency_sec=first_token_latency_sec,
+        for attempt in range(3):
+            text_fragments: list[str] = []
+            usage = ChatUsage()
+            started_at = time.perf_counter()
+            render_state = _StreamRenderState(
+                started_at=started_at,
+                on_text=on_text,
+                enable_thinking=enable_thinking,
+                include_thinking_tags=include_thinking_tags,
+                text_fragments=text_fragments,
             )
-            self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
-            return result
-        except httpx.HTTPStatusError as exc:
-            detail = self._extract_error_detail(exc)
-            self._log_fail("stream_chat", detail)
-            raise ValueError(f"Chat failed: {detail}") from exc
-        except Exception as exc:
-            self._log_fail("stream_chat", exc)
-            raise
+            try:
+                with self.client.stream(
+                    "POST",
+                    f"{self.endpoint}/v1/chat/completions",
+                    json=payload,
+                ) as response:
+                    response.raise_for_status()
+                    render_state.begin()
+                    retry_requested = False
+                    for line in response.iter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            break
+                        chunk = orjson.loads(data)
+                        if "error" in chunk:
+                            detail = _normalize_error_detail(chunk["error"])
+                            if (
+                                not text_fragments
+                                and self._maybe_retry_with_capped_max_tokens(
+                                    payload,
+                                    detail,
+                                    action="stream_chat",
+                                    attempt=attempt,
+                                )
+                            ):
+                                retry_requested = True
+                                break
+                            raise ValueError(f"Chat failed: {detail}")
+
+                        render_state.emit_chunk(chunk)
+
+                        chunk_usage = chunk.get("usage")
+                        if isinstance(chunk_usage, dict):
+                            usage = ChatUsage.from_dict(chunk_usage)
+
+                if retry_requested:
+                    continue
+
+                render_state.finish()
+                elapsed_sec = time.perf_counter() - started_at
+                result = StreamChatResult(
+                    text="".join(text_fragments),
+                    usage=usage,
+                    elapsed_sec=elapsed_sec,
+                    first_token_latency_sec=render_state.first_token_latency_sec,
+                )
+                self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
+                return result
+            except httpx.HTTPStatusError as exc:
+                detail = self._extract_error_detail(exc)
+                if self._maybe_retry_with_capped_max_tokens(
+                    payload,
+                    detail,
+                    action="stream_chat",
+                    attempt=attempt,
+                ):
+                    continue
+                self._log_fail("stream_chat", detail)
+                raise ValueError(f"Chat failed: {detail}") from exc
+            except Exception as exc:
+                self._log_fail("stream_chat", exc)
+                raise
+
+        raise RuntimeError("unreachable")
 
     def generate(
         self,
         prompt: str,
         system_prompt: str | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         model: str = "",
@@ -638,10 +875,33 @@ class AsyncQWNClient:
         try:
             payload = exc.response.json()
             if "error" in payload:
-                return payload["error"].get("message", str(exc))
-            return str(payload)
+                return _normalize_error_detail(payload["error"])
+            return _normalize_error_detail(payload)
         except Exception:
             return str(exc)
+
+    def _maybe_retry_with_capped_max_tokens(
+        self,
+        payload: dict,
+        detail: str,
+        action: str,
+        attempt: int,
+    ) -> bool:
+        retry_max_tokens = _get_retry_max_tokens(
+            detail,
+            int(payload.get("max_tokens", 0) or 0),
+        )
+        if retry_max_tokens is None or attempt >= 2:
+            return False
+        self._log_fail(
+            action,
+            (
+                f"requested max_tokens={payload.get('max_tokens')} exceeds backend limit; "
+                f"retrying with max_tokens={retry_max_tokens}"
+            ),
+        )
+        payload["max_tokens"] = retry_max_tokens
+        return True
 
     async def health(self) -> HealthResponse:
         client = await self._get_client()
@@ -672,7 +932,7 @@ class AsyncQWNClient:
         self,
         messages: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         stream: bool = False,
@@ -689,33 +949,44 @@ class AsyncQWNClient:
         )
 
         client = await self._get_client()
-        try:
-            response = await client.post(
-                f"{self.endpoint}/v1/chat/completions",
-                content=orjson.dumps(payload),
-                headers={"Content-Type": "application/json"},
-            )
-            response.raise_for_status()
-            result = ChatResponse.from_dict(orjson.loads(response.content))
-            self._log_okay("chat", f"tokens={result.usage.total_tokens}")
-            return result
-        except httpx.HTTPStatusError as exc:
-            detail = self._extract_error_detail(exc)
-            self._log_fail("chat", detail)
-            raise ValueError(f"Chat failed: {detail}") from exc
-        except Exception as exc:
-            self._log_fail("chat", exc)
-            raise
+        for attempt in range(3):
+            try:
+                response = await client.post(
+                    f"{self.endpoint}/v1/chat/completions",
+                    content=orjson.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                )
+                response.raise_for_status()
+                result = ChatResponse.from_dict(orjson.loads(response.content))
+                self._log_okay("chat", f"tokens={result.usage.total_tokens}")
+                return result
+            except httpx.HTTPStatusError as exc:
+                detail = self._extract_error_detail(exc)
+                if self._maybe_retry_with_capped_max_tokens(
+                    payload,
+                    detail,
+                    action="chat",
+                    attempt=attempt,
+                ):
+                    continue
+                self._log_fail("chat", detail)
+                raise ValueError(f"Chat failed: {detail}") from exc
+            except Exception as exc:
+                self._log_fail("chat", exc)
+                raise
+
+        raise RuntimeError("unreachable")
 
     async def stream_chat(
         self,
         messages: list[dict],
         model: str = "",
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         on_text: Callable[[str], None] | None = None,
         enable_thinking: bool = False,
+        include_thinking_tags: bool = False,
     ) -> StreamChatResult:
         payload = _build_chat_payload(
             messages=messages,
@@ -728,64 +999,91 @@ class AsyncQWNClient:
         )
         payload["stream_options"] = {"include_usage": True}
 
-        text_fragments: list[str] = []
-        usage = ChatUsage()
-        started_at = time.perf_counter()
-        first_token_latency_sec = 0.0
         client = await self._get_client()
-        try:
-            async with client.stream(
-                "POST",
-                f"{self.endpoint}/v1/chat/completions",
-                content=orjson.dumps(payload),
-                headers={"Content-Type": "application/json"},
-            ) as response:
-                response.raise_for_status()
-                async for line in response.aiter_lines():
-                    if not line or not line.startswith("data: "):
-                        continue
-                    data = line[6:].strip()
-                    if data == "[DONE]":
-                        break
-                    chunk = orjson.loads(data)
-                    if "error" in chunk:
-                        detail = chunk["error"].get("message", str(chunk["error"]))
-                        raise ValueError(f"Chat failed: {detail}")
-
-                    chunk_text = _extract_stream_text(chunk)
-                    if chunk_text:
-                        if first_token_latency_sec <= 0:
-                            first_token_latency_sec = time.perf_counter() - started_at
-                        text_fragments.append(chunk_text)
-                        if on_text:
-                            on_text(chunk_text)
-
-                    chunk_usage = chunk.get("usage")
-                    if isinstance(chunk_usage, dict):
-                        usage = ChatUsage.from_dict(chunk_usage)
-
-            elapsed_sec = time.perf_counter() - started_at
-            result = StreamChatResult(
-                text="".join(text_fragments),
-                usage=usage,
-                elapsed_sec=elapsed_sec,
-                first_token_latency_sec=first_token_latency_sec,
+        for attempt in range(3):
+            text_fragments: list[str] = []
+            usage = ChatUsage()
+            started_at = time.perf_counter()
+            render_state = _StreamRenderState(
+                started_at=started_at,
+                on_text=on_text,
+                enable_thinking=enable_thinking,
+                include_thinking_tags=include_thinking_tags,
+                text_fragments=text_fragments,
             )
-            self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
-            return result
-        except httpx.HTTPStatusError as exc:
-            detail = self._extract_error_detail(exc)
-            self._log_fail("stream_chat", detail)
-            raise ValueError(f"Chat failed: {detail}") from exc
-        except Exception as exc:
-            self._log_fail("stream_chat", exc)
-            raise
+            try:
+                async with client.stream(
+                    "POST",
+                    f"{self.endpoint}/v1/chat/completions",
+                    content=orjson.dumps(payload),
+                    headers={"Content-Type": "application/json"},
+                ) as response:
+                    response.raise_for_status()
+                    render_state.begin()
+                    retry_requested = False
+                    async for line in response.aiter_lines():
+                        if not line or not line.startswith("data: "):
+                            continue
+                        data = line[6:].strip()
+                        if data == "[DONE]":
+                            break
+                        chunk = orjson.loads(data)
+                        if "error" in chunk:
+                            detail = _normalize_error_detail(chunk["error"])
+                            if (
+                                not text_fragments
+                                and self._maybe_retry_with_capped_max_tokens(
+                                    payload,
+                                    detail,
+                                    action="stream_chat",
+                                    attempt=attempt,
+                                )
+                            ):
+                                retry_requested = True
+                                break
+                            raise ValueError(f"Chat failed: {detail}")
+
+                        render_state.emit_chunk(chunk)
+
+                        chunk_usage = chunk.get("usage")
+                        if isinstance(chunk_usage, dict):
+                            usage = ChatUsage.from_dict(chunk_usage)
+
+                if retry_requested:
+                    continue
+
+                render_state.finish()
+                elapsed_sec = time.perf_counter() - started_at
+                result = StreamChatResult(
+                    text="".join(text_fragments),
+                    usage=usage,
+                    elapsed_sec=elapsed_sec,
+                    first_token_latency_sec=render_state.first_token_latency_sec,
+                )
+                self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
+                return result
+            except httpx.HTTPStatusError as exc:
+                detail = self._extract_error_detail(exc)
+                if self._maybe_retry_with_capped_max_tokens(
+                    payload,
+                    detail,
+                    action="stream_chat",
+                    attempt=attempt,
+                ):
+                    continue
+                self._log_fail("stream_chat", detail)
+                raise ValueError(f"Chat failed: {detail}") from exc
+            except Exception as exc:
+                self._log_fail("stream_chat", exc)
+                raise
+
+        raise RuntimeError("unreachable")
 
     async def generate(
         self,
         prompt: str,
         system_prompt: str | None = None,
-        max_tokens: int = 512,
+        max_tokens: int = DEFAULT_MAX_TOKENS,
         temperature: float = 0.7,
         top_p: float = 0.9,
         model: str = "",
@@ -841,7 +1139,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     chat_parser = subparsers.add_parser("chat", help="Send a chat completion")
     chat_parser.add_argument("text", nargs="+", help="Prompt text segment(s)")
     chat_parser.add_argument("--model", default="", help="Model label")
-    chat_parser.add_argument("--max-tokens", type=int, default=512)
+    chat_parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     chat_parser.add_argument("--temperature", type=float, default=0.7)
     chat_parser.add_argument("--top-p", type=float, default=0.9)
     chat_parser.add_argument("-s", "--system", default=None, help="System prompt")
@@ -868,7 +1166,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     generate_parser.add_argument("--prompt", required=True)
     generate_parser.add_argument("--model", default="", help="Model label")
-    generate_parser.add_argument("--max-tokens", type=int, default=512)
+    generate_parser.add_argument("--max-tokens", type=int, default=DEFAULT_MAX_TOKENS)
     generate_parser.add_argument("--temperature", type=float, default=0.7)
     generate_parser.add_argument("--top-p", type=float, default=0.9)
     generate_parser.add_argument("-s", "--system", default=None, help="System prompt")
@@ -945,6 +1243,7 @@ def run_from_args(args: argparse.Namespace) -> None:
                     top_p=args.top_p,
                     on_text=lambda chunk: print(chunk, end="", flush=True),
                     enable_thinking=args.thinking,
+                    include_thinking_tags=args.thinking,
                 )
                 if stream_result.text and not stream_result.text.endswith("\n"):
                     print()

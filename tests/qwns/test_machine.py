@@ -99,6 +99,7 @@ class TestQWNMachineServer:
             ]
         )
         assert request.messages[0].content[1].type == "image_url"
+        assert request.max_tokens == 8192
 
     def test_get_model_label(self):
         instance = QWNInstance(
