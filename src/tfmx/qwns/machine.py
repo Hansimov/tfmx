@@ -35,6 +35,8 @@ DEFAULT_MAX_TOKENS = MAX_MODEL_LEN
 QWN_CONTAINER_IMAGE_PATTERN = "vllm"
 DEFAULT_NAME_PATTERN = r"qwn[-_]"
 HEALTH_REFRESH_INTERVAL_SEC = 5
+HEALTH_REQUEST_TIMEOUT_SEC = 5.0
+MODEL_DISCOVERY_TIMEOUT_SEC = 10.0
 
 
 class TextContent(BaseModel):
@@ -577,7 +579,10 @@ class QWNMachineServer:
     async def _check_instance_health(self, instance: QWNInstance) -> bool:
         try:
             started_at = time.perf_counter()
-            response = await self._client.get(instance.health_url)
+            response = await self._client.get(
+                instance.health_url,
+                timeout=httpx.Timeout(HEALTH_REQUEST_TIMEOUT_SEC),
+            )
             instance.healthy = response.status_code == 200
             instance._latency_ms = (
                 (time.perf_counter() - started_at) * 1000 if instance.healthy else 0.0
@@ -596,7 +601,10 @@ class QWNMachineServer:
             if not instance.healthy or instance.model_name:
                 continue
             try:
-                response = await self._client.get(instance.models_url)
+                response = await self._client.get(
+                    instance.models_url,
+                    timeout=httpx.Timeout(MODEL_DISCOVERY_TIMEOUT_SEC),
+                )
                 if response.status_code != 200:
                     continue
                 payload = response.json()

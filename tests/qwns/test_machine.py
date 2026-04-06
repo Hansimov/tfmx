@@ -164,6 +164,41 @@ class TestQWNMachineServer:
         assert isinstance(result, ModelsResponse)
         assert result.data[0].id == "4b:4bit"
 
+    def test_check_instance_health_uses_short_timeout(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+        )
+        server = QWNMachineServer(instances=[instance])
+        response = MagicMock(status_code=200)
+        server._client = AsyncMock()
+        server._client.get.return_value = response
+
+        assert asyncio.run(server._check_instance_health(instance)) is True
+        timeout = server._client.get.call_args.kwargs["timeout"]
+        assert timeout.connect == 5.0
+
+    def test_discover_instance_models_uses_short_timeout(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+        )
+        server = QWNMachineServer(instances=[instance])
+        response = MagicMock(status_code=200)
+        response.json.return_value = {"data": [{"id": "4b:4bit"}]}
+        server._client = AsyncMock()
+        server._client.get.return_value = response
+
+        asyncio.run(server._discover_instance_models())
+
+        timeout = server._client.get.call_args.kwargs["timeout"]
+        assert timeout.connect == 10.0
+        assert instance.model_name == "4b:4bit"
+
     def test_acquire_instance_does_not_fallback_to_wrong_requested_model(self):
         primary = QWNInstance(
             container_name="qwn-multi--gpu0",

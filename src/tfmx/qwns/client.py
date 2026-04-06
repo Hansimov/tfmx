@@ -395,29 +395,29 @@ def format_elapsed_time(elapsed_sec: float) -> str:
 
 
 def format_stream_stats_line(result: StreamChatResult) -> str:
-    elapsed_value = format_elapsed_time(result.elapsed_sec)
-    ttft_value = (
+    first_token_value = (
         format_elapsed_time(result.first_token_latency_sec)
         if result.first_token_latency_sec > 0
         else "n/a"
     )
-    elapsed_text = logstr.okay(f"elapsed={elapsed_value}")
-    ttft_text = (
-        logstr.mesg(f"ttft={ttft_value}")
+    total_value = format_elapsed_time(result.elapsed_sec)
+    first_token_text = (
+        logstr.mesg(f"首 {first_token_value}")
         if result.first_token_latency_sec > 0
-        else logstr.warn(f"ttft={ttft_value}")
+        else logstr.warn(f"首 {first_token_value}")
     )
-    rate_value = f"{result.token_per_second:.1f} token/s"
-    rate_text = (
-        logstr.okay(f"rate={rate_value}")
-        if result.token_per_second > 0
-        else logstr.mesg(f"rate={rate_value}")
-    )
+    total_text = logstr.okay(f"总 {total_value}")
     token_count = result.usage.completion_tokens or result.usage.total_tokens
-    token_text = logstr.mesg(f"out={token_count} tok")
+    token_text = logstr.mesg(f"{token_count} tokens")
+    throughput_value = f"{result.token_per_second:.1f} token/s"
+    throughput_text = (
+        logstr.okay(throughput_value)
+        if result.token_per_second > 0
+        else logstr.mesg(throughput_value)
+    )
     return (
-        f"{logstr.mesg('[stats]')} {elapsed_text} | "
-        f"{ttft_text} | {rate_text} | {token_text}"
+        f"{logstr.mesg('[统计]:')} {first_token_text} | "
+        f"{total_text} | {token_text} | {throughput_text}"
     )
 
 

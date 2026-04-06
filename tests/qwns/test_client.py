@@ -73,9 +73,10 @@ class TestFormatStreamStatsLine:
                 first_token_latency_sec=0.8,
             )
         )
-        assert "[stats]" in stats
-        assert "elapsed=" in stats
-        assert "ttft=" in stats
+        assert "[统计]:" in stats
+        assert "首 " in stats
+        assert "总 " in stats
+        assert "tokens" in stats
         assert "token/s" in stats
 
 
