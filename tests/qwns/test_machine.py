@@ -1,9 +1,14 @@
 """Tests for tfmx.qwns.machine."""
 
 import asyncio
+import httpx
+import orjson
+import pytest
 
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock, patch
+
+from fastapi import HTTPException
 
 from tfmx.qwns.machine import ModelInfo
 from tfmx.qwns.machine import ModelsResponse
@@ -44,10 +49,15 @@ class TestQWNInstance:
 class TestQWNStatsData:
     def test_to_model(self):
         stats = QWNStatsData(
-            total_requests=3, total_tokens=50, total_errors=1, active_requests=2
+            total_requests=3,
+            total_tokens=50,
+            total_errors=1,
+            total_failovers=2,
+            active_requests=2,
         )
         model = stats.to_model()
         assert model.total_requests == 3
+        assert model.total_failovers == 2
         assert model.active_requests == 2
 
 
@@ -152,6 +162,153 @@ class TestQWNMachineServer:
         result = asyncio.run(server.models())
         assert isinstance(result, ModelsResponse)
         assert result.data[0].id == "4b:4bit"
+
+    def test_acquire_instance_does_not_fallback_to_wrong_requested_model(self):
+        primary = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+            model_name="4b:4bit",
+        )
+        alternate = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            healthy=True,
+            model_name="8b:4bit",
+        )
+        server = QWNMachineServer(instances=[primary, alternate])
+        server._build_router()
+
+        with pytest.raises(HTTPException):
+            asyncio.run(server._acquire_instance("32b:4bit"))
+
+    def test_forward_chat_fails_over_to_next_healthy_instance(self):
+        primary = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+            model_name="4b:4bit",
+        )
+        alternate = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            healthy=True,
+            model_name="4b:4bit",
+        )
+        server = QWNMachineServer(instances=[primary, alternate])
+        server._build_router()
+        server._client = AsyncMock()
+        server._client.post.side_effect = [
+            httpx.ConnectError("boom"),
+            MagicMock(
+                status_code=200,
+                content=orjson.dumps(
+                    {
+                        "id": "ok",
+                        "object": "chat.completion",
+                        "model": "4b:4bit",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "message": {"role": "assistant", "content": "ok"},
+                                "finish_reason": "stop",
+                            }
+                        ],
+                        "usage": {
+                            "prompt_tokens": 10,
+                            "completion_tokens": 3,
+                            "total_tokens": 13,
+                        },
+                    }
+                ),
+            ),
+        ]
+
+        result = asyncio.run(
+            server._forward_chat(b'{"messages":[{"role":"user","content":"hello"}]}')
+        )
+
+        assert result.model == "4b:4bit"
+        assert primary.healthy is False
+        assert alternate.healthy is True
+        assert server.stats.total_failovers == 1
+
+    def test_forward_stream_fails_over_before_first_chunk(self):
+        class FakeStreamResponse:
+            def __init__(self, status_code=200, lines=None, enter_error=None):
+                self.status_code = status_code
+                self._lines = lines or []
+                self._enter_error = enter_error
+
+            async def __aenter__(self):
+                if self._enter_error is not None:
+                    raise self._enter_error
+                return self
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+            async def aread(self):
+                return b"upstream error"
+
+            async def aiter_lines(self):
+                for line in self._lines:
+                    yield line
+
+        class FakeAsyncClient:
+            def __init__(self, responses):
+                self._responses = list(responses)
+
+            def stream(self, *args, **kwargs):
+                return self._responses.pop(0)
+
+        primary = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+            model_name="4b:4bit",
+        )
+        alternate = QWNInstance(
+            container_name="qwn-multi--gpu2",
+            host="localhost",
+            port=27882,
+            healthy=True,
+            model_name="4b:4bit",
+        )
+        server = QWNMachineServer(instances=[primary, alternate])
+        server._build_router()
+        server._client = FakeAsyncClient(
+            [
+                FakeStreamResponse(enter_error=httpx.ConnectError("boom")),
+                FakeStreamResponse(
+                    lines=[
+                        'data: {"choices":[{"delta":{"content":"ok"}}]}',
+                        "data: [DONE]",
+                    ]
+                ),
+            ]
+        )
+
+        response = asyncio.run(
+            server._forward_stream(b'{"messages":[{"role":"user","content":"hello"}]}')
+        )
+
+        async def collect_stream():
+            chunks = []
+            async for chunk in response.body_iterator:
+                chunks.append(chunk)
+            return chunks
+
+        chunks = asyncio.run(collect_stream())
+
+        assert any('"model":"4b:4bit"' in chunk for chunk in chunks)
+        assert primary.healthy is False
+        assert server.stats.total_failovers == 1
 
     @patch.object(
         QWNMachineServer, "_refresh_gpu_runtime_metrics", new_callable=AsyncMock

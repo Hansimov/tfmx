@@ -157,6 +157,7 @@ class MachineStats(BaseModel):
     total_requests: int = 0
     total_tokens: int = 0
     total_errors: int = 0
+    total_failovers: int = 0
     active_requests: int = 0
     requests_per_instance: dict[str, int] = Field(default_factory=dict)
 
@@ -258,6 +259,7 @@ class QWNStatsData:
     total_requests: int = 0
     total_tokens: int = 0
     total_errors: int = 0
+    total_failovers: int = 0
     active_requests: int = 0
     requests_per_instance: dict[str, int] = field(default_factory=dict)
 
@@ -266,6 +268,7 @@ class QWNStatsData:
             total_requests=self.total_requests,
             total_tokens=self.total_tokens,
             total_errors=self.total_errors,
+            total_failovers=self.total_failovers,
             active_requests=self.active_requests,
             requests_per_instance=self.requests_per_instance,
         )
@@ -415,8 +418,12 @@ class QWNMachineServer:
         return [instance for instance in self.instances if instance.healthy]
 
     def _get_idle_instance(
-        self, model: str = "", quant: str = ""
+        self,
+        model: str = "",
+        quant: str = "",
+        excluded_instances: set[str] | None = None,
     ) -> Optional[QWNInstance]:
+        excluded_instances = excluded_instances or set()
         if model or quant:
             descriptors = self.router.find_instances(model, quant)
             endpoints = {descriptor.endpoint for descriptor in descriptors}
@@ -426,12 +433,15 @@ class QWNMachineServer:
                 if instance.healthy
                 and instance.is_idle
                 and instance.endpoint in endpoints
+                and instance.container_name not in excluded_instances
             ]
         else:
             candidates = [
                 instance
                 for instance in self.instances
-                if instance.healthy and instance.is_idle
+                if instance.healthy
+                and instance.is_idle
+                and instance.container_name not in excluded_instances
             ]
 
         if not candidates:
@@ -697,29 +707,42 @@ class QWNMachineServer:
         return await self._forward_chat(body, model)
 
     async def _acquire_instance(
-        self, model_field: str = ""
+        self,
+        model_field: str = "",
+        excluded_instances: set[str] | None = None,
     ) -> tuple[QWNInstance, str, str]:
+        excluded_instances = excluded_instances or set()
         requested_model = ""
         requested_quant = ""
         if model_field:
             requested_model, requested_quant = parse_model_spec(model_field)
 
-        instance = self._get_idle_instance(model=requested_model, quant=requested_quant)
+        instance = self._get_idle_instance(
+            model=requested_model,
+            quant=requested_quant,
+            excluded_instances=excluded_instances,
+        )
         if instance is None:
             for _ in range(10):
                 await asyncio.sleep(0.1)
                 instance = self._get_idle_instance(
-                    model=requested_model, quant=requested_quant
+                    model=requested_model,
+                    quant=requested_quant,
+                    excluded_instances=excluded_instances,
                 )
                 if instance is not None:
                     break
 
-        if instance is None:
-            instance = self._get_idle_instance()
+        if instance is None and not (requested_model or requested_quant):
+            instance = self._get_idle_instance(excluded_instances=excluded_instances)
 
         if instance is None:
-            self.stats.total_errors += 1
-            raise HTTPException(status_code=503, detail="No available QWN instances")
+            detail = "No available QWN instances"
+            if model_field:
+                detail = (
+                    f"No available QWN instances for requested model '{model_field}'"
+                )
+            raise HTTPException(status_code=503, detail=detail)
 
         return instance, requested_model, requested_quant
 
@@ -733,77 +756,189 @@ class QWNMachineServer:
         except Exception:
             return body
 
+    def _is_retryable_upstream_status(self, status_code: int) -> bool:
+        return status_code >= 500
+
+    def _is_retryable_upstream_exception(self, exc: Exception) -> bool:
+        return isinstance(
+            exc,
+            (
+                httpx.TransportError,
+                httpx.TimeoutException,
+                asyncio.TimeoutError,
+            ),
+        )
+
+    def _mark_instance_unhealthy(
+        self, instance: QWNInstance, reason: Exception | str
+    ) -> None:
+        if instance.healthy:
+            logger.warn(
+                f"× Marking {instance.container_name} unhealthy for failover: {reason}"
+            )
+        instance.healthy = False
+        instance._latency_ms = 0.0
+        self._build_router()
+
+    def _build_stream_error_chunk(
+        self,
+        message: str,
+        code: int,
+        error_type: str,
+    ) -> str:
+        payload = {
+            "error": {
+                "message": message,
+                "type": error_type,
+                "code": code,
+            }
+        }
+        return f"data: {orjson.dumps(payload).decode()}\n\n"
+
     async def _forward_stream(
         self, body: bytes, model_field: str = ""
     ) -> StreamingResponse:
         self.stats.total_requests += 1
         self.stats.active_requests += 1
-        try:
-            instance, _, _ = await self._acquire_instance(model_field)
-        except HTTPException:
-            self.stats.active_requests = max(0, self.stats.active_requests - 1)
-            raise
-
-        instance._active_requests += 1
-        model_label = self._get_model_label(instance)
-        self.stats.requests_per_instance[instance.container_name] = (
-            self.stats.requests_per_instance.get(instance.container_name, 0) + 1
-        )
-        body = self._rewrite_model_in_body(body, instance)
 
         async def stream_generator():
             try:
-                async with self._client.stream(
-                    "POST",
-                    instance.chat_url,
-                    content=body,
-                    headers={"Content-Type": "application/json"},
-                ) as response:
-                    if response.status_code != 200:
-                        error_text = (await response.aread()).decode(
-                            "utf-8", errors="replace"
+                attempted_instances: set[str] = set()
+                last_retryable_error = ""
+                while True:
+                    try:
+                        instance, _, _ = await self._acquire_instance(
+                            model_field,
+                            excluded_instances=attempted_instances,
                         )
-                        yield f"data: {orjson.dumps({'error': {'message': error_text, 'type': 'upstream_error', 'code': response.status_code}}).decode()}\n\n"
-                        yield "data: [DONE]\n\n"
+                    except HTTPException as exc:
                         self.stats.total_errors += 1
+                        detail = str(exc.detail)
+                        if last_retryable_error and exc.status_code == 503:
+                            detail = (
+                                "All candidate QWN instances failed before "
+                                f"stream start: {last_retryable_error}"
+                            )
+                        yield self._build_stream_error_chunk(
+                            message=detail,
+                            code=exc.status_code,
+                            error_type="service_unavailable",
+                        )
+                        yield "data: [DONE]\n\n"
                         return
 
-                    async for line in response.aiter_lines():
-                        if not line.strip():
-                            continue
-                        if line.startswith("data: "):
-                            payload = line[6:].strip()
-                            if payload == "[DONE]":
-                                yield "data: [DONE]\n\n"
-                                break
-                            try:
-                                chunk = orjson.loads(payload)
-                                if model_label:
-                                    chunk["model"] = model_label
-                                usage = chunk.get("usage")
-                                if usage:
-                                    self.stats.total_tokens += usage.get(
-                                        "total_tokens", 0
+                    attempted_instances.add(instance.container_name)
+                    instance._active_requests += 1
+                    self.stats.requests_per_instance[instance.container_name] = (
+                        self.stats.requests_per_instance.get(instance.container_name, 0)
+                        + 1
+                    )
+                    model_label = self._get_model_label(instance)
+                    attempt_body = self._rewrite_model_in_body(body, instance)
+                    started_stream = False
+
+                    try:
+                        async with self._client.stream(
+                            "POST",
+                            instance.chat_url,
+                            content=attempt_body,
+                            headers={"Content-Type": "application/json"},
+                        ) as response:
+                            if response.status_code != 200:
+                                error_text = (await response.aread()).decode(
+                                    "utf-8", errors="replace"
+                                )
+                                if self._is_retryable_upstream_status(
+                                    response.status_code
+                                ):
+                                    last_retryable_error = (
+                                        f"{instance.container_name} returned "
+                                        f"{response.status_code}: {error_text}"
                                     )
-                                yield f"data: {orjson.dumps(chunk).decode()}\n\n"
-                            except Exception:
-                                yield f"data: {payload}\n\n"
-                        elif line.startswith(":"):
-                            yield f"{line}\n"
+                                    self.stats.total_failovers += 1
+                                    self._mark_instance_unhealthy(
+                                        instance, last_retryable_error
+                                    )
+                                    continue
+                                self.stats.total_errors += 1
+                                yield self._build_stream_error_chunk(
+                                    message=error_text,
+                                    code=response.status_code,
+                                    error_type="upstream_error",
+                                )
+                                yield "data: [DONE]\n\n"
+                                return
+
+                            async for line in response.aiter_lines():
+                                if not line.strip():
+                                    continue
+                                if line.startswith("data: "):
+                                    payload = line[6:].strip()
+                                    if payload == "[DONE]":
+                                        yield "data: [DONE]\n\n"
+                                        return
+                                    try:
+                                        chunk = orjson.loads(payload)
+                                        if model_label:
+                                            chunk["model"] = model_label
+                                        usage = chunk.get("usage")
+                                        if usage:
+                                            self.stats.total_tokens += usage.get(
+                                                "total_tokens", 0
+                                            )
+                                        started_stream = True
+                                        yield (
+                                            f"data: {orjson.dumps(chunk).decode()}\n\n"
+                                        )
+                                    except Exception:
+                                        started_stream = True
+                                        yield f"data: {payload}\n\n"
+                                elif line.startswith(":"):
+                                    yield f"{line}\n"
+
+                            if not started_stream:
+                                last_retryable_error = (
+                                    f"{instance.container_name} closed stream before "
+                                    "sending any data"
+                                )
+                                self.stats.total_failovers += 1
+                                self._mark_instance_unhealthy(
+                                    instance, last_retryable_error
+                                )
+                                continue
+                            return
+                    except Exception as exc:
+                        if (
+                            not started_stream
+                            and self._is_retryable_upstream_exception(exc)
+                        ):
+                            last_retryable_error = f"{instance.container_name}: {exc}"
+                            self.stats.total_failovers += 1
+                            self._mark_instance_unhealthy(instance, exc)
+                            continue
+                        self.stats.total_errors += 1
+                        logger.warn(f"× Stream error: {exc}")
+                        yield self._build_stream_error_chunk(
+                            message=str(exc),
+                            code=500,
+                            error_type="proxy_error",
+                        )
+                        yield "data: [DONE]\n\n"
+                        return
+                    finally:
+                        instance._active_requests = max(
+                            0, instance._active_requests - 1
+                        )
             except Exception as exc:
                 self.stats.total_errors += 1
                 logger.warn(f"× Stream error: {exc}")
-                error_payload = {
-                    "error": {
-                        "message": str(exc),
-                        "type": "proxy_error",
-                        "code": 500,
-                    }
-                }
-                yield f"data: {orjson.dumps(error_payload).decode()}\n\n"
+                yield self._build_stream_error_chunk(
+                    message=str(exc),
+                    code=500,
+                    error_type="proxy_error",
+                )
                 yield "data: [DONE]\n\n"
             finally:
-                instance._active_requests = max(0, instance._active_requests - 1)
                 self.stats.active_requests = max(0, self.stats.active_requests - 1)
 
         return StreamingResponse(
@@ -822,47 +957,88 @@ class QWNMachineServer:
         self.stats.total_requests += 1
         self.stats.active_requests += 1
         try:
-            instance, _, _ = await self._acquire_instance(model_field)
-            instance._active_requests += 1
-            body = self._rewrite_model_in_body(body, instance)
-            response = await self._client.post(
-                instance.chat_url,
-                content=body,
-                headers={"Content-Type": "application/json"},
-            )
-            self.stats.requests_per_instance[instance.container_name] = (
-                self.stats.requests_per_instance.get(instance.container_name, 0) + 1
-            )
+            attempted_instances: set[str] = set()
+            last_retryable_error = ""
+            while True:
+                try:
+                    instance, _, _ = await self._acquire_instance(
+                        model_field,
+                        excluded_instances=attempted_instances,
+                    )
+                except HTTPException as exc:
+                    self.stats.total_errors += 1
+                    if last_retryable_error and exc.status_code == 503:
+                        raise HTTPException(
+                            status_code=503,
+                            detail=(
+                                "All candidate QWN instances failed before "
+                                f"response start: {last_retryable_error}"
+                            ),
+                        ) from exc
+                    raise
 
-            if response.status_code != 200:
-                self.stats.total_errors += 1
-                raise HTTPException(
-                    status_code=response.status_code, detail=response.text
+                attempted_instances.add(instance.container_name)
+                instance._active_requests += 1
+                self.stats.requests_per_instance[instance.container_name] = (
+                    self.stats.requests_per_instance.get(instance.container_name, 0) + 1
                 )
+                attempt_body = self._rewrite_model_in_body(body, instance)
 
-            payload = orjson.loads(response.content)
-            usage = payload.get("usage", {})
-            self.stats.total_tokens += usage.get("total_tokens", 0)
-            return ChatCompletionResponse(
-                id=payload.get("id", ""),
-                object=payload.get("object", "chat.completion"),
-                created=payload.get("created", 0),
-                model=self._get_model_label(instance) or payload.get("model", ""),
-                choices=[
-                    ChatChoiceDelta(**choice) for choice in payload.get("choices", [])
-                ],
-                usage=UsageInfo(**usage),
-            )
+                try:
+                    response = await self._client.post(
+                        instance.chat_url,
+                        content=attempt_body,
+                        headers={"Content-Type": "application/json"},
+                    )
+
+                    if response.status_code != 200:
+                        if self._is_retryable_upstream_status(response.status_code):
+                            last_retryable_error = (
+                                f"{instance.container_name} returned "
+                                f"{response.status_code}: {response.text}"
+                            )
+                            self.stats.total_failovers += 1
+                            self._mark_instance_unhealthy(
+                                instance, last_retryable_error
+                            )
+                            continue
+                        self.stats.total_errors += 1
+                        raise HTTPException(
+                            status_code=response.status_code, detail=response.text
+                        )
+
+                    payload = orjson.loads(response.content)
+                    usage = payload.get("usage", {})
+                    self.stats.total_tokens += usage.get("total_tokens", 0)
+                    return ChatCompletionResponse(
+                        id=payload.get("id", ""),
+                        object=payload.get("object", "chat.completion"),
+                        created=payload.get("created", 0),
+                        model=self._get_model_label(instance)
+                        or payload.get("model", ""),
+                        choices=[
+                            ChatChoiceDelta(**choice)
+                            for choice in payload.get("choices", [])
+                        ],
+                        usage=UsageInfo(**usage),
+                    )
+                except HTTPException:
+                    raise
+                except Exception as exc:
+                    if self._is_retryable_upstream_exception(exc):
+                        last_retryable_error = f"{instance.container_name}: {exc}"
+                        self.stats.total_failovers += 1
+                        self._mark_instance_unhealthy(instance, exc)
+                        continue
+                    self.stats.total_errors += 1
+                    logger.warn(f"× Chat completion error: {exc}")
+                    raise HTTPException(status_code=500, detail=str(exc))
+                finally:
+                    instance._active_requests = max(0, instance._active_requests - 1)
         except HTTPException:
             raise
-        except Exception as exc:
-            self.stats.total_errors += 1
-            logger.warn(f"× Chat completion error: {exc}")
-            raise HTTPException(status_code=500, detail=str(exc))
         finally:
             self.stats.active_requests = max(0, self.stats.active_requests - 1)
-            if "instance" in locals():
-                instance._active_requests = max(0, instance._active_requests - 1)
 
     def run(self) -> None:
         uvicorn.run(self.app, host="0.0.0.0", port=self.port, log_level="info")

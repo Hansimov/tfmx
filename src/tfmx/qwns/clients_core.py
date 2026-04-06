@@ -7,7 +7,8 @@ from abc import ABC
 from dataclasses import dataclass, field
 from typing import Callable, Optional
 
-from .client import AsyncQWNClient, ChatResponse, QWNClient, build_text_messages
+from .client import AsyncQWNClient, ChatResponse, QWNClient, StreamChatResult
+from .client import build_text_messages
 from .compose import MAX_CONCURRENT_REQUESTS
 from .performance import ExplorationConfig
 
@@ -191,6 +192,18 @@ class ClientsHealthResponse:
         )
 
 
+@dataclass
+class BatchChatOutcome:
+    response: ChatResponse | StreamChatResult | None = None
+    error: Exception | None = None
+    latency_sec: float = 0.0
+    first_token_latency_sec: float = 0.0
+
+    @property
+    def succeeded(self) -> bool:
+        return self.response is not None and self.error is None
+
+
 class _QWNClientsPipeline:
     def __init__(
         self,
@@ -210,6 +223,25 @@ class _QWNClientsPipeline:
         action_name: str = "chat",
         close_clients: bool = True,
     ) -> list[ChatResponse]:
+        outcomes = self.run_pipeline_outcomes(
+            requests=requests,
+            healthy=healthy,
+            request_fn=request_fn,
+            action_name=action_name,
+            close_clients=close_clients,
+        )
+        return [
+            outcome.response for outcome in outcomes if outcome.response is not None
+        ]
+
+    def run_pipeline_outcomes(
+        self,
+        requests: list[dict],
+        healthy: list[MachineState],
+        request_fn: Callable,
+        action_name: str = "chat",
+        close_clients: bool = True,
+    ) -> list[BatchChatOutcome]:
         for machine in healthy:
             machine.async_client.reset()
         return asyncio.run(
@@ -229,14 +261,14 @@ class _QWNClientsPipeline:
         request_fn: Callable,
         action_name: str,
         close_clients: bool,
-    ) -> list[ChatResponse]:
+    ) -> list[BatchChatOutcome]:
         total = len(requests)
         start_time = time.perf_counter()
         machine_stats = {
             machine.endpoint: {"host": machine.endpoint, "items": 0}
             for machine in healthy
         }
-        results: list[ChatResponse | None] = [None] * total
+        results: list[BatchChatOutcome | None] = [None] * total
         tasks: set[asyncio.Task] = set()
         completed = 0
         next_index = 0
@@ -246,12 +278,17 @@ class _QWNClientsPipeline:
             request_started_at = time.perf_counter()
             try:
                 response = await request_fn(machine, request)
-                setattr(
-                    response, "_latency_sec", time.perf_counter() - request_started_at
-                )
-                return machine, index, response, None
+                latency_sec = time.perf_counter() - request_started_at
+                setattr(response, "_latency_sec", latency_sec)
+                return machine, index, response, None, latency_sec
             except Exception as exc:
-                return machine, index, None, exc
+                return (
+                    machine,
+                    index,
+                    None,
+                    exc,
+                    time.perf_counter() - request_started_at,
+                )
             finally:
                 machine.mark_idle()
                 self.scheduler.signal_idle()
@@ -278,21 +315,43 @@ class _QWNClientsPipeline:
                 )
 
                 for finished in done:
-                    machine, index, response, error = await finished
+                    machine, index, response, error, latency_sec = await finished
                     if error is None and response is not None:
-                        results[index] = response
+                        machine.record_success()
+                        results[index] = BatchChatOutcome(
+                            response=response,
+                            latency_sec=latency_sec,
+                            first_token_latency_sec=getattr(
+                                response, "first_token_latency_sec", 0.0
+                            ),
+                        )
                         machine_stats[machine.endpoint]["items"] += 1
                     else:
                         machine.record_failure()
+                        results[index] = BatchChatOutcome(
+                            error=error,
+                            latency_sec=latency_sec,
+                        )
                     completed += 1
                     if self.on_progress:
                         elapsed = time.perf_counter() - start_time
                         self.on_progress(completed, total, elapsed, machine_stats)
 
             elapsed = time.perf_counter() - start_time
-            final_results = [result for result in results if result is not None]
+            final_results = [
+                (
+                    result
+                    if result is not None
+                    else BatchChatOutcome(error=RuntimeError("missing pipeline result"))
+                )
+                for result in results
+            ]
             if self.on_complete:
-                self.on_complete(len(final_results), total, elapsed)
+                self.on_complete(
+                    sum(1 for result in final_results if result.succeeded),
+                    total,
+                    elapsed,
+                )
             return final_results
         finally:
             if close_clients:
@@ -448,6 +507,27 @@ class _QWNClientsBase(ABC):
         temperature: float = 0.7,
         top_p: float = 0.9,
     ) -> list[ChatResponse]:
+        outcomes = self.chat_batch_outcomes(
+            requests=requests,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            measure_ttft=False,
+        )
+        return [
+            outcome.response for outcome in outcomes if outcome.response is not None
+        ]
+
+    def chat_batch_outcomes(
+        self,
+        requests: list[dict],
+        model: str = "",
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        measure_ttft: bool = False,
+    ) -> list[BatchChatOutcome]:
         if not requests:
             return []
 
@@ -456,14 +536,42 @@ class _QWNClientsBase(ABC):
             machine = healthy[self._rr_index % len(healthy)]
             self._rr_index += 1
             request = requests[0]
-            response = machine.client.chat(
-                messages=request["messages"],
-                model=request.get("model", model),
-                max_tokens=request.get("max_tokens", max_tokens),
-                temperature=request.get("temperature", temperature),
-                top_p=request.get("top_p", top_p),
-            )
-            return [response]
+            started_at = time.perf_counter()
+            try:
+                if measure_ttft:
+                    response = machine.client.stream_chat(
+                        messages=request["messages"],
+                        model=request.get("model", model),
+                        max_tokens=request.get("max_tokens", max_tokens),
+                        temperature=request.get("temperature", temperature),
+                        top_p=request.get("top_p", top_p),
+                    )
+                else:
+                    response = machine.client.chat(
+                        messages=request["messages"],
+                        model=request.get("model", model),
+                        max_tokens=request.get("max_tokens", max_tokens),
+                        temperature=request.get("temperature", temperature),
+                        top_p=request.get("top_p", top_p),
+                    )
+                latency_sec = time.perf_counter() - started_at
+                setattr(response, "_latency_sec", latency_sec)
+                return [
+                    BatchChatOutcome(
+                        response=response,
+                        latency_sec=latency_sec,
+                        first_token_latency_sec=getattr(
+                            response, "first_token_latency_sec", 0.0
+                        ),
+                    )
+                ]
+            except Exception as exc:
+                return [
+                    BatchChatOutcome(
+                        error=exc,
+                        latency_sec=time.perf_counter() - started_at,
+                    )
+                ]
 
         enriched = []
         for request in requests:
@@ -477,16 +585,33 @@ class _QWNClientsBase(ABC):
                 }
             )
 
-        async def request_fn(machine: MachineState, request_dict: dict) -> ChatResponse:
-            return await machine.async_client.chat(
-                messages=request_dict["messages"],
-                model=request_dict.get("model", ""),
-                max_tokens=request_dict.get("max_tokens", 512),
-                temperature=request_dict.get("temperature", 0.7),
-                top_p=request_dict.get("top_p", 0.9),
-            )
+        if measure_ttft:
 
-        return self._pipeline.run_pipeline(
+            async def request_fn(
+                machine: MachineState, request_dict: dict
+            ) -> StreamChatResult:
+                return await machine.async_client.stream_chat(
+                    messages=request_dict["messages"],
+                    model=request_dict.get("model", ""),
+                    max_tokens=request_dict.get("max_tokens", 512),
+                    temperature=request_dict.get("temperature", 0.7),
+                    top_p=request_dict.get("top_p", 0.9),
+                )
+
+        else:
+
+            async def request_fn(
+                machine: MachineState, request_dict: dict
+            ) -> ChatResponse:
+                return await machine.async_client.chat(
+                    messages=request_dict["messages"],
+                    model=request_dict.get("model", ""),
+                    max_tokens=request_dict.get("max_tokens", 512),
+                    temperature=request_dict.get("temperature", 0.7),
+                    top_p=request_dict.get("top_p", 0.9),
+                )
+
+        return self._pipeline.run_pipeline_outcomes(
             requests=enriched,
             healthy=healthy,
             request_fn=request_fn,

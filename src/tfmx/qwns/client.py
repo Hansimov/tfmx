@@ -170,6 +170,7 @@ class MachineStats:
     total_requests: int = 0
     total_tokens: int = 0
     total_errors: int = 0
+    total_failovers: int = 0
     active_requests: int = 0
     requests_per_instance: dict[str, int] = field(default_factory=dict)
 
@@ -179,6 +180,7 @@ class MachineStats:
             total_requests=data.get("total_requests", 0),
             total_tokens=data.get("total_tokens", 0),
             total_errors=data.get("total_errors", 0),
+            total_failovers=data.get("total_failovers", 0),
             active_requests=data.get("active_requests", 0),
             requests_per_instance=data.get("requests_per_instance", {}),
         )
@@ -703,6 +705,80 @@ class AsyncQWNClient:
             raise ValueError(f"Chat failed: {detail}") from exc
         except Exception as exc:
             self._log_fail("chat", exc)
+            raise
+
+    async def stream_chat(
+        self,
+        messages: list[dict],
+        model: str = "",
+        max_tokens: int = 512,
+        temperature: float = 0.7,
+        top_p: float = 0.9,
+        on_text: Callable[[str], None] | None = None,
+        enable_thinking: bool = False,
+    ) -> StreamChatResult:
+        payload = _build_chat_payload(
+            messages=messages,
+            model=model,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            stream=True,
+            enable_thinking=enable_thinking,
+        )
+        payload["stream_options"] = {"include_usage": True}
+
+        text_fragments: list[str] = []
+        usage = ChatUsage()
+        started_at = time.perf_counter()
+        first_token_latency_sec = 0.0
+        client = await self._get_client()
+        try:
+            async with client.stream(
+                "POST",
+                f"{self.endpoint}/v1/chat/completions",
+                content=orjson.dumps(payload),
+                headers={"Content-Type": "application/json"},
+            ) as response:
+                response.raise_for_status()
+                async for line in response.aiter_lines():
+                    if not line or not line.startswith("data: "):
+                        continue
+                    data = line[6:].strip()
+                    if data == "[DONE]":
+                        break
+                    chunk = orjson.loads(data)
+                    if "error" in chunk:
+                        detail = chunk["error"].get("message", str(chunk["error"]))
+                        raise ValueError(f"Chat failed: {detail}")
+
+                    chunk_text = _extract_stream_text(chunk)
+                    if chunk_text:
+                        if first_token_latency_sec <= 0:
+                            first_token_latency_sec = time.perf_counter() - started_at
+                        text_fragments.append(chunk_text)
+                        if on_text:
+                            on_text(chunk_text)
+
+                    chunk_usage = chunk.get("usage")
+                    if isinstance(chunk_usage, dict):
+                        usage = ChatUsage.from_dict(chunk_usage)
+
+            elapsed_sec = time.perf_counter() - started_at
+            result = StreamChatResult(
+                text="".join(text_fragments),
+                usage=usage,
+                elapsed_sec=elapsed_sec,
+                first_token_latency_sec=first_token_latency_sec,
+            )
+            self._log_okay("stream_chat", f"tokens={result.usage.total_tokens}")
+            return result
+        except httpx.HTTPStatusError as exc:
+            detail = self._extract_error_detail(exc)
+            self._log_fail("stream_chat", detail)
+            raise ValueError(f"Chat failed: {detail}") from exc
+        except Exception as exc:
+            self._log_fail("stream_chat", exc)
             raise
 
     async def generate(

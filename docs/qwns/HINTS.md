@@ -100,6 +100,18 @@ qwn compose up \
 - 这不是硬隔离，也不是跨服务统一调度器；它属于轻量级的“避让”策略，目标是减少同卡热点，而不是保证严格 QoS
 - 当前机器上的一次实测结果是：5 个健康 `qwn` 实例在无干扰时，180 个请求平均落到每卡 36 个；在 GPU2 上持续施加 TEI embedding 压力后，GPU2 对应 `qwn` 实例只接到 24 个请求，而其他卡大致落在 36 到 40 个之间
 
+## 突发实例故障与 failover
+
+- `qwn machine` 现在在请求转发层支持受控 failover：若实例在健康检查间隙里突然断连、超时，或在响应开始前返回 `5xx`，代理会立刻把它标记为不健康，并尝试切到其他健康实例
+- 若流式响应已经开始输出，就不会再切到另一台实例，避免把两台实例的 token 流混在一起；此时会直接把错误回给客户端
+- `qwn client info` 的 `stats` 里现在会包含 `total_failovers`，用于观察运行期到底发生了多少次实例级切换
+
+## benchmark 口径
+
+- `qwn benchmark run` 默认会额外统计 `ttft_sec`，同时区分 `submitted`、`successful`、`failed` 和 `success_rate`
+- `throughput.requests_per_second` 现在代表成功请求吞吐，不再把失败请求静默算进“有效吞吐”里
+- 如果只想做老式总吞吐压测，可以加 `--no-ttft`，跳过流式 TTFT 采样
+
 ## 常见问题
 
 ### 没检测到 GPU

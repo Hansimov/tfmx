@@ -85,7 +85,12 @@ qwn client -e http://localhost:27880 models
 qwn benchmark health -E http://localhost:27800
 qwn benchmark run -E http://localhost:27800 -n 100
 qwn benchmark run -E http://localhost:27800 http://host2:27800 -n 100 -o bench.json
+qwn benchmark run -E http://localhost:27800 -n 100 --no-ttft
 qwn benchmark generate -n 5 --show
 ```
 
 benchmark 使用 `tfmx.teis.benchtext.TEIBenchTextGenerator` 生成中文文本样本，因此不依赖 `data/prompts.txt` 里的视觉任务提示词。
+
+- `qwn benchmark run` 现在默认通过流式请求额外统计 `ttft_sec`，并同时输出 `submitted/successful/failed/success_rate`
+- `throughput.requests_per_second` 表示成功请求吞吐；`submitted_requests_per_second` 表示提交吞吐
+- 若你只关心总吞吐，不想为 TTFT 走流式路径，可显式加 `--no-ttft`
