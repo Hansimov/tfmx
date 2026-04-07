@@ -46,6 +46,21 @@ class TestComposeFileGenerator:
         compose_text = generator.generate()
         assert "Alibaba-NLP/gte-multilingual-base" in compose_text
 
+    def test_generate_manual_mode_preserves_common_environment(self):
+        generator = ComposeFileGenerator(
+            gpus=[GPUInfo(index=0, compute_cap="8.6")],
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name="tei-test",
+            data_dir=Path("/tmp/tei-test"),
+        )
+
+        compose_text = generator.generate()
+        assert "HF_ENDPOINT=https://hf-mirror.com" in compose_text
+        assert "CUDA_VISIBLE_DEVICES=0" in compose_text
+        assert "NVIDIA_VISIBLE_DEVICES=0" in compose_text
+        assert "    environment:" not in compose_text
+
 
 class TestTEIComposer:
     @patch("tfmx.teis.compose.GPUDetector.detect")

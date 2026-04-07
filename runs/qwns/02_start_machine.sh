@@ -9,5 +9,5 @@ qwn_cmd() {
 	fi
 }
 
-qwn_cmd machine run -b
+qwn_cmd machine run -b --on-conflict replace
 qwn_cmd machine status

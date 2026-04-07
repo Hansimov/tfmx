@@ -839,6 +839,7 @@ class ComposeFileGenerator:
                 [
                     "    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64",
                     "    - CUDA_VISIBLE_DEVICES=0",
+                    "    - NVIDIA_VISIBLE_DEVICES=0",
                 ]
             )
 

@@ -118,6 +118,8 @@ class TestComposeFileGenerator:
         assert DEFAULT_AWQ_MODEL in compose_text
         assert "PIP_INDEX_URL=https://mirrors.ustc.edu.cn/pypi/simple" in compose_text
         assert "HF_ENDPOINT=https://hf-mirror.com" in compose_text
+        assert "CUDA_VISIBLE_DEVICES=0" in compose_text
+        assert "NVIDIA_VISIBLE_DEVICES=0" in compose_text
 
     def test_generate_single_gpu_with_local_proxy(self):
         local_proxy = "http://localhost:" + "18080"

@@ -62,7 +62,7 @@ tei machine run --auto-start --on-conflict replace
 当前 `tei machine` 在运行期遇到后端返回 OOM 或 capacity 错误时，会先自动递归拆小 batch 再重试。这意味着：
 
 - 单次大请求不再轻易把所有健康后端都一起判死
-- 你会在 `--perf-track` 日志中看到类似 `Splitting overloaded batch ...` 的记录
+- 第一次撞到容量上限时，日志会记录该实例当前学到的安全批量上限；后续请求会优先按这个上限预切分，不再每次都重复撞同样的过载点
 - 如果拆到很小仍然失败，才说明问题已经不是简单的临时过载
 
 如果仍然经常 OOM，建议按这个顺序收紧：

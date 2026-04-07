@@ -61,3 +61,21 @@ qwn machine run --auto-start -b --on-conflict replace
 qwn client chat "你好，请做个自我介绍"
 qwn benchmark run -E "$QWN_MACHINE_URL" -n 100
 ```
+
+## Staged Run Scripts
+
+For repeatable repo-local workflows, use the staged script directories:
+
+```sh
+bash runs/teis/01_deploy_default.sh
+bash runs/teis/02_start_machine.sh
+bash runs/teis/03_health_check.sh
+bash runs/qwns/01_deploy_uniform.sh
+bash runs/qwns/02_start_machine.sh
+bash runs/qwns/03_health_check.sh
+bash runs/recovery/restart_tei_qwn.sh
+```
+
+- `runs/teis/README.md`: staged TEI deploy, health, benchmark, cleanup
+- `runs/qwns/README.md`: staged QWN deploy, health, benchmark, cleanup
+- `runs/recovery/README.md`: joint TEI + QWN recovery and live validation

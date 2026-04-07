@@ -548,6 +548,7 @@ class TEIMachineServer:
             get_worker_id=lambda inst: inst.container_name,
             max_batch_size=batch_size,
         )
+        self._instance_capacity_limits: dict[str, int] = {}
 
         # Lock for serializing GPU access - multiple concurrent requests would
         # compete for the same GPUs, causing severe performance degradation
@@ -580,6 +581,64 @@ class TEIMachineServer:
 
     def _update_scheduler_workers(self) -> None:
         self.scheduler.update_workers(self.get_healthy_instances())
+
+    def _get_instance_capacity_limit(self, instance: TEIInstance) -> int | None:
+        return self._instance_capacity_limits.get(self._instance_identity(instance))
+
+    def _record_instance_capacity_limit(
+        self,
+        instance: TEIInstance,
+        *,
+        attempted_size: int,
+        inferred_limit: int,
+    ) -> None:
+        normalized_limit = max(1, inferred_limit)
+        identity = self._instance_identity(instance)
+        current_limit = self._instance_capacity_limits.get(identity)
+
+        if current_limit is not None and normalized_limit >= current_limit:
+            return
+
+        self._instance_capacity_limits[identity] = normalized_limit
+        logger.warn(
+            f"[tei_machine] Learned overload-safe batch limit for {instance.container_name}: <= {normalized_limit} after failure at {attempted_size}"
+        )
+
+    async def _send_embed_request_with_capacity_limit(
+        self,
+        instance: TEIInstance,
+        inputs: list[str],
+        normalize: bool,
+        truncate: bool,
+    ) -> np.ndarray:
+        capacity_limit = self._get_instance_capacity_limit(instance)
+        if capacity_limit is None or len(inputs) <= capacity_limit:
+            return await self._send_embed_request_np(
+                instance,
+                inputs,
+                normalize,
+                truncate,
+            )
+
+        arrays = []
+        start = 0
+        while start < len(inputs):
+            current_limit = (
+                self._get_instance_capacity_limit(instance) or capacity_limit
+            )
+            arrays.append(
+                await self._send_embed_request_np(
+                    instance,
+                    inputs[start : start + current_limit],
+                    normalize,
+                    truncate,
+                )
+            )
+            start += current_limit
+
+        if len(arrays) == 1:
+            return arrays[0]
+        return np.vstack(arrays)
 
     def _merge_discovered_instances(
         self,
@@ -909,8 +968,10 @@ class TEIMachineServer:
             )
             if error.capacity_related and len(inputs) > 1:
                 midpoint = max(1, len(inputs) // 2)
-                logger.warn(
-                    f"[tei_machine] Splitting overloaded batch on {instance.container_name}: {len(inputs)} -> {midpoint}+{len(inputs) - midpoint}"
+                self._record_instance_capacity_limit(
+                    instance,
+                    attempted_size=len(inputs),
+                    inferred_limit=max(midpoint, len(inputs) - midpoint),
                 )
                 left = await self._send_embed_request_np(
                     instance,
@@ -958,7 +1019,7 @@ class TEIMachineServer:
         async def process_on_instance_np(
             instance: TEIInstance, chunk: list[str]
         ) -> np.ndarray:
-            result = await self._send_embed_request_np(
+            result = await self._send_embed_request_with_capacity_limit(
                 instance, chunk, normalize, truncate
             )
             # Update stats

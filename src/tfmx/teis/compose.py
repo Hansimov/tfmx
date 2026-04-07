@@ -631,7 +631,13 @@ class ComposeFileGenerator:
 
         # Add LD_LIBRARY_PATH for manual mode
         if self.mount_mode == "manual":
-            lines.append(f"    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64")
+            lines.extend(
+                [
+                    f"    - LD_LIBRARY_PATH=/usr/local/nvidia/lib64",
+                    f"    - CUDA_VISIBLE_DEVICES=0",
+                    f"    - NVIDIA_VISIBLE_DEVICES=0",
+                ]
+            )
 
         lines.append(f"")
         return lines
@@ -678,17 +684,6 @@ class ComposeFileGenerator:
                 if Path(device).exists():
                     lines.append(f"      - {device}:{device}")
 
-            # CRITICAL: When mounting a single GPU device, always set CUDA_VISIBLE_DEVICES=0
-            # This tells CUDA that the single mounted GPU should be treated as device 0
-            # within the container, regardless of its actual index on the host.
-            # Without this, CUDA will try to enumerate all GPUs up to the host index
-            # and fail with CUDA_ERROR_NO_DEVICE when it can't find the intermediate devices.
-            lines.extend(
-                [
-                    f"    environment:",
-                    f"      - CUDA_VISIBLE_DEVICES=0",
-                ]
-            )
         else:
             # nvidia-runtime mode - uses docker GPU reservation
             lines.extend(

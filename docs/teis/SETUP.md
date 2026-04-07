@@ -68,10 +68,10 @@ tei client embed --port 28800 "Hello" "World"
 如果你只想让 auto-start 使用指定 GPU：
 
 ```bash
-tei machine run --auto-start --compose-gpus "0,2" --on-conflict replace
+tei machine run --auto-start --compose-gpus "0,1" --on-conflict replace
 
 # 或者显式走 per-GPU 配置语法
-tei machine run --auto-start --compose-gpu-configs "0,2" --on-conflict replace
+tei machine run --auto-start --compose-gpu-configs "0,1" --on-conflict replace
 ```
 
 说明：
@@ -90,7 +90,7 @@ tei machine run --perf-track --on-conflict replace
 如果你要手动限制 GPU：
 
 ```bash
-tei compose up --gpu-configs "0,2"
+tei compose up --gpu-configs "0,1"
 tei machine run --on-conflict replace
 ```
 

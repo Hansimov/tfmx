@@ -133,10 +133,12 @@ class TestTEIMachineAutoStart:
             healthy=True,
         )
         server = TEIMachineServer(instances=[instance], port=28800, timeout=1.0)
+        request_sizes: list[int] = []
 
         class _FakeClient:
             async def post(self, _url, json):
                 request = httpx.Request("POST", "http://localhost:28880/embed")
+                request_sizes.append(len(json["inputs"]))
                 if len(json["inputs"]) > 1:
                     return httpx.Response(
                         500,
@@ -158,9 +160,22 @@ class TestTEIMachineAutoStart:
             server._send_embed_request_np(instance, ["aa", "bbbb"], True, True)
         )
 
+        second_result = asyncio.run(
+            server._send_embed_request_with_capacity_limit(
+                instance,
+                ["cc", "dddd"],
+                True,
+                True,
+            )
+        )
+
         assert instance.healthy is True
         assert result.shape == (2, 1)
         assert result[:, 0].tolist() == [2.0, 4.0]
+        assert second_result.shape == (2, 1)
+        assert second_result[:, 0].tolist() == [2.0, 4.0]
+        assert request_sizes == [2, 1, 1, 1, 1]
+        assert server._instance_capacity_limits[instance.container_name] == 1
 
     @patch("tfmx.teis.machine.handle_port_conflicts", return_value=False)
     @patch("tfmx.teis.machine.discover_instances")
