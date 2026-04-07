@@ -1,30 +1,31 @@
 """TEI (Text Embeddings Inference) Client
 
 This module provides a client for connecting to TEI services,
-either the load-balanced tei_machine or individual tei_compose containers.
+either the load-balanced TEI machine service or individual TEI backends.
 """
 
 # ANCHOR[id=client-clis]
 CLI_EPILOG = """
 Examples:
-  # Connect to tei_machine (default port 28800)
-  tei_client health                        # Check health
-  tei_client info                          # Get server info
-  tei_client embed "Hello, world"          # Embed single text
-  tei_client embed "Hello" "World"         # Embed multiple texts
-  tei_client lsh "Hello, world"            # Get LSH hash
-  tei_client rerank -q "query" -p "doc1" "doc2"  # Rerank passages
+    # Connect to the local TEI machine (default port 28800)
+    tei client health                        # Check health
+    tei client info                          # Get server info
+    tei client embed "Hello, world"          # Embed single text
+    tei client embed "Hello" "World"         # Embed multiple texts
+    tei client lsh "Hello, world"            # Get LSH hash
+    tei client rerank -q "query" -p "doc1" "doc2"  # Rerank passages
   
   # Connect to specific endpoint
-  tei_client -e "http://localhost:28800" health
-  tei_client -e "http://localhost:28880" embed "Hello"  # Direct TEI container
+    tei client -e "$TEI_MACHINE_A_URL" health
+    tei client -e "$TEI_BACKEND_A_URL" embed "Hello"  # Direct TEI backend
+    tei client -E "$TEI_MACHINE_A_URL,$TEI_MACHINE_B_URL" lsh "Hello"
   
-  # With custom port (shorthand for localhost)
-  tei_client -p 28800 health
-  tei_client -p 28880 embed "Hello"
+    # With custom port (same host, without writing a full URL)
+    tei client --port 28800 health
+    tei client --port 28880 embed "Hello"
   
   # LSH with custom bit count
-  tei_client lsh -b 2048 "Hello, world"
+    tei client lsh -b 2048 "Hello, world"
 """
 
 import argparse
@@ -709,101 +710,95 @@ class AsyncTEIClient:
             raise
 
 
-class TEIClientArgParser:
-    """Argument parser for TEI Client CLI."""
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    parser.description = (
+        "Connect to a TEI machine, TEI container, or multiple TEI machines"
+    )
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    parser.epilog = CLI_EPILOG
 
-    def __init__(self):
-        self.parser = argparse.ArgumentParser(
-            description="TEI Client - Connect to TEI services",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=CLI_EPILOG,
-        )
-        self._setup_arguments()
-        self.args = self.parser.parse_args()
+    parent_parser = argparse.ArgumentParser(add_help=False)
+    parent_parser.add_argument(
+        "-e",
+        "--endpoint",
+        type=str,
+        default=None,
+        help="Single endpoint URL (e.g., http://localhost:28800)",
+    )
+    parent_parser.add_argument(
+        "-E",
+        "--endpoints",
+        type=str,
+        default=None,
+        help="Comma-separated TEI machine endpoints for multi-machine mode",
+    )
+    parent_parser.add_argument(
+        "--port",
+        type=int,
+        default=PORT,
+        help=f"Server port (default: {PORT})",
+    )
+    parent_parser.add_argument(
+        "-H",
+        "--host",
+        type=str,
+        default=HOST,
+        help=f"Server host (default: {HOST})",
+    )
+    parent_parser.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="Enable verbose output; with -E this enables stats/progress logging",
+    )
 
-    def _setup_arguments(self):
-        """Setup all command-line arguments."""
-        # Connection options
-        self.parser.add_argument(
-            "-e",
-            "--endpoint",
-            type=str,
-            default=None,
-            help="Full endpoint URL (e.g., http://localhost:28800)",
-        )
-        self.parser.add_argument(
-            "-p",
-            "--port",
-            type=int,
-            default=PORT,
-            help=f"Server port (default: {PORT})",
-        )
-        self.parser.add_argument(
-            "-H",
-            "--host",
-            type=str,
-            default=HOST,
-            help=f"Server host (default: {HOST})",
-        )
-        self.parser.add_argument(
-            "-v",
-            "--verbose",
-            action="store_true",
-            help="Enable verbose output",
-        )
+    subparsers = parser.add_subparsers(dest="client_action", help="Action to perform")
 
-        # Action subcommands
-        subparsers = self.parser.add_subparsers(dest="action", help="Action to perform")
+    subparsers.add_parser(
+        "health", help="Check service health", parents=[parent_parser]
+    )
+    subparsers.add_parser(
+        "info",
+        help="Get service info (tei_machine only)",
+        parents=[parent_parser],
+    )
 
-        # health
-        subparsers.add_parser("health", help="Check service health")
+    embed_parser = subparsers.add_parser(
+        "embed", help="Generate embeddings", parents=[parent_parser]
+    )
+    embed_parser.add_argument("texts", nargs="+", help="Texts to embed")
 
-        # info
-        subparsers.add_parser("info", help="Get service info (tei_machine only)")
+    lsh_parser = subparsers.add_parser(
+        "lsh", help="Generate LSH hashes (tei_machine only)", parents=[parent_parser]
+    )
+    lsh_parser.add_argument("texts", nargs="+", help="Texts to hash")
+    lsh_parser.add_argument(
+        "-b",
+        "--bitn",
+        type=int,
+        default=2048,
+        help="Number of LSH bits (default: 2048)",
+    )
 
-        # embed
-        embed_parser = subparsers.add_parser("embed", help="Generate embeddings")
-        embed_parser.add_argument(
-            "texts",
-            nargs="+",
-            help="Texts to embed",
-        )
-
-        # lsh
-        lsh_parser = subparsers.add_parser(
-            "lsh", help="Generate LSH hashes (tei_machine only)"
-        )
-        lsh_parser.add_argument(
-            "texts",
-            nargs="+",
-            help="Texts to hash",
-        )
-        lsh_parser.add_argument(
-            "-b",
-            "--bitn",
-            type=int,
-            default=2048,
-            help="Number of LSH bits (default: 2048)",
-        )
-
-        # rerank
-        rerank_parser = subparsers.add_parser(
-            "rerank", help="Rerank passages for queries (tei_machine only)"
-        )
-        rerank_parser.add_argument(
-            "-q",
-            "--queries",
-            nargs="+",
-            required=True,
-            help="Query texts to rank passages against",
-        )
-        rerank_parser.add_argument(
-            "-p",
-            "--passages",
-            nargs="+",
-            required=True,
-            help="Passage texts to be ranked",
-        )
+    rerank_parser = subparsers.add_parser(
+        "rerank",
+        help="Rerank passages for queries (tei_machine only)",
+        parents=[parent_parser],
+    )
+    rerank_parser.add_argument(
+        "-q",
+        "--queries",
+        nargs="+",
+        required=True,
+        help="Query texts to rank passages against",
+    )
+    rerank_parser.add_argument(
+        "-p",
+        "--passages",
+        nargs="+",
+        required=True,
+        help="Passage texts to be ranked",
+    )
 
 
 class TEIClientCLI:
@@ -881,19 +876,13 @@ class TEIClientCLI:
                 passage_preview = passages[p_idx][:50]
                 if len(passages[p_idx]) > 50:
                     passage_preview += "..."
-                logger.mesg(f"  [{rank_pos+1}] (p_idx={p_idx}, score={score:.4f}) {passage_preview}")
+                logger.mesg(
+                    f"  [{rank_pos+1}] (p_idx={p_idx}, score={score:.4f}) {passage_preview}"
+                )
             print()
 
 
-def main():
-    """Main entry point for CLI."""
-    arg_parser = TEIClientArgParser()
-    args = arg_parser.args
-
-    if args.action is None:
-        arg_parser.parser.print_help()
-        return
-
+def _run_single_endpoint(args: argparse.Namespace) -> None:
     client = TEIClient(
         endpoint=args.endpoint,
         host=args.host,
@@ -903,25 +892,88 @@ def main():
 
     try:
         cli = TEIClientCLI(client)
-
-        if args.action == "health":
+        if args.client_action == "health":
             cli.run_health()
-        elif args.action == "info":
+        elif args.client_action == "info":
             cli.run_info()
-        elif args.action == "embed":
+        elif args.client_action == "embed":
             cli.run_embed(args.texts)
-        elif args.action == "lsh":
+        elif args.client_action == "lsh":
             cli.run_lsh(args.texts, args.bitn)
-        elif args.action == "rerank":
+        elif args.client_action == "rerank":
             cli.run_rerank(args.queries, args.passages)
-
     except httpx.ConnectError as e:
         logger.warn(f"× Connection failed: {e}")
         logger.hint(f"  Is the TEI service running at {client.endpoint}?")
-    except Exception as e:
-        logger.warn(f"× Error: {e}")
     finally:
         client.close()
+
+
+def _run_multi_endpoint(args: argparse.Namespace) -> None:
+    from .clients import TEIClients
+    from .clients_cli import TEIClientsCLIBase
+    from .clients_stats import TEIClientsWithStats
+
+    endpoints = [
+        endpoint.strip() for endpoint in args.endpoints.split(",") if endpoint.strip()
+    ]
+    if args.verbose:
+        clients = TEIClientsWithStats(endpoints=endpoints, verbose=True)
+    else:
+        clients = TEIClients(endpoints=endpoints)
+
+    try:
+        cli = TEIClientsCLIBase(clients)
+        if args.client_action == "health":
+            cli.run_health()
+        elif args.client_action == "info":
+            cli.run_info()
+        elif args.client_action == "embed":
+            cli.run_embed(args.texts)
+        elif args.client_action == "lsh":
+            cli.run_lsh(args.texts, args.bitn)
+        elif args.client_action == "rerank":
+            cli.run_rerank(args.queries, args.passages)
+    except httpx.ConnectError as e:
+        logger.warn(f"× Connection failed: {e}")
+        logger.hint("  Check if the target TEI machines are running")
+    finally:
+        clients.close()
+
+
+def run_from_args(args: argparse.Namespace) -> None:
+    if args.endpoint and args.endpoints:
+        raise ValueError("Use either --endpoint or --endpoints, not both")
+
+    if args.endpoints:
+        _run_multi_endpoint(args)
+        return
+
+    _run_single_endpoint(args)
+
+
+class TEIClientArgParser:
+    """Compatibility wrapper around the reusable client parser."""
+
+    def __init__(self, argv: list[str] | None = None):
+        self.parser = argparse.ArgumentParser()
+        configure_parser(self.parser)
+        self.args = self.parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Main entry point for CLI."""
+    arg_parser = TEIClientArgParser(argv)
+    args = arg_parser.args
+
+    if args.client_action is None:
+        arg_parser.parser.print_help()
+        return
+
+    try:
+        run_from_args(args)
+    except Exception as e:
+        logger.warn(f"× Error: {e}")
 
 
 if __name__ == "__main__":

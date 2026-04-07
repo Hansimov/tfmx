@@ -13,12 +13,12 @@ from .performance import ExplorationConfig
 # ANCHOR[id=clients-stats-clis]
 CLI_EPILOG = """
 Examples:
-  export TEI_EPS="http://localhost:28800,http://ai122:28800"
+    export TEI_EPS="$TEI_MACHINE_A_URL,$TEI_MACHINE_B_URL"
   
-  # Action comes first
-  tei_clients_stats health -E $TEI_EPS -v
-  tei_clients_stats embed -E $TEI_EPS -v "Hello" "World"
-  tei_clients_stats lsh -E $TEI_EPS -v "Hello, world"
+    # Unified CLI replacement
+    tei client health -E "$TEI_EPS" -v
+    tei client embed -E "$TEI_EPS" -v "Hello" "World"
+    tei client lsh -E "$TEI_EPS" -v "Hello, world"
 """
 
 
@@ -97,7 +97,7 @@ class TEIClientsWithStats(_TEIClientsBase):
     ) -> None:
         """Callback for logging progress during pipeline execution.
 
-        Format: [20%] 20000/100000 | localhost:1000/s | ai122:2400/s | 3400/s
+        Format: [20%] 20000/100000 | machine-a:1000/s | machine-b:2400/s | 3400/s
         """
         pct = int(processed / total * 100)
         total_rate = processed / elapsed if elapsed > 0 else 0

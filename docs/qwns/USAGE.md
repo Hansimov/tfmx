@@ -4,6 +4,16 @@
 
 `qwn` 是唯一的公开入口，所有能力都通过子命令暴露。
 
+建议先准备几个环境变量，便于在不同机器间切换：
+
+```bash
+export QWN_MACHINE_URL="http://$QWN_HOST:27800"
+export QWN_MACHINE_B_URL="http://$QWN_HOST_B:27800"
+export QWN_BACKEND_A_URL="http://$QWN_BACKEND_HOST_A:27880"
+export QWN_BACKEND_B_URL="http://$QWN_BACKEND_HOST_B:27881"
+export QWN_BACKEND_EPS="$QWN_BACKEND_A_URL,$QWN_BACKEND_B_URL"
+```
+
 ## `qwn compose`
 
 ```bash
@@ -33,8 +43,10 @@ qwn compose down
 
 ```bash
 qwn machine run
+qwn machine run --auto-start
+qwn machine run --auto-start -b
 qwn machine run -b
-qwn machine run -e http://localhost:27880,http://localhost:27881
+qwn machine run -e "$QWN_BACKEND_EPS"
 qwn machine discover
 qwn machine health
 qwn machine status
@@ -44,10 +56,13 @@ qwn machine restart
 ```
 
 - `qwn machine` 默认监听 `0.0.0.0:27800`，因此同局域网其他机器可以直接访问这台宿主机的 LAN IP
+- `qwn machine run --auto-start` 会在没有运行中的 QWN 后端时自动调用 `qwn compose up`，并等待后端健康后再提供代理服务
+- 如果你需要精确控制 GPU 布局、模型或量化配置，优先手动执行 `qwn compose up ...`；`--auto-start` 更适合默认单模型部署
 - 对 OpenAI 兼容客户端，推荐把 base URL 指到 `http://<host>:27800`，实际请求路径使用 `/v1/chat/completions`
 - 当前代理也会兼容一部分旧的 thinking 扩展字段写法：若客户端发送顶层 `thinking` 或 `enable_thinking`，代理会自动归一化为 Qwen3.5/vLLM 需要的 `chat_template_kwargs.enable_thinking`
 - 若请求里不传 `model`，`qwn machine` 会稳定回落到当前默认模型，而不是在多模型部署里跨模型随机挑选
 - 当前同时支持 `/v1/chat/completions`、`/v1/models` 与无版本前缀的 `/chat/completions`、`/models` 兼容别名，便于不同第三方客户端直接接入
+- `/models` 和 `/v1/models` 当前会同时暴露 `4b:4bit` 与兼容别名 `qwen3.5-4b-awq-4bit`、`qwen3.5-4b`，便于第三方 OpenAI 客户端自动识别模型能力
 
 ### OpenAI 兼容接口
 
@@ -78,7 +93,7 @@ qwn client chat -i image_a.png -i image_b.png "先看第一张图" "再比较第
 qwn client chat "你好" --no-stream
 qwn client chat "请展示详细推理过程" --thinking
 qwn client generate --prompt "总结一下 qwn compose 的作用"
-qwn client -e http://localhost:27880 models
+qwn client -e "$QWN_BACKEND_A_URL" models
 ```
 
 `qwn client info` 现在除了基础实例信息外，还会显示调度器的实时画像，便于快速判断某张卡当前是否因为 GPU 压力、近期延迟、近期 tok/s 或冷却期而被降权。
@@ -104,10 +119,10 @@ qwn client -e http://localhost:27880 models
 ## `qwn benchmark`
 
 ```bash
-qwn benchmark health -E http://localhost:27800
-qwn benchmark run -E http://localhost:27800 -n 100
-qwn benchmark run -E http://localhost:27800 http://host2:27800 -n 100 -o bench.json
-qwn benchmark run -E http://localhost:27800 -n 100 --no-ttft
+qwn benchmark health -E "$QWN_MACHINE_URL"
+qwn benchmark run -E "$QWN_MACHINE_URL" -n 100
+qwn benchmark run -E "$QWN_MACHINE_URL" "$QWN_MACHINE_B_URL" -n 100 -o bench.json
+qwn benchmark run -E "$QWN_MACHINE_URL" -n 100 --no-ttft
 qwn benchmark generate -n 5 --show
 ```
 

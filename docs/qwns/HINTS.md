@@ -76,12 +76,19 @@ qwn compose up \
 
 ## 推荐流程
 
-1. `qwn compose up --gpu-configs "0:4b:4bit"`
-2. 等待 vLLM 完成加载与 warmup
-3. `qwn machine run -b`
+先准备：
+
+```bash
+export QWN_MACHINE_URL="http://$QWN_HOST:27800"
+export QWN_BACKEND_URL="http://$QWN_BACKEND_HOST:27880"
+```
+
+1. `qwn machine run --auto-start -b`
+2. 如果需要精确 GPU 布局，再改为手动执行 `qwn compose up ...` 后配合 `qwn machine run -b`
+3. 等待 vLLM 完成加载与 warmup
 4. `qwn client health`
 5. `qwn client chat "你好"`
-6. `qwn benchmark run -E http://localhost:27800 -n 100`
+6. `qwn benchmark run -E "$QWN_MACHINE_URL" -n 100`
 
 ## CLI 流式输出
 
@@ -156,8 +163,8 @@ qwn compose up \
 - 直接访问后端：
 
 ```bash
-curl http://localhost:27880/health
-curl http://localhost:27880/v1/models
+curl "$QWN_BACKEND_URL/health"
+curl "$QWN_BACKEND_URL/v1/models"
 ```
 
 ### 自动发现不到容器
@@ -166,5 +173,5 @@ curl http://localhost:27880/v1/models
 
 ```bash
 qwn machine run -n my-custom-project
-qwn machine run -e http://localhost:27880,http://localhost:27881
+qwn machine run -e "$QWN_BACKEND_EPS"
 ```

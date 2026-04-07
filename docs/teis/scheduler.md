@@ -4,6 +4,8 @@
 
 TEI Machine 使用多层调度架构来实现高效的 GPU 负载均衡和任务分配。本文档详细说明了调度系统的核心组件、使用路径和架构设计。
 
+> 说明：对外 CLI 已统一为 `tei`。文中出现的 `tei_clients` / `tei_clients_stats` 代表多 machine 聚合这一层的历史 CLI 命名；当前实际命令应使用 `tei client -E ...`，而 `TEIClients` / `TEIClientsWithStats` 仍然保留为 Python API 和内部实现名称。
+
 ---
 
 ## 核心组件
@@ -84,7 +86,7 @@ probe_batch_size: int = 100   # 探测批次大小
                          │
                          ▼
 ┌─────────────────────────────────────────────────────────────┐
-│ tei_clients (多机器负载均衡)                                  │
+│ tei client -E / TEIClients (多机器负载均衡)                   │
 │ - MachineScheduler (独立实现)                                │
 │ - _TEIClientsPipeline                                         │
 └────────────┬────────────────────────┬───────────────────────┘
@@ -113,15 +115,15 @@ probe_batch_size: int = 100   # 探测批次大小
 
 | 层级 | 组件 | 职责 | 调度策略 |
 |------|------|------|----------|
-| L3 | `tei_clients` | 多机器间负载均衡 | 自定义 MachineScheduler + Pipeline |
-| L2 | `tei_machine` | 单机器多 GPU 负载均衡 | IdleFillingScheduler + adaptive_pipeline |
+| L3 | `tei client -E` / `TEIClients` | 多机器间负载均衡 | 自定义 MachineScheduler + Pipeline |
+| L2 | `tei machine` | 单机器多 GPU 负载均衡 | IdleFillingScheduler + adaptive_pipeline |
 | L1 | `TEI Instance` | 单 GPU 推理服务 | N/A (Docker 容器) |
 
 ---
 
 ## 主要使用路径
 
-### 在 tei_machine 中的调用流程
+### 在 `tei machine` 中的调用流程
 
 ```python
 # 1. 初始化阶段
@@ -329,17 +331,17 @@ batch_size = max(
 
 ---
 
-## tei_client 和 tei_clients 的使用情况
+## `tei client` 与多 machine 客户端的使用情况
 
-### tei_client.py
+### `tei client` / `TEIClient`
 - **不使用** tei_scheduler 中的任何调度函数
 - 职责：简单的 HTTP 客户端
-- 功能：向 tei_machine 或 TEI 容器发送请求
+- 功能：向 `tei machine` 或直接向单个 TEI 后端发送请求
 - 实现：使用 httpx 进行同步/异步 HTTP 调用
 
-### tei_clients.py 和 tei_clients_core.py
+### `TEIClients` / `TEIClientsWithStats` / `clients_core`
 - **不使用** tei_scheduler 中的调度函数
-- 职责：多个 tei_machine 之间的负载均衡
+- 职责：多个 `tei machine` 之间的负载均衡
 - 使用独立的调度系统：
   - `MachineScheduler`: 不同于 `IdleFillingScheduler` 的独立实现
   - `_TEIClientsPipeline`: 自定义流水线实现
@@ -349,10 +351,10 @@ batch_size = max(
 **架构隔离**:
 ```
 tei_scheduler.IdleFillingScheduler
-    └─ 用于 GPU 级别调度（tei_machine 内部）
+    └─ 用于 GPU 级别调度（`tei machine` 内部）
 
 tei_clients_core.MachineScheduler
-    └─ 用于机器级别调度（多个 tei_machine 之间）
+    └─ 用于机器级别调度（多个 `tei machine` 之间）
 ```
 
 ---
@@ -392,26 +394,29 @@ distribute_with_adaptive_pipeline(
 
 ## 命令行使用
 
-### 启动 tei_machine 服务器
+### 启动 `tei machine`
 
 ```bash
 # 默认配置（自动发现 TEI 容器，使用自适应流水线）
-tei_machine run
+tei machine run
 
 # 指定端口
-tei_machine run -p 28800
+tei machine run -p 28800
+
+# 如果没有运行中的后端，则自动启动 compose 并等待健康
+tei machine run --auto-start
 
 # 启用性能跟踪
-tei_machine run --perf-track
+tei machine run --perf-track
 
 # 自定义批次大小
-tei_machine run -b 500 -m 100
+tei machine run -b 500 -m 100
 
 # 发现可用的 TEI 实例
-tei_machine discover
+tei machine discover
 
 # 检查所有实例的健康状态
-tei_machine health
+tei machine health
 ```
 
 ### 性能跟踪输出示例
@@ -437,7 +442,7 @@ tei_machine health
 
 启用性能跟踪用于调试和优化：
 ```bash
-tei_machine run --perf-track
+tei machine run --perf-track
 ```
 
 查看详细的：
@@ -521,10 +526,10 @@ all_results = [results_map[k] for k in sorted(results_map.keys())]
 
 ## 相关文件
 
-- `src/tfmx/tei_scheduler.py`: 调度器核心实现
-- `src/tfmx/tei_machine.py`: TEI Machine 服务器
-- `src/tfmx/tei_clients_core.py`: 多机器客户端调度器
-- `src/tfmx/perf_tracker.py`: 性能跟踪工具
+- `src/tfmx/teis/scheduler.py`: 调度器核心实现
+- `src/tfmx/teis/machine.py`: TEI Machine 服务器
+- `src/tfmx/teis/clients_core.py`: 多机器客户端调度器
+- `src/tfmx/teis/perf_tracker.py`: 性能跟踪工具
 - `src/tfmx/__init__.py`: 包导出
 
 ---

@@ -23,9 +23,13 @@ from tclogger import logger, logstr
 from typing import Literal, Optional, Union
 from webu import setup_swagger_ui
 
-from .compose import MACHINE_PORT, MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
+from ..utils.service_bootstrap import ensure_backend_instances
+from .compose import GPU_LAYOUT_UNIFORM_AWQ, MACHINE_PORT
+from .compose import MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
+from .compose import MODEL_NAME as COMPOSE_MODEL_NAME
+from .compose import QWNComposer, SERVER_PORT as COMPOSE_SERVER_PORT
 from .compose import get_display_shortcut, get_model_api_aliases
-from .compose import get_model_shortcut, normalize_model_key
+from .compose import get_model_shortcut, normalize_model_key, parse_gpu_configs
 from .gpu_runtime import GPURuntimeStats, query_gpu_runtime_stats
 from .router import InstanceDescriptor, QWNRouter, parse_model_spec
 from .adaptive_routing import DEFAULT_FAILURE_COOLDOWN_SEC
@@ -49,6 +53,8 @@ HEALTH_REQUEST_TIMEOUT_SEC = 5.0
 MODEL_DISCOVERY_TIMEOUT_SEC = 10.0
 INSTANCE_ACQUIRE_TIMEOUT_SEC = 5.0
 SCHEDULER_ALGORITHM = "adaptive_pressure_v2"
+BACKEND_STARTUP_TIMEOUT_SEC = 300.0
+BACKEND_STARTUP_POLL_INTERVAL_SEC = 5.0
 
 
 class TextContent(BaseModel):
@@ -2113,6 +2119,7 @@ CLI_EPILOG = """
 Examples:
   qwn machine run
   qwn machine run -b
+    qwn machine run --auto-start
   qwn machine run -e http://localhost:27880,http://localhost:27881
   qwn machine status
   qwn machine logs -f
@@ -2159,9 +2166,98 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "-b", "--background", action="store_true", help="Run as background daemon"
     )
     parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help=(
+            "When no QWN backends are running, start a compose deployment in the "
+            "background and wait for healthy instances"
+        ),
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=BACKEND_STARTUP_TIMEOUT_SEC,
+        help=(
+            "Seconds to wait for auto-started backends to become healthy "
+            f"(default: {BACKEND_STARTUP_TIMEOUT_SEC:g})"
+        ),
+    )
+    parser.add_argument(
+        "--startup-poll-interval",
+        type=float,
+        default=BACKEND_STARTUP_POLL_INTERVAL_SEC,
+        help=(
+            "Polling interval in seconds while waiting for healthy backends "
+            f"(default: {BACKEND_STARTUP_POLL_INTERVAL_SEC:g})"
+        ),
+    )
+    parser.add_argument(
+        "--compose-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Model name to use for auto-started compose backends "
+            f"(default: {COMPOSE_MODEL_NAME})"
+        ),
+    )
+    parser.add_argument(
+        "--compose-port",
+        type=int,
+        default=None,
+        help=(
+            "Compose backend base port for auto-started QWN containers "
+            f"(default: {COMPOSE_SERVER_PORT})"
+        ),
+    )
+    parser.add_argument(
+        "--compose-project-name",
+        type=str,
+        default=None,
+        help="Compose project name for auto-started backends",
+    )
+    parser.add_argument(
+        "--compose-gpus",
+        type=str,
+        default=None,
+        help="GPU IDs for auto-started backends (default: all healthy GPUs)",
+    )
+    parser.add_argument(
+        "--compose-gpu-layout",
+        choices=[GPU_LAYOUT_UNIFORM_AWQ],
+        default=None,
+        help="Named GPU layout preset for auto-started backends",
+    )
+    parser.add_argument(
+        "--compose-gpu-configs",
+        type=str,
+        default=None,
+        help='Per-GPU config for auto-started backends: "GPU:MODEL[:QUANT],..."',
+    )
+    parser.add_argument(
         "-f", "--follow", action="store_true", help="Follow logs in real time"
     )
     parser.add_argument("--tail", type=int, default=50, help="Log lines to show")
+
+
+def _discover_instances_from_docker(name_pattern: Optional[str]) -> list[QWNInstance]:
+    return QWNInstanceDiscovery.discover(name_pattern)
+
+
+def _build_auto_start_composer(args: argparse.Namespace) -> QWNComposer:
+    composer_kwargs = {}
+    if getattr(args, "compose_model_name", None):
+        composer_kwargs["model_name"] = args.compose_model_name
+    if getattr(args, "compose_port", None) is not None:
+        composer_kwargs["port"] = args.compose_port
+    if getattr(args, "compose_project_name", None):
+        composer_kwargs["project_name"] = args.compose_project_name
+    if getattr(args, "compose_gpus", None):
+        composer_kwargs["gpu_ids"] = args.compose_gpus
+    if getattr(args, "compose_gpu_layout", None):
+        composer_kwargs["gpu_layout"] = args.compose_gpu_layout
+    if getattr(args, "compose_gpu_configs", None):
+        composer_kwargs["gpu_configs"] = parse_gpu_configs(args.compose_gpu_configs)
+    return QWNComposer(**composer_kwargs)
 
 
 def discover_instances(args: argparse.Namespace) -> list[QWNInstance]:
@@ -2173,9 +2269,24 @@ def discover_instances(args: argparse.Namespace) -> list[QWNInstance]:
         ]
         instances = QWNInstanceDiscovery.from_endpoints(endpoints)
         logger.okay(f"[qwn_machine] Using {len(instances)} manual endpoints")
-    else:
-        instances = QWNInstanceDiscovery.discover(args.name_pattern)
-        logger.okay(f"[qwn_machine] Discovered {len(instances)} QWN instances")
+        return instances
+
+    instances = _discover_instances_from_docker(args.name_pattern)
+    instances = ensure_backend_instances(
+        instances,
+        enabled=getattr(args, "auto_start", False),
+        manual_endpoints=bool(getattr(args, "endpoints", None)),
+        service_label="[qwn_machine]",
+        compose_factory=lambda: _build_auto_start_composer(args),
+        rediscover=lambda: _discover_instances_from_docker(args.name_pattern),
+        timeout_sec=getattr(args, "startup_timeout", BACKEND_STARTUP_TIMEOUT_SEC),
+        poll_interval_sec=getattr(
+            args,
+            "startup_poll_interval",
+            BACKEND_STARTUP_POLL_INTERVAL_SEC,
+        ),
+    )
+    logger.okay(f"[qwn_machine] Discovered {len(instances)} QWN instances")
     return instances
 
 

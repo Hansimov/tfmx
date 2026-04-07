@@ -8,29 +8,30 @@ requests across multiple TEI Docker instances running on different GPUs.
 CLI_EPILOG = """
 Examples:
   # Start machine server (auto-discover TEI containers)
-  tei_machine run                   # Start on default port 28800 with smart GPU LSH
-  tei_machine run -p 28800          # Start on specific port
+    tei machine run                   # Start on default port 28800 with smart GPU LSH
+    tei machine run -p 28800          # Start on specific port
+    tei machine run --auto-start      # Auto-start compose backends if none are running
   
   # Filter containers by name pattern
-  tei_machine run -n "qwen3-embedding"  # Only match containers with this pattern
+    tei machine run -n "qwen3-embedding"  # Only match containers with this pattern
   
   # Manual endpoint specification (skip auto-discovery)
-  tei_machine run -e "http://localhost:28880,http://localhost:28881"
+    tei machine run -e "http://localhost:28880,http://localhost:28881"
   
   # With custom batch size per instance
-  tei_machine run -b 50             # Max 50 inputs per request to each instance
+    tei machine run -b 50             # Max 50 inputs per request to each instance
   
   # LSH computation options
-  tei_machine run --no-gpu-lsh      # Force CPU for LSH computation
+    tei machine run --no-gpu-lsh      # Force CPU for LSH computation
   
   # Performance tracking
-  tei_machine run --perf-track      # Enable detailed performance tracking
+    tei machine run --perf-track      # Enable detailed performance tracking
   
   # Check discovered instances without starting server
-  tei_machine discover              # List all discovered TEI instances
+    tei machine discover              # List all discovered TEI instances
   
   # Health check all instances
-  tei_machine health                # Check health of all instances
+    tei machine health                # Check health of all instances
 """
 
 import argparse
@@ -52,8 +53,10 @@ from typing import Optional, Union
 from webu import setup_swagger_ui
 
 from ..utils.lsh import LSHConverter
+from ..utils.service_bootstrap import ensure_backend_instances
 from .perf_tracker import PerfTracker
-from .compose import MAX_CLIENT_BATCH_SIZE
+from .compose import MAX_CLIENT_BATCH_SIZE, MODEL_NAME as COMPOSE_MODEL_NAME
+from .compose import SERVER_PORT as COMPOSE_SERVER_PORT, TEIComposer
 from .scheduler import (
     IdleFillingScheduler,
     distribute_with_adaptive_pipeline,
@@ -67,6 +70,8 @@ MICRO_BATCH_SIZE = 100
 MIN_BATCH_SIZE = 50  # Minimum batch size
 MAX_BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Must match TEI container limit
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
+BACKEND_STARTUP_TIMEOUT_SEC = 300.0
+BACKEND_STARTUP_POLL_INTERVAL_SEC = 5.0
 
 
 class EmbedRequest(BaseModel):
@@ -997,91 +1002,168 @@ class TEIMachineServer:
         await server.serve()
 
 
-class TEIMachineArgParser:
-    """Argument parser for TEI Machine CLI."""
+def configure_parser(parser: argparse.ArgumentParser) -> None:
+    parser.description = "Run the TEI machine load-balanced proxy"
+    parser.formatter_class = argparse.RawDescriptionHelpFormatter
+    parser.epilog = CLI_EPILOG
+    parser.add_argument(
+        "-p",
+        "--port",
+        type=int,
+        default=PORT,
+        help=f"Machine server port (default: {PORT})",
+    )
+    parser.add_argument(
+        "-n",
+        "--name-pattern",
+        type=str,
+        default=None,
+        help="Regex pattern to filter container names",
+    )
+    parser.add_argument(
+        "-e",
+        "--endpoints",
+        type=str,
+        default=None,
+        help="Comma-separated list of TEI endpoints (skip auto-discovery)",
+    )
+    parser.add_argument(
+        "-b",
+        "--batch-size",
+        type=int,
+        default=BATCH_SIZE,
+        help=f"Max batch size per instance (default: {BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "-m",
+        "--micro-batch-size",
+        type=int,
+        default=MICRO_BATCH_SIZE,
+        help=f"Micro-batch size for pipeline scheduling (default: {MICRO_BATCH_SIZE})",
+    )
+    parser.add_argument(
+        "-t",
+        "--timeout",
+        type=float,
+        default=60.0,
+        help="Request timeout in seconds (default: 60)",
+    )
+    parser.add_argument(
+        "--no-gpu-lsh",
+        action="store_true",
+        help="Disable GPU acceleration for LSH computation (use CPU instead)",
+    )
+    parser.add_argument(
+        "--perf-track",
+        action="store_true",
+        help="Enable detailed performance tracking to identify bottlenecks",
+    )
+    parser.add_argument(
+        "--auto-start",
+        action="store_true",
+        help=(
+            "When no TEI containers are running, start a compose deployment in the "
+            "background and wait for healthy backends"
+        ),
+    )
+    parser.add_argument(
+        "--startup-timeout",
+        type=float,
+        default=BACKEND_STARTUP_TIMEOUT_SEC,
+        help=(
+            "Seconds to wait for auto-started backends to become healthy "
+            f"(default: {BACKEND_STARTUP_TIMEOUT_SEC:g})"
+        ),
+    )
+    parser.add_argument(
+        "--startup-poll-interval",
+        type=float,
+        default=BACKEND_STARTUP_POLL_INTERVAL_SEC,
+        help=(
+            "Polling interval in seconds while waiting for healthy backends "
+            f"(default: {BACKEND_STARTUP_POLL_INTERVAL_SEC:g})"
+        ),
+    )
+    parser.add_argument(
+        "--compose-model-name",
+        type=str,
+        default=None,
+        help=(
+            "Model name to use for auto-started compose backends "
+            f"(default: {COMPOSE_MODEL_NAME})"
+        ),
+    )
+    parser.add_argument(
+        "--compose-port",
+        type=int,
+        default=None,
+        help=(
+            "Compose backend base port for auto-started TEI containers "
+            f"(default: {COMPOSE_SERVER_PORT})"
+        ),
+    )
+    parser.add_argument(
+        "--compose-project-name",
+        type=str,
+        default=None,
+        help="Compose project name for auto-started backends",
+    )
+    parser.add_argument(
+        "--compose-gpus",
+        type=str,
+        default=None,
+        help="GPU IDs for auto-started backends (default: all healthy GPUs)",
+    )
+    parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["run", "discover", "health"],
+        default=None,
+        help="Action to perform: run, discover, or health",
+    )
 
-    def __init__(self):
-        self.parser = argparse.ArgumentParser(
-            description="TEI Machine - Load-balanced proxy for TEI instances",
-            formatter_class=argparse.RawDescriptionHelpFormatter,
-            epilog=CLI_EPILOG,
-        )
-        self._setup_arguments()
-        self.args = self.parser.parse_args()
 
-    def _setup_arguments(self):
-        """Setup all command-line arguments."""
-        self.parser.add_argument(
-            "-p",
-            "--port",
-            type=int,
-            default=PORT,
-            help=f"Machine server port (default: {PORT})",
-        )
-        self.parser.add_argument(
-            "-n",
-            "--name-pattern",
-            type=str,
-            default=None,
-            help="Regex pattern to filter container names",
-        )
-        self.parser.add_argument(
-            "-e",
-            "--endpoints",
-            type=str,
-            default=None,
-            help="Comma-separated list of TEI endpoints (skip auto-discovery)",
-        )
-        self.parser.add_argument(
-            "-b",
-            "--batch-size",
-            type=int,
-            default=BATCH_SIZE,
-            help=f"Max batch size per instance (default: {BATCH_SIZE})",
-        )
-        self.parser.add_argument(
-            "-m",
-            "--micro-batch-size",
-            type=int,
-            default=MICRO_BATCH_SIZE,
-            help=f"Micro-batch size for pipeline scheduling (default: {MICRO_BATCH_SIZE})",
-        )
-        self.parser.add_argument(
-            "-t",
-            "--timeout",
-            type=float,
-            default=60.0,
-            help="Request timeout in seconds (default: 60)",
-        )
-        self.parser.add_argument(
-            "--no-gpu-lsh",
-            action="store_true",
-            help="Disable GPU acceleration for LSH computation (use CPU instead)",
-        )
-        self.parser.add_argument(
-            "--perf-track",
-            action="store_true",
-            help="Enable detailed performance tracking to identify bottlenecks",
-        )
-        self.parser.add_argument(
-            "action",
-            nargs="?",
-            choices=["run", "discover", "health"],
-            default=None,
-            help="Action to perform: run (start server), discover (list instances), health (check health)",
-        )
+def _discover_instances_from_docker(name_pattern: Optional[str]) -> list[TEIInstance]:
+    return TEIInstanceDiscovery.discover(name_pattern)
 
 
-def discover_instances(args) -> list[TEIInstance]:
+def _build_auto_start_composer(args: argparse.Namespace) -> TEIComposer:
+    composer_kwargs = {}
+    if getattr(args, "compose_model_name", None):
+        composer_kwargs["model_name"] = args.compose_model_name
+    if getattr(args, "compose_port", None) is not None:
+        composer_kwargs["port"] = args.compose_port
+    if getattr(args, "compose_project_name", None):
+        composer_kwargs["project_name"] = args.compose_project_name
+    if getattr(args, "compose_gpus", None):
+        composer_kwargs["gpu_ids"] = args.compose_gpus
+    return TEIComposer(**composer_kwargs)
+
+
+def discover_instances(args: argparse.Namespace) -> list[TEIInstance]:
     """Discover or create TEI instances based on args."""
     if args.endpoints:
-        endpoints = [e.strip() for e in args.endpoints.split(",")]
+        endpoints = [e.strip() for e in args.endpoints.split(",") if e.strip()]
         instances = TEIInstanceDiscovery.from_endpoints(endpoints)
         logger.okay(f"[tei_machine] Using {len(instances)} manual endpoints")
-    else:
-        instances = TEIInstanceDiscovery.discover(args.name_pattern)
-        logger.okay(f"[tei_machine] Discovered {len(instances)} TEI instances")
+        return instances
 
+    instances = _discover_instances_from_docker(args.name_pattern)
+    instances = ensure_backend_instances(
+        instances,
+        enabled=getattr(args, "auto_start", False),
+        manual_endpoints=bool(getattr(args, "endpoints", None)),
+        service_label="[tei_machine]",
+        compose_factory=lambda: _build_auto_start_composer(args),
+        rediscover=lambda: _discover_instances_from_docker(args.name_pattern),
+        timeout_sec=getattr(args, "startup_timeout", BACKEND_STARTUP_TIMEOUT_SEC),
+        poll_interval_sec=getattr(
+            args,
+            "startup_poll_interval",
+            BACKEND_STARTUP_POLL_INTERVAL_SEC,
+        ),
+    )
+    logger.okay(f"[tei_machine] Discovered {len(instances)} TEI instances")
     return instances
 
 
@@ -1139,16 +1221,7 @@ async def check_health(instances: list[TEIInstance]) -> None:
     log_instances(instances, show_health=True)
 
 
-def main():
-    """Main entry point."""
-    arg_parser = TEIMachineArgParser()
-    args = arg_parser.args
-
-    # Show help if no action specified
-    if args.action is None:
-        arg_parser.parser.print_help()
-        return
-
+def run_from_args(args: argparse.Namespace) -> None:
     instances = discover_instances(args)
 
     if args.action == "discover":
@@ -1186,6 +1259,27 @@ def main():
             enable_perf_tracking=args.perf_track,
         )
         server.run()
+
+
+class TEIMachineArgParser:
+    """Compatibility wrapper around the reusable machine parser."""
+
+    def __init__(self, argv: list[str] | None = None):
+        self.parser = argparse.ArgumentParser()
+        configure_parser(self.parser)
+        self.args = self.parser.parse_args(argv)
+
+
+def main(argv: list[str] | None = None) -> None:
+    """Main entry point."""
+    arg_parser = TEIMachineArgParser(argv)
+    args = arg_parser.args
+
+    if args.action is None:
+        arg_parser.parser.print_help()
+        return
+
+    run_from_args(args)
 
 
 if __name__ == "__main__":

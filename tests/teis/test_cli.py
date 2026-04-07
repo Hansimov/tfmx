@@ -1,0 +1,41 @@
+"""CLI parser tests for tei."""
+
+from tfmx.teis.cli import build_parser
+
+
+class TestTeiCliParser:
+    def test_compose_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(["compose", "up", "-g", "0,1"])
+        assert args.command == "compose"
+        assert args.compose_action == "up"
+        assert args.gpus == "0,1"
+
+    def test_machine_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["machine", "run", "--auto-start", "--compose-gpus", "0,2"]
+        )
+        assert args.command == "machine"
+        assert args.action == "run"
+        assert args.auto_start is True
+        assert args.compose_gpus == "0,2"
+
+    def test_client_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["client", "embed", "-E", "http://localhost:28800", "hello"]
+        )
+        assert args.command == "client"
+        assert args.client_action == "embed"
+        assert args.endpoints == "http://localhost:28800"
+        assert args.texts == ["hello"]
+
+    def test_benchmark_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            ["benchmark", "run", "-E", "http://localhost:28800", "-n", "10"]
+        )
+        assert args.command == "benchmark"
+        assert args.benchmark_action == "run"
+        assert args.num_samples == 10

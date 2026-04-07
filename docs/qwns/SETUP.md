@@ -42,6 +42,13 @@ qwn --help
 
 ## 快速开始
 
+建议先准备：
+
+```bash
+export QWN_MACHINE_URL="http://$QWN_HOST:27800"
+export QWN_PROXY_URL="http://$PROXY_HOST:$PROXY_PORT"
+```
+
 ### 1. 预拉基础镜像
 
 ```bash
@@ -75,8 +82,8 @@ qwn compose up --gpu-layout uniform-awq -g 0,1
 # 前台模式
 qwn machine run
 
-# 后台模式
-qwn machine run -b
+# 后台模式（如无后端则自动拉起 compose）
+qwn machine run --auto-start -b
 qwn machine status
 qwn machine logs
 ```
@@ -84,6 +91,8 @@ qwn machine logs
 说明：
 
 - `qwn machine` 当前默认监听 `0.0.0.0:27800`，不仅是 `localhost`
+- `--auto-start` 会在没有检测到运行中的后端时，按默认 compose 策略拉起所有健康 GPU 对应的后端实例
+- 如果你已经用 `qwn compose up ...` 手动部署了精确的 GPU 布局，`qwn machine run -b` 即可；此时 `--auto-start` 不会重复启动新的后端
 - 同机可用 `http://127.0.0.1:27800` 或 `http://localhost:27800` 访问；局域网内其他机器可直接用这台机器的 LAN IP，例如 `http://192.168.x.x:27800`
 - 若局域网机器仍无法访问，优先检查宿主机防火墙、安全组或上层路由策略，而不是 `qwn machine` 本身的 bind 地址
 - 对 OpenAI 兼容客户端，若 base URL 写成 `http://host:27800/v1`，可直接走标准 `/chat/completions` 与 `/models`；若 base URL 写成 `http://host:27800`，当前也额外兼容 `/chat/completions` 与 `/models` 这组无版本前缀别名
@@ -94,6 +103,7 @@ qwn machine logs
 qwn client health
 qwn client models
 qwn client chat "你好，请用三句话介绍你的能力。"
+qwn benchmark run -E "$QWN_MACHINE_URL" -n 100
 python debugs/qwn_multimodal_probe.py
 ```
 
@@ -108,7 +118,7 @@ python debugs/qwn_multimodal_probe.py
 ### 5. 运行 benchmark
 
 ```bash
-qwn benchmark run -E http://localhost:27800 -n 100 -o runs/qwns/results/latest.json
+qwn benchmark run -E "$QWN_MACHINE_URL" -n 100 -o runs/qwns/results/latest.json
 ```
 
 ## 端口布局

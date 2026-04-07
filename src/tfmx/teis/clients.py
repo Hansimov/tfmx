@@ -10,15 +10,15 @@ from .clients_core import _TEIClientsBase, _TEIClientsPipeline
 # ANCHOR[id=clients-clis]
 CLI_EPILOG = """
 Examples:
-  export TEI_EPS="http://localhost:28800,http://ai122:28800"
+    export TEI_EPS="$TEI_MACHINE_A_URL,$TEI_MACHINE_B_URL"
   
-  # Action comes first
-  tei_clients health -E $TEI_EPS
-  tei_clients info -E $TEI_EPS
-  tei_clients embed -E $TEI_EPS "Hello" "World"
-  tei_clients lsh -E $TEI_EPS "Hello"
-  tei_clients lsh -E $TEI_EPS -b 2048 "Hello, world"
-  tei_clients rerank -E $TEI_EPS -q "hello" -p "hi" "good" "你好"
+    # Unified CLI replacement
+    tei client health -E "$TEI_EPS"
+    tei client info -E "$TEI_EPS"
+    tei client embed -E "$TEI_EPS" "Hello" "World"
+    tei client lsh -E "$TEI_EPS" "Hello"
+    tei client lsh -E "$TEI_EPS" -b 2048 "Hello, world"
+    tei client rerank -E "$TEI_EPS" -q "hello" -p "hi" "good" "你好"
 """
 
 

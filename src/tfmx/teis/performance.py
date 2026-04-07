@@ -34,16 +34,16 @@ class ExplorationConfig:
     ```
     {
         "b775a741a567": {
-            "endpoints": [ "http://localhost:28800", "http://ai122:28800" ],
+            "endpoints": [ "$TEI_MACHINE_A_URL", "$TEI_MACHINE_B_URL" ],
             "machines": {
-            "ai122:28800": {
+            "$TEI_MACHINE_B_KEY": {
                 "optimal_batch_size": 1750,
                 "optimal_max_concurrent": 10,
                 "throughput": 291.7,
                 "instances": 7,
                 "updated_at": "2026-01-14T07:40:23.804785"
             },
-            "localhost:28800": {
+            "$TEI_MACHINE_A_KEY": {
                 "optimal_batch_size": 4750,
                 "optimal_max_concurrent": 2,
                 "throughput": 687.9,

@@ -15,6 +15,8 @@ from typing import Optional
 
 from tclogger import logger
 
+from ..utils.service_bootstrap import wait_for_healthy_http_endpoints
+
 from .networking import DEFAULT_HF_ENDPOINT
 from .networking import DEFAULT_PIP_INDEX_URL
 from .networking import DEFAULT_PIP_TRUSTED_HOST
@@ -1074,6 +1076,22 @@ class QWNComposer:
         self.compose_file.write_text(generator.generate())
         logger.okay(f"[qwn] Generated: {self.compose_file}")
         return self.compose_file
+
+    def get_backend_endpoints(self) -> list[str]:
+        return [f"http://localhost:{self.port + gpu.index}" for gpu in self.gpus]
+
+    def wait_for_healthy_backends(
+        self,
+        timeout_sec: float = 300.0,
+        poll_interval_sec: float = 5.0,
+        label: str = "[qwn]",
+    ) -> bool:
+        return wait_for_healthy_http_endpoints(
+            self.get_backend_endpoints(),
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            label=label,
+        )
 
     def _run_compose_cmd(
         self,
