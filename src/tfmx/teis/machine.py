@@ -49,14 +49,16 @@ from dataclasses import dataclass, field
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
-from typing import Optional, Union
+from typing import Callable, Optional, Union
 from webu import setup_swagger_ui
 
 from ..utils.lsh import LSHConverter
 from ..utils.service_bootstrap import ensure_backend_instances
+from ..utils.service_bootstrap import handle_port_conflicts
 from .perf_tracker import PerfTracker
 from .compose import MAX_CLIENT_BATCH_SIZE, MODEL_NAME as COMPOSE_MODEL_NAME
 from .compose import SERVER_PORT as COMPOSE_SERVER_PORT, TEIComposer
+from .compose import parse_gpu_configs
 from .scheduler import (
     IdleFillingScheduler,
     distribute_with_adaptive_pipeline,
@@ -72,6 +74,57 @@ MAX_BATCH_SIZE = MAX_CLIENT_BATCH_SIZE  # Must match TEI container limit
 TEI_CONTAINER_IMAGE_PATTERN = "text-embeddings-inference"
 BACKEND_STARTUP_TIMEOUT_SEC = 300.0
 BACKEND_STARTUP_POLL_INTERVAL_SEC = 5.0
+BACKEND_DISCOVERY_SETTLE_SEC = 10.0
+HEALTH_REFRESH_INTERVAL_SEC = 10.0
+
+
+class TEIBackendRequestError(RuntimeError):
+    def __init__(
+        self,
+        instance: "TEIInstance",
+        *,
+        status_code: int,
+        detail: str,
+        error_type: str = "",
+    ):
+        self.instance = instance
+        self.status_code = status_code
+        self.detail = detail
+        self.error_type = error_type
+        super().__init__(f"Instance {instance.port} error: {detail}")
+
+    @property
+    def retryable(self) -> bool:
+        return self.status_code >= 500 or self.error_type.lower() in {
+            "backend",
+            "unhealthy",
+        }
+
+    @property
+    def normalized_detail(self) -> str:
+        return self.detail.lower()
+
+    @property
+    def capacity_related(self) -> bool:
+        return (
+            "out of memory" in self.normalized_detail
+            or "cuda_error_out_of_memory" in self.normalized_detail
+            or "oom" in self.normalized_detail
+        )
+
+    @property
+    def fatal_backend(self) -> bool:
+        return (
+            "launch failed" in self.normalized_detail
+            or "cuda_error_launch_failed" in self.normalized_detail
+            or self.error_type.lower() == "unhealthy"
+        )
+
+    @property
+    def should_mark_unhealthy(self) -> bool:
+        return self.fatal_backend or (
+            self.status_code >= 500 and not self.capacity_related
+        )
 
 
 class EmbedRequest(BaseModel):
@@ -464,12 +517,14 @@ class TEIMachineServer:
         use_gpu_lsh: bool = True,
         enable_perf_tracking: bool = False,
         batch_wait_ms: float = 5.0,  # Time to wait for more requests before processing
+        discover_instances_fn: Callable[[], list[TEIInstance]] | None = None,
     ):
         self.instances = instances
         self.port = port
         self.batch_size = batch_size
         self.micro_batch_size = micro_batch_size
         self.timeout = timeout
+        self._discover_instances_fn = discover_instances_fn
         self.stats = TEIMachineStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
@@ -511,6 +566,156 @@ class TEIMachineServer:
     def get_healthy_instances(self) -> list[TEIInstance]:
         """Get all healthy instances."""
         return [i for i in self.instances if i.healthy]
+
+    @staticmethod
+    def _instance_identity(instance: TEIInstance) -> str:
+        return instance.container_name or instance.endpoint
+
+    @staticmethod
+    def _instance_sort_key(instance: TEIInstance) -> tuple[int, str]:
+        return (
+            instance.gpu_id if instance.gpu_id is not None else 999,
+            instance.container_name,
+        )
+
+    def _update_scheduler_workers(self) -> None:
+        self.scheduler.update_workers(self.get_healthy_instances())
+
+    def _merge_discovered_instances(
+        self,
+        discovered: list[TEIInstance],
+    ) -> tuple[bool, list[TEIInstance]]:
+        existing_by_identity = {
+            self._instance_identity(instance): instance for instance in self.instances
+        }
+        changed = False
+        added_instances: list[TEIInstance] = []
+
+        for discovered_instance in discovered:
+            identity = self._instance_identity(discovered_instance)
+            existing = existing_by_identity.get(identity)
+            if existing is None:
+                self.instances.append(discovered_instance)
+                existing_by_identity[identity] = discovered_instance
+                added_instances.append(discovered_instance)
+                changed = True
+                continue
+
+            if (
+                existing.host != discovered_instance.host
+                or existing.port != discovered_instance.port
+                or existing.gpu_id != discovered_instance.gpu_id
+            ):
+                existing.host = discovered_instance.host
+                existing.port = discovered_instance.port
+                existing.gpu_id = discovered_instance.gpu_id
+                changed = True
+
+        if changed:
+            self.instances.sort(key=self._instance_sort_key)
+        return changed, added_instances
+
+    async def _refresh_instances_from_discovery(self) -> None:
+        if self._discover_instances_fn is None:
+            return
+
+        discovered = await asyncio.to_thread(self._discover_instances_fn)
+        if not discovered:
+            return
+
+        changed, added_instances = self._merge_discovered_instances(discovered)
+        if not changed:
+            return
+
+        for instance in added_instances:
+            logger.okay(
+                f"[tei_machine] Added backend instance: {instance.container_name} @ {instance.endpoint}"
+            )
+        self._update_scheduler_workers()
+
+    def _is_retryable_upstream_status(self, status_code: int) -> bool:
+        return status_code >= 500
+
+    def _is_retryable_upstream_exception(self, exc: Exception) -> bool:
+        if isinstance(exc, TEIBackendRequestError):
+            return exc.retryable
+        return isinstance(
+            exc,
+            (
+                httpx.TransportError,
+                httpx.TimeoutException,
+                asyncio.TimeoutError,
+            ),
+        )
+
+    def _mark_instance_unhealthy(
+        self,
+        instance: TEIInstance,
+        reason: Exception | str,
+    ) -> None:
+        reason_text = str(reason)
+        if instance.healthy:
+            logger.warn(
+                f"× Marking {instance.container_name} unhealthy for TEI failover: {reason_text}"
+            )
+        instance.healthy = False
+        self._update_scheduler_workers()
+
+    @staticmethod
+    def _extract_backend_error(response: httpx.Response) -> tuple[str, str]:
+        detail = response.text
+        error_type = ""
+        try:
+            payload = response.json()
+            detail = payload.get("error", detail)
+            error_type = payload.get("error_type", "")
+        except Exception:
+            pass
+        return detail, error_type
+
+    async def _run_embeddings_with_failover(
+        self,
+        inputs: list[str],
+        normalize: bool,
+        truncate: bool,
+    ) -> np.ndarray:
+        max_attempts = max(1, len(self.instances))
+        last_error: Exception | None = None
+
+        for attempt in range(1, max_attempts + 1):
+            healthy = self.get_healthy_instances()
+            if not healthy:
+                if last_error is not None:
+                    raise last_error
+                raise HTTPException(
+                    status_code=503,
+                    detail="No healthy instances available",
+                )
+
+            before_attempt = {instance.container_name for instance in healthy}
+            try:
+                return await self._distribute_with_scheduler_np(
+                    inputs,
+                    healthy,
+                    normalize,
+                    truncate,
+                )
+            except Exception as exc:
+                last_error = exc
+                after_attempt = {
+                    instance.container_name for instance in self.get_healthy_instances()
+                }
+                lost_instances = before_attempt - after_attempt
+                if lost_instances and after_attempt and attempt < max_attempts:
+                    logger.warn(
+                        f"[tei_machine] Retrying request after backend failures on {sorted(lost_instances)}; remaining healthy instances: {len(after_attempt)}/{len(self.instances)}"
+                    )
+                    continue
+                raise
+
+        if last_error is not None:
+            raise last_error
+        raise HTTPException(status_code=503, detail="No healthy instances available")
 
     def _create_app(self) -> FastAPI:
         """Create and configure the FastAPI application."""
@@ -607,16 +812,18 @@ class TEIMachineServer:
     async def _periodic_health_check(self) -> None:
         """Periodically check health of all instances."""
         while True:
-            await asyncio.sleep(30)
+            await asyncio.sleep(HEALTH_REFRESH_INTERVAL_SEC)
             await self.health_check_all()
 
     async def health_check_all(self) -> None:
         """Check health of all instances."""
+        await self._refresh_instances_from_discovery()
         if not self._client:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
 
         tasks = [self._check_instance_health(inst) for inst in self.instances]
         await asyncio.gather(*tasks, return_exceptions=True)
+        self._update_scheduler_workers()
 
     async def _check_instance_health(self, instance: TEIInstance) -> bool:
         """Check health of a single instance."""
@@ -653,8 +860,10 @@ class TEIMachineServer:
             # Use lock to serialize GPU access
             async with self._scheduler_lock:
                 # Use optimized numpy path for all embedding operations
-                embs_array = await self._distribute_with_scheduler_np(
-                    inputs, healthy, request.normalize, request.truncate
+                embs_array = await self._run_embeddings_with_failover(
+                    inputs,
+                    request.normalize,
+                    request.truncate,
                 )
             # Convert numpy array to list for JSON response
             # tolist() is faster than manually rebuilding nested lists
@@ -683,9 +892,42 @@ class TEIMachineServer:
             "truncate": truncate,
         }
 
-        resp = await self._client.post(instance.embed_url, json=payload)
+        try:
+            resp = await self._client.post(instance.embed_url, json=payload)
+        except Exception as exc:
+            if self._is_retryable_upstream_exception(exc):
+                self._mark_instance_unhealthy(instance, exc)
+            raise
+
         if resp.status_code != 200:
-            raise ValueError(f"Instance {instance.port} error: {resp.text}")
+            detail, error_type = self._extract_backend_error(resp)
+            error = TEIBackendRequestError(
+                instance,
+                status_code=resp.status_code,
+                detail=detail,
+                error_type=error_type,
+            )
+            if error.capacity_related and len(inputs) > 1:
+                midpoint = max(1, len(inputs) // 2)
+                logger.warn(
+                    f"[tei_machine] Splitting overloaded batch on {instance.container_name}: {len(inputs)} -> {midpoint}+{len(inputs) - midpoint}"
+                )
+                left = await self._send_embed_request_np(
+                    instance,
+                    inputs[:midpoint],
+                    normalize,
+                    truncate,
+                )
+                right = await self._send_embed_request_np(
+                    instance,
+                    inputs[midpoint:],
+                    normalize,
+                    truncate,
+                )
+                return np.vstack([left, right])
+            if error.should_mark_unhealthy:
+                self._mark_instance_unhealthy(instance, error)
+            raise error
 
         # Parse JSON with orjson (10x faster) and convert to numpy array directly
         # orjson.loads returns Python list, which we convert to numpy
@@ -833,8 +1075,10 @@ class TEIMachineServer:
 
                 # Use optimized numpy distribution that returns numpy array directly
                 # This avoids the expensive nested-list-to-array conversion
-                embs_array = await self._distribute_with_scheduler_np(
-                    inputs, healthy, request.normalize, request.truncate
+                embs_array = await self._run_embeddings_with_failover(
+                    inputs,
+                    request.normalize,
+                    request.truncate,
                 )
 
                 t2 = _time.perf_counter()
@@ -927,8 +1171,10 @@ class TEIMachineServer:
                 # Embed all texts together for efficiency
                 # Combine queries and passages: [queries..., passages...]
                 all_texts = queries + passages
-                all_embs = await self._distribute_with_scheduler_np(
-                    all_texts, healthy, request.normalize, request.truncate
+                all_embs = await self._run_embeddings_with_failover(
+                    all_texts,
+                    request.normalize,
+                    request.truncate,
                 )
 
                 # Split embeddings back into queries and passages
@@ -1049,6 +1295,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         help="Request timeout in seconds (default: 60)",
     )
     parser.add_argument(
+        "--on-conflict",
+        choices=["report", "replace"],
+        default="report",
+        help="How to handle an existing machine listener on the target port",
+    )
+    parser.add_argument(
         "--no-gpu-lsh",
         action="store_true",
         help="Disable GPU acceleration for LSH computation (use CPU instead)",
@@ -1115,6 +1367,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         help="GPU IDs for auto-started backends (default: all healthy GPUs)",
     )
     parser.add_argument(
+        "--compose-gpu-configs",
+        type=str,
+        default=None,
+        help='Per-GPU config for auto-started backends: "GPU[:MODEL],..."',
+    )
+    parser.add_argument(
         "action",
         nargs="?",
         choices=["run", "discover", "health"],
@@ -1137,6 +1395,8 @@ def _build_auto_start_composer(args: argparse.Namespace) -> TEIComposer:
         composer_kwargs["project_name"] = args.compose_project_name
     if getattr(args, "compose_gpus", None):
         composer_kwargs["gpu_ids"] = args.compose_gpus
+    if getattr(args, "compose_gpu_configs", None):
+        composer_kwargs["gpu_configs"] = parse_gpu_configs(args.compose_gpu_configs)
     return TEIComposer(**composer_kwargs)
 
 
@@ -1162,6 +1422,8 @@ def discover_instances(args: argparse.Namespace) -> list[TEIInstance]:
             "startup_poll_interval",
             BACKEND_STARTUP_POLL_INTERVAL_SEC,
         ),
+        allow_partial=True,
+        settle_sec=BACKEND_DISCOVERY_SETTLE_SEC,
     )
     logger.okay(f"[tei_machine] Discovered {len(instances)} TEI instances")
     return instances
@@ -1239,6 +1501,13 @@ def run_from_args(args: argparse.Namespace) -> None:
             )
             return
 
+        if not handle_port_conflicts(
+            args.port,
+            policy=getattr(args, "on_conflict", "report"),
+            label="[tei_machine]",
+        ):
+            return
+
         if args.perf_track:
             logger.note("[tei_machine] Performance tracking ENABLED")
             logger.note(
@@ -1257,6 +1526,11 @@ def run_from_args(args: argparse.Namespace) -> None:
             timeout=args.timeout,
             use_gpu_lsh=not args.no_gpu_lsh,
             enable_perf_tracking=args.perf_track,
+            discover_instances_fn=(
+                None
+                if args.endpoints
+                else lambda: _discover_instances_from_docker(args.name_pattern)
+            ),
         )
         server.run()
 

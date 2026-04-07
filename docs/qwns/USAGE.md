@@ -20,6 +20,7 @@ export QWN_BACKEND_EPS="$QWN_BACKEND_A_URL,$QWN_BACKEND_B_URL"
 qwn compose up
 qwn compose up -g 0,1
 qwn compose up --gpu-layout uniform-awq
+qwn compose up --gpu-configs "0,2"
 qwn compose up --gpu-configs "0:4b:4bit,1:4b:4bit"
 qwn compose generate -j qwn-awq --gpu-configs "0:4b:4bit"
 qwn compose ps
@@ -29,7 +30,7 @@ qwn compose down
 
 ### 常用参数
 
-- `--gpu-configs`：显式指定每张 GPU 的模型/量化配置
+- `--gpu-configs`：显式指定每张 GPU 的模型/量化配置，格式为 `GPU[:MODEL[:QUANT]],...`；例如 `"0,2"` 会对 GPU0/GPU2 使用默认 `4b:4bit`
 - `--gpu-layout uniform-awq`：对所有选中 GPU 应用同一套默认 AWQ 部署
 - `--mount-mode manual`：直接挂载 `/dev/nvidia*`
 - `--proxy`：覆盖默认 build 代理
@@ -45,6 +46,7 @@ qwn compose down
 qwn machine run
 qwn machine run --auto-start
 qwn machine run --auto-start -b
+qwn machine run --auto-start -b --on-conflict replace
 qwn machine run -b
 qwn machine run -e "$QWN_BACKEND_EPS"
 qwn machine discover
@@ -56,8 +58,9 @@ qwn machine restart
 ```
 
 - `qwn machine` 默认监听 `0.0.0.0:27800`，因此同局域网其他机器可以直接访问这台宿主机的 LAN IP
-- `qwn machine run --auto-start` 会在没有运行中的 QWN 后端时自动调用 `qwn compose up`，并等待后端健康后再提供代理服务
+- `qwn machine run --auto-start` 会在没有运行中的 QWN 后端时自动调用 `qwn compose up`；如果启动过程中只有部分 GPU 后端恢复健康，代理会继续带着这部分健康实例启动，而不是被单张掉卡阻塞
 - 如果你需要精确控制 GPU 布局、模型或量化配置，优先手动执行 `qwn compose up ...`；`--auto-start` 更适合默认单模型部署
+- `--on-conflict report|replace` 用于控制当 `27800` 端口或旧 daemon 已存在时的行为；`replace` 会先停止旧 daemon 或占用端口的旧进程，再启动新的 machine
 - 对 OpenAI 兼容客户端，推荐把 base URL 指到 `http://<host>:27800`，实际请求路径使用 `/v1/chat/completions`
 - 当前代理也会兼容一部分旧的 thinking 扩展字段写法：若客户端发送顶层 `thinking` 或 `enable_thinking`，代理会自动归一化为 Qwen3.5/vLLM 需要的 `chat_template_kwargs.enable_thinking`
 - 若请求里不传 `model`，`qwn machine` 会稳定回落到当前默认模型，而不是在多模型部署里跨模型随机挑选

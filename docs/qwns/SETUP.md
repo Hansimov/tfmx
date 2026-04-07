@@ -83,7 +83,7 @@ qwn compose up --gpu-layout uniform-awq -g 0,1
 qwn machine run
 
 # 后台模式（如无后端则自动拉起 compose）
-qwn machine run --auto-start -b
+qwn machine run --auto-start -b --on-conflict replace
 qwn machine status
 qwn machine logs
 ```
@@ -91,7 +91,8 @@ qwn machine logs
 说明：
 
 - `qwn machine` 当前默认监听 `0.0.0.0:27800`，不仅是 `localhost`
-- `--auto-start` 会在没有检测到运行中的后端时，按默认 compose 策略拉起所有健康 GPU 对应的后端实例
+- `--auto-start` 会在没有检测到运行中的后端时，按默认 compose 策略拉起所有健康 GPU 对应的后端实例；如果只有部分后端在启动窗口内恢复健康，也会先带着这些健康实例启动
+- `--on-conflict replace` 适合替换旧 machine 或已占用 `27800` 端口的旧进程
 - 如果你已经用 `qwn compose up ...` 手动部署了精确的 GPU 布局，`qwn machine run -b` 即可；此时 `--auto-start` 不会重复启动新的后端
 - 同机可用 `http://127.0.0.1:27800` 或 `http://localhost:27800` 访问；局域网内其他机器可直接用这台机器的 LAN IP，例如 `http://192.168.x.x:27800`
 - 若局域网机器仍无法访问，优先检查宿主机防火墙、安全组或上层路由策略，而不是 `qwn machine` 本身的 bind 地址

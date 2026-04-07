@@ -28,6 +28,7 @@ Examples:
   # With specific GPUs
     tei compose up -g "0,1"           # Start on GPU 0 and 1
     tei compose up -g "2"             # Start on GPU 2 only
+        tei compose up --gpu-configs "0,1"  # Per-GPU config with default model
   
   # Custom port and project name
     tei compose up -p 28890           # Use port 28890 as base
@@ -88,6 +89,7 @@ import re
 import shutil
 import subprocess
 
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
@@ -132,6 +134,61 @@ SENTENCE_CONFIG_FILES = [
     "sentence_xlm-roberta_config.json",
     "sentence_xlnet_config.json",
 ]
+
+
+@dataclass
+class GpuModelConfig:
+    gpu_id: int
+    model_name: str = MODEL_NAME
+
+    def __post_init__(self) -> None:
+        self.model_name = (self.model_name or MODEL_NAME).strip() or MODEL_NAME
+
+    @property
+    def label(self) -> str:
+        return self.model_name
+
+
+def parse_gpu_configs(config_str: str) -> list[GpuModelConfig]:
+    configs: list[GpuModelConfig] = []
+    seen_gpu_ids: set[int] = set()
+    for raw_part in config_str.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        fields = [field.strip() for field in part.split(":")]
+        if not fields or not fields[0]:
+            raise ValueError(f"Invalid config: '{part}'. Format: GPU_ID[:MODEL]")
+        if len(fields) > 2:
+            raise ValueError(f"Invalid config: '{part}'. Format: GPU_ID[:MODEL]")
+
+        gpu_id = int(fields[0])
+        if gpu_id in seen_gpu_ids:
+            raise ValueError(f"Duplicate GPU ID in config: '{gpu_id}'")
+        seen_gpu_ids.add(gpu_id)
+
+        model_name = fields[1] if len(fields) > 1 and fields[1] else MODEL_NAME
+        configs.append(GpuModelConfig(gpu_id=gpu_id, model_name=model_name))
+    return configs
+
+
+def infer_gpu_ids(
+    gpu_ids: str | None,
+    gpu_configs: list[GpuModelConfig] | None = None,
+) -> str | None:
+    if gpu_ids:
+        return gpu_ids
+    if not gpu_configs:
+        return None
+
+    inferred_ids: list[str] = []
+    seen_gpu_ids: set[int] = set()
+    for config in gpu_configs:
+        if config.gpu_id in seen_gpu_ids:
+            continue
+        seen_gpu_ids.add(config.gpu_id)
+        inferred_ids.append(str(config.gpu_id))
+    return ",".join(inferred_ids) if inferred_ids else None
 
 
 class NvidiaDriverLibs:
@@ -481,6 +538,7 @@ class ComposeFileGenerator:
         mount_mode: str = "manual",
         driver_lib_dir: Optional[str] = None,
         http_proxy: Optional[str] = None,
+        gpu_configs: list[GpuModelConfig] | None = None,
     ):
         self.gpus = gpus
         self.model_name = model_name
@@ -494,6 +552,14 @@ class ComposeFileGenerator:
         self.mount_mode = mount_mode
         self.driver_lib_dir = driver_lib_dir or NvidiaDriverLibs.detect_driver_lib_dir()
         self.http_proxy = http_proxy
+        self.gpu_configs = gpu_configs or []
+        self._gpu_config_map = {config.gpu_id: config for config in self.gpu_configs}
+
+    def _get_gpu_config(self, gpu: GPUInfo) -> GpuModelConfig:
+        return self._gpu_config_map.get(
+            gpu.index,
+            GpuModelConfig(gpu_id=gpu.index, model_name=self.model_name),
+        )
 
     def generate(self) -> str:
         """Generate docker-compose.yml content with YAML anchors for common config."""
@@ -508,14 +574,23 @@ class ComposeFileGenerator:
 
     def _generate_header(self) -> list[str]:
         """Generate compose file header."""
-        return [
-            f"# TEI Multi-GPU Deployment",
-            f"# Model: {self.model_name}",
-            f"# GPUs: {[g.index for g in self.gpus]}",
-            f"",
-            f"name: {self.project_name}",
-            f"",
-        ]
+        lines = [f"# TEI Multi-GPU Deployment"]
+        if self._gpu_config_map:
+            lines.append("# Per-GPU configs:")
+            for gpu in self.gpus:
+                config = self._get_gpu_config(gpu)
+                lines.append(f"#   GPU {config.gpu_id}: {config.label}")
+        else:
+            lines.append(f"# Model: {self.model_name}")
+        lines.extend(
+            [
+                f"# GPUs: {[g.index for g in self.gpus]}",
+                f"",
+                f"name: {self.project_name}",
+                f"",
+            ]
+        )
+        return lines
 
     def _generate_common_config(self) -> list[str]:
         """Generate common configuration as YAML anchor."""
@@ -568,6 +643,7 @@ class ComposeFileGenerator:
         - nvidia-runtime: Uses Docker GPU reservation (requires nvidia-container-runtime)
         - manual: Manually mounts device nodes (bypasses nvidia-container-cli NVML detection)
         """
+        gpu_config = self._get_gpu_config(gpu)
         service_port = self.port + gpu.index
         container_name = f"{self.project_name}--gpu{gpu.index}"
 
@@ -634,7 +710,7 @@ class ComposeFileGenerator:
                 f"      - --huggingface-hub-cache",
                 f"      - /root/{self.cache_hf_hub}",
                 f"      - --model-id",
-                f"      - {self.model_name}",
+                f"      - {gpu_config.model_name}",
             ]
         )
         if self.hf_token:
@@ -703,18 +779,31 @@ class TEIComposer:
         compose_dir: Optional[Path] = None,
         mount_mode: str = DEVICE_MOUNT_MODE,
         http_proxy: Optional[str] = None,
+        gpu_configs: list[GpuModelConfig] | None = None,
     ):
-        self.model_name = model_name
+        self.gpu_configs = gpu_configs or []
+        configured_model_names = {
+            config.model_name for config in self.gpu_configs if config.model_name
+        }
+        resolved_model_name = (model_name or MODEL_NAME).strip() or MODEL_NAME
+        if len(configured_model_names) == 1:
+            resolved_model_name = next(iter(configured_model_names))
+        self.model_name = resolved_model_name
         self.port = port
-        self.gpu_ids = gpu_ids
+        self.gpu_ids = infer_gpu_ids(gpu_ids, self.gpu_configs)
         self.hf_token = hf_token
         self.mount_mode = mount_mode
         self.http_proxy = http_proxy
 
         # project name must match: '^[a-z0-9][a-z0-9_-]*$'
-        project_dash = model_name.replace("/", "--").lower()
-        project_dash = re.sub(r"[^a-z0-9_-]", "_", project_dash)
-        self.project_name = project_name or f"tei--{project_dash}"
+        if project_name:
+            self.project_name = project_name
+        elif len(configured_model_names) > 1:
+            self.project_name = "tei-multi"
+        else:
+            project_dash = self.model_name.replace("/", "--").lower()
+            project_dash = re.sub(r"[^a-z0-9_-]", "_", project_dash)
+            self.project_name = f"tei--{project_dash}"
 
         # Compose file location (default to configs directory)
         if compose_dir:
@@ -726,7 +815,7 @@ class TEIComposer:
         self.compose_file = self.compose_dir / f"{self.project_name}.yml"
 
         # Components
-        self.gpus = GPUDetector.detect(gpu_ids)
+        self.gpus = GPUDetector.detect(self.gpu_ids)
         self.model_config_manager = ModelConfigManager()
         self.image_manager = DockerImageManager()
 
@@ -762,11 +851,22 @@ class TEIComposer:
             hf_token=self.hf_token,
             mount_mode=self.mount_mode,
             http_proxy=self.http_proxy,
+            gpu_configs=self.gpu_configs,
         )
         content = compose_generator.generate()
         self.compose_file.write_text(content)
         logger.okay(f"[tfmx] Generated: {self.compose_file}")
         return self.compose_file
+
+    def _configured_model_names(self) -> list[str]:
+        if not self.gpu_configs:
+            return [self.model_name]
+
+        names: list[str] = []
+        for config in self.gpu_configs:
+            if config.model_name and config.model_name not in names:
+                names.append(config.model_name)
+        return names or [self.model_name]
 
     def get_backend_endpoints(self) -> list[str]:
         return [f"http://localhost:{self.port + gpu.index}" for gpu in self.gpus]
@@ -862,9 +962,13 @@ class TEIComposer:
         logger.mesg(
             f"[tfmx] GPUs: {[f'{g.index}(cap={g.compute_cap})' for g in self.gpus]}"
         )
+        if self.gpu_configs:
+            for config in self.gpu_configs:
+                logger.mesg(f"[tfmx]   GPU {config.gpu_id}: {config.label}")
 
         # Patch config files (if cache exists and is accessible)
-        self.model_config_manager.patch_config_files(self.model_name)
+        for configured_model_name in self._configured_model_names():
+            self.model_config_manager.patch_config_files(configured_model_name)
 
         # Ensure images are available
         images = set(g.image for g in self.gpus)
@@ -1194,6 +1298,12 @@ def _add_common_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="Comma-separated GPU IDs (default: all healthy GPUs)",
     )
+    parser.add_argument(
+        "--gpu-configs",
+        type=str,
+        default=None,
+        help='Per-GPU config: "GPU[:MODEL],..."',
+    )
 
 
 def _add_deployment_arguments(parser: argparse.ArgumentParser) -> None:
@@ -1268,6 +1378,9 @@ def _composer_from_args(args: argparse.Namespace) -> TEIComposer:
         "mount_mode": getattr(args, "mount_mode", DEVICE_MOUNT_MODE),
         "http_proxy": getattr(args, "proxy", None),
     }
+    gpu_configs = getattr(args, "gpu_configs", None)
+    if gpu_configs:
+        composer_kwargs["gpu_configs"] = parse_gpu_configs(gpu_configs)
     return TEIComposer(**composer_kwargs)
 
 

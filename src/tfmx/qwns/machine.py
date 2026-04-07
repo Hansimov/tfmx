@@ -20,10 +20,11 @@ from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from pathlib import Path
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
-from typing import Literal, Optional, Union
+from typing import Callable, Literal, Optional, Union
 from webu import setup_swagger_ui
 
 from ..utils.service_bootstrap import ensure_backend_instances
+from ..utils.service_bootstrap import handle_port_conflicts
 from .compose import GPU_LAYOUT_UNIFORM_AWQ, MACHINE_PORT
 from .compose import MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
 from .compose import MODEL_NAME as COMPOSE_MODEL_NAME
@@ -55,6 +56,7 @@ INSTANCE_ACQUIRE_TIMEOUT_SEC = 5.0
 SCHEDULER_ALGORITHM = "adaptive_pressure_v2"
 BACKEND_STARTUP_TIMEOUT_SEC = 300.0
 BACKEND_STARTUP_POLL_INTERVAL_SEC = 5.0
+BACKEND_DISCOVERY_SETTLE_SEC = 10.0
 
 
 class TextContent(BaseModel):
@@ -477,10 +479,12 @@ class QWNMachineServer:
         instances: list[QWNInstance],
         port: int = PORT,
         timeout: float = 120.0,
+        discover_instances_fn: Callable[[], list[QWNInstance]] | None = None,
     ):
         self.instances = instances
         self.port = port
         self.timeout = timeout
+        self._discover_instances_fn = discover_instances_fn
         self.stats = QWNStatsData()
         self._client: Optional[httpx.AsyncClient] = None
         self._health_task: Optional[asyncio.Task] = None
@@ -524,6 +528,70 @@ class QWNMachineServer:
 
     def get_healthy_instances(self) -> list[QWNInstance]:
         return [instance for instance in self.instances if instance.healthy]
+
+    @staticmethod
+    def _instance_identity(instance: QWNInstance) -> str:
+        return instance.container_name or instance.endpoint
+
+    @staticmethod
+    def _instance_sort_key(instance: QWNInstance) -> tuple[int, str]:
+        return (
+            instance.gpu_id if instance.gpu_id is not None else 999,
+            instance.container_name,
+        )
+
+    def _merge_discovered_instances(
+        self,
+        discovered: list[QWNInstance],
+    ) -> tuple[bool, list[QWNInstance]]:
+        existing_by_identity = {
+            self._instance_identity(instance): instance for instance in self.instances
+        }
+        changed = False
+        added_instances: list[QWNInstance] = []
+
+        for discovered_instance in discovered:
+            identity = self._instance_identity(discovered_instance)
+            existing = existing_by_identity.get(identity)
+            if existing is None:
+                self.instances.append(discovered_instance)
+                existing_by_identity[identity] = discovered_instance
+                added_instances.append(discovered_instance)
+                changed = True
+                continue
+
+            if (
+                existing.host != discovered_instance.host
+                or existing.port != discovered_instance.port
+                or existing.gpu_id != discovered_instance.gpu_id
+            ):
+                existing.host = discovered_instance.host
+                existing.port = discovered_instance.port
+                existing.gpu_id = discovered_instance.gpu_id
+                changed = True
+
+        if changed:
+            self.instances.sort(key=self._instance_sort_key)
+        return changed, added_instances
+
+    async def _refresh_instances_from_discovery(self) -> None:
+        if self._discover_instances_fn is None:
+            return
+
+        discovered = await asyncio.to_thread(self._discover_instances_fn)
+        if not discovered:
+            return
+
+        changed, added_instances = self._merge_discovered_instances(discovered)
+        if not changed:
+            return
+
+        for instance in added_instances:
+            logger.okay(
+                f"[qwn_machine] Added backend instance: {instance.container_name} @ {instance.endpoint}"
+            )
+        self._build_router()
+        await self._notify_capacity_changed()
 
     def _ensure_scheduler_primitives(self) -> None:
         if self._capacity_cond is None:
@@ -926,6 +994,7 @@ class QWNMachineServer:
             await self.health_check_all()
 
     async def health_check_all(self) -> None:
+        await self._refresh_instances_from_discovery()
         if self._client is None:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(5.0))
         await asyncio.gather(
@@ -2166,6 +2235,15 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "-b", "--background", action="store_true", help="Run as background daemon"
     )
     parser.add_argument(
+        "--on-conflict",
+        choices=["report", "replace"],
+        default="report",
+        help=(
+            "How to handle an existing qwn machine listener or daemon: "
+            "report the conflict or replace it"
+        ),
+    )
+    parser.add_argument(
         "--auto-start",
         action="store_true",
         help=(
@@ -2231,7 +2309,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "--compose-gpu-configs",
         type=str,
         default=None,
-        help='Per-GPU config for auto-started backends: "GPU:MODEL[:QUANT],..."',
+        help='Per-GPU config for auto-started backends: "GPU[:MODEL[:QUANT]],..."',
     )
     parser.add_argument(
         "-f", "--follow", action="store_true", help="Follow logs in real time"
@@ -2285,6 +2363,8 @@ def discover_instances(args: argparse.Namespace) -> list[QWNInstance]:
             "startup_poll_interval",
             BACKEND_STARTUP_POLL_INTERVAL_SEC,
         ),
+        allow_partial=True,
+        settle_sec=BACKEND_DISCOVERY_SETTLE_SEC,
     )
     logger.okay(f"[qwn_machine] Discovered {len(instances)} QWN instances")
     return instances
@@ -2354,6 +2434,12 @@ def run_from_args(args: argparse.Namespace) -> None:
         return
     if args.action == "restart":
         daemon.stop()
+        if not handle_port_conflicts(
+            args.port,
+            policy="replace",
+            label="[qwn_machine]",
+        ):
+            return
         argv = [arg if arg != "restart" else "run" for arg in sys.argv]
         if "-b" not in argv and "--background" not in argv:
             argv.append("-b")
@@ -2377,11 +2463,28 @@ def run_from_args(args: argparse.Namespace) -> None:
 
         if args.background:
             if daemon.is_running():
-                logger.warn(
-                    f"[qwn_machine] Daemon already running (PID {daemon.get_pid()}). Use 'restart' to replace it."
-                )
+                if getattr(args, "on_conflict", "report") == "report":
+                    logger.warn(
+                        f"[qwn_machine] Daemon already running (PID {daemon.get_pid()}). Use 'restart' or '--on-conflict replace' to replace it."
+                    )
+                    return
+                logger.warn("[qwn_machine] Replacing existing daemon before restart")
+                if not daemon.stop():
+                    return
+            if not handle_port_conflicts(
+                args.port,
+                policy=getattr(args, "on_conflict", "report"),
+                label="[qwn_machine]",
+            ):
                 return
             daemon.start_background(sys.argv)
+            return
+
+        if not handle_port_conflicts(
+            args.port,
+            policy=getattr(args, "on_conflict", "report"),
+            label="[qwn_machine]",
+        ):
             return
 
         is_daemon = os.environ.get("_QWN_MACHINE_DAEMON") == "1"
@@ -2389,7 +2492,14 @@ def run_from_args(args: argparse.Namespace) -> None:
             daemon.write_pid()
 
         server = QWNMachineServer(
-            instances=instances, port=args.port, timeout=args.timeout
+            instances=instances,
+            port=args.port,
+            timeout=args.timeout,
+            discover_instances_fn=(
+                None
+                if args.endpoints
+                else lambda: _discover_instances_from_docker(args.name_pattern)
+            ),
         )
         try:
             server.run()

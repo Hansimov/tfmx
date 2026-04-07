@@ -10,6 +10,12 @@ class TestQwnCliParser:
         assert args.command == "compose"
         assert args.compose_action == "up"
 
+    def test_compose_parse_gpu_only_configs(self):
+        parser = build_parser()
+        args = parser.parse_args(["compose", "up", "--gpu-configs", "0,1"])
+        assert args.command == "compose"
+        assert args.gpu_configs == "0,1"
+
     def test_compose_layout_parse(self):
         parser = build_parser()
         args = parser.parse_args(["compose", "up", "--gpu-layout", "uniform-awq"])
@@ -22,6 +28,13 @@ class TestQwnCliParser:
         assert args.command == "machine"
         assert args.action == "run"
         assert args.background is True
+
+    def test_machine_parse_on_conflict(self):
+        parser = build_parser()
+        args = parser.parse_args(["machine", "run", "--on-conflict", "replace"])
+        assert args.command == "machine"
+        assert args.action == "run"
+        assert args.on_conflict == "replace"
 
     def test_client_parse(self):
         parser = build_parser()

@@ -294,17 +294,29 @@ def parse_gpu_configs(config_str: str) -> list[GpuModelConfig]:
         part = raw_part.strip()
         if not part:
             continue
-        fields = [field.strip() for field in part.split(":") if field.strip()]
-        if len(fields) < 2:
-            raise ValueError(f"Invalid config: '{part}'. Format: GPU_ID:MODEL[:QUANT]")
+        fields = [field.strip() for field in part.split(":")]
+        if not fields or not fields[0]:
+            raise ValueError(
+                f"Invalid config: '{part}'. Format: GPU_ID[:MODEL[:QUANT]]"
+            )
+        if len(fields) > 3:
+            raise ValueError(
+                f"Invalid config: '{part}'. Format: GPU_ID[:MODEL[:QUANT]]"
+            )
 
         gpu_id = int(fields[0])
         if gpu_id in seen_gpu_ids:
             raise ValueError(f"Duplicate GPU ID in config: '{gpu_id}'")
         seen_gpu_ids.add(gpu_id)
-        model_name = resolve_model_name(fields[1])
+        model_name = (
+            resolve_model_name(fields[1])
+            if len(fields) > 1 and fields[1]
+            else MODEL_NAME
+        )
         quant_level = (
-            resolve_quant_level(fields[2]) if len(fields) > 2 else DEFAULT_QUANT_LEVEL
+            resolve_quant_level(fields[2])
+            if len(fields) > 2 and fields[2]
+            else DEFAULT_QUANT_LEVEL
         )
         quant_method = "awq" if quant_level in AWQ_QUANT_LEVELS else "none"
         configs.append(
@@ -1257,6 +1269,7 @@ Examples:
   qwn compose up
   qwn compose up -g 0,1
     qwn compose up --gpu-layout uniform-awq
+    qwn compose up --gpu-configs "0,1"
   qwn compose up --gpu-configs "0:4b:4bit,1:4b:4bit"
   qwn compose generate -j qwn-awq --gpu-configs "0:4b:4bit"
   qwn compose logs -f
@@ -1337,7 +1350,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             "--gpu-configs",
             type=str,
             default=None,
-            help='Per-GPU config: "GPU:MODEL[:QUANT],..."',
+            help='Per-GPU config: "GPU[:MODEL[:QUANT]],..."',
         )
         target.add_argument(
             "--gpu-layout",

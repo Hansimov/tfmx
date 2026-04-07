@@ -83,7 +83,7 @@ export QWN_MACHINE_URL="http://$QWN_HOST:27800"
 export QWN_BACKEND_URL="http://$QWN_BACKEND_HOST:27880"
 ```
 
-1. `qwn machine run --auto-start -b`
+1. `qwn machine run --auto-start -b --on-conflict replace`
 2. 如果需要精确 GPU 布局，再改为手动执行 `qwn compose up ...` 后配合 `qwn machine run -b`
 3. 等待 vLLM 完成加载与 warmup
 4. `qwn client health`
@@ -131,6 +131,7 @@ export QWN_BACKEND_URL="http://$QWN_BACKEND_HOST:27880"
 ## 突发实例故障与 failover
 
 - `qwn machine` 现在在请求转发层支持受控 failover：若实例在健康检查间隙里突然断连、超时，或在响应开始前返回 `5xx`，代理会立刻把它标记为不健康，并尝试切到其他健康实例
+- 如果某张 GPU 在启动期间掉卡或对应后端一直起不来，`qwn machine` 不会再因为等待所有理论实例都健康而卡死；它会先跳过坏实例，用已经恢复的健康实例对外服务
 - 若流式响应已经开始输出，就不会再切到另一台实例，避免把两台实例的 token 流混在一起；此时会直接把错误回给客户端
 - `qwn client info` 的 `stats` 里现在会包含 `total_failovers`，用于观察运行期到底发生了多少次实例级切换
 
@@ -152,6 +153,7 @@ export QWN_BACKEND_URL="http://$QWN_BACKEND_HOST:27880"
 
 - 先看 `qwn machine status`
 - 再看 `qwn machine logs`
+- 若只是旧 machine 或其他进程占住了 `27800`，可直接使用 `qwn machine run -b --on-conflict replace`
 - 只有在确认进程已死的前提下，才手动删除：
   - `~/.cache/tfmx/qwn_machine.pid`
   - `~/.cache/tfmx/qwn_machine.log`
@@ -160,6 +162,7 @@ export QWN_BACKEND_URL="http://$QWN_BACKEND_HOST:27880"
 
 - 先确认容器是否仍在加载模型
 - 查看 `qwn compose logs -f`
+- 若宿主机 `nvidia-smi -L` 已经报 `Unable to determine the device handle ... Unknown Error`，说明问题在 GPU/驱动层；此时 machine 层 failover 和冲突处理仍可工作，但无法把坏掉的后端重新拉健康
 - 直接访问后端：
 
 ```bash

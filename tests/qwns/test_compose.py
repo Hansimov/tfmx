@@ -69,6 +69,11 @@ class TestGpuModelConfig:
 
 
 class TestParseGpuConfigs:
+    def test_parse_gpu_only_config_uses_defaults(self):
+        configs = parse_gpu_configs("0,2")
+        assert [config.gpu_id for config in configs] == [0, 2]
+        assert [config.label for config in configs] == ["4b:4bit", "4b:4bit"]
+
     def test_parse_single_config(self):
         configs = parse_gpu_configs("0:4b:4bit")
         assert len(configs) == 1

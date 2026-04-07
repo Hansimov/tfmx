@@ -41,7 +41,7 @@ Set GPU monitor with curve:
 Run tei compose and machine:
 
 ```sh
-tei machine run --auto-start --perf-track
+tei machine run --auto-start --perf-track --on-conflict replace
 ```
 
 Run tei benchmark:
@@ -55,9 +55,9 @@ Run qwn compose, machine, and benchmark:
 ```sh
 export QWN_MACHINE_URL="http://$QWN_HOST:27800"
 
-qwn compose up --gpu-configs "0:4b:4bit"
+qwn compose up --gpu-configs "0"
 qwn compose up --gpu-layout uniform-awq
-qwn machine run --auto-start -b
+qwn machine run --auto-start -b --on-conflict replace
 qwn client chat "你好，请做个自我介绍"
 qwn benchmark run -E "$QWN_MACHINE_URL" -n 100
 ```

@@ -1,5 +1,6 @@
 from .compose import TEIComposer, TEIComposeArgParser
 from .compose import GPUInfo, GPUDetector
+from .compose import GpuModelConfig, infer_gpu_ids, parse_gpu_configs
 from .compose import ModelConfigManager, DockerImageManager, ComposeFileGenerator
 from .client import TEIClient, AsyncTEIClient, TEIClientArgParser
 from .client import HealthResponse, InfoResponse, InstanceInfo, MachineStats
