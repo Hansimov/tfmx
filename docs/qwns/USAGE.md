@@ -47,6 +47,7 @@ qwn machine run
 qwn machine run --auto-start
 qwn machine run --auto-start -b
 qwn machine run --auto-start -b --on-conflict replace
+qwn machine run --auto-start -b --compose-gpus "0,2,3,4,5" --on-conflict replace
 qwn machine run -b
 qwn machine run -e "$QWN_BACKEND_EPS"
 qwn machine discover
@@ -59,7 +60,9 @@ qwn machine restart
 
 - `qwn machine` 默认监听 `0.0.0.0:27800`，因此同局域网其他机器可以直接访问这台宿主机的 LAN IP
 - `qwn machine run --auto-start` 会在没有运行中的 QWN 后端时自动调用 `qwn compose up`；如果启动过程中只有部分 GPU 后端恢复健康，代理会继续带着这部分健康实例启动，而不是被单张掉卡阻塞
+- 如果你当前只想让 `qwn machine` 自动拉起 GPU `0/2/3/4/5` 上的实例，可直接使用 `qwn machine run --auto-start -b --compose-gpus "0,2,3,4,5" --on-conflict replace`
 - 如果你需要精确控制 GPU 布局、模型或量化配置，优先手动执行 `qwn compose up ...`；`--auto-start` 更适合默认单模型部署
+- 如果已经有其他 QWN 后端在运行，`--compose-gpus` 只影响 auto-start 新拉起的后端；这时应先手动执行 `qwn compose up --gpu-layout uniform-awq -g "0,2,3,4,5"`，再运行 `qwn machine run -b --on-conflict replace`
 - `--on-conflict report|replace` 用于控制当 `27800` 端口或旧 daemon 已存在时的行为；`replace` 会先停止旧 daemon 或占用端口的旧进程，再启动新的 machine
 - 对 OpenAI 兼容客户端，推荐把 base URL 指到 `http://<host>:27800`，实际请求路径使用 `/v1/chat/completions`
 - 当前代理也会兼容一部分旧的 thinking 扩展字段写法：若客户端发送顶层 `thinking` 或 `enable_thinking`，代理会自动归一化为 Qwen3.5/vLLM 需要的 `chat_template_kwargs.enable_thinking`

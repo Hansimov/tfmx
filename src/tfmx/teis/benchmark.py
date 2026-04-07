@@ -22,7 +22,7 @@ Usage:
     # Verbose with results saved
     tei benchmark run -E "$TEI_EPS" -v -o results.json
 
-See TEI.md for detailed usage guide.
+See docs/teis/USAGE.md for detailed usage guide.
 """
 
 # ANCHOR[id=benchmark-clis]
