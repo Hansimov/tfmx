@@ -3,7 +3,7 @@
 from dataclasses import dataclass
 
 from .compose import AWQ_QUANT_LEVELS
-from .compose import get_model_shortcut, normalize_model_key
+from .compose import get_model_shortcut, normalize_model_key, resolve_model_name
 
 
 @dataclass
@@ -30,9 +30,17 @@ class InstanceDescriptor:
     def matches(self, model: str = "", quant: str = "") -> bool:
         if model:
             requested = normalize_model_key(model)
+            requested_shortcut = normalize_model_key(
+                get_model_shortcut(resolve_model_name(model))
+            )
+            requested_model_name = normalize_model_key(resolve_model_name(model))
             model_name = normalize_model_key(self.model_name)
             model_shortcut = normalize_model_key(self.model_shortcut)
-            if requested not in {model_name, model_shortcut}:
+            if not {
+                requested,
+                requested_shortcut,
+                requested_model_name,
+            }.intersection({model_name, model_shortcut}):
                 return False
 
         if quant and normalize_model_key(quant) != normalize_model_key(

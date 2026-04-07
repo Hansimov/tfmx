@@ -24,7 +24,8 @@ from typing import Literal, Optional, Union
 from webu import setup_swagger_ui
 
 from .compose import MACHINE_PORT, MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
-from .compose import get_display_shortcut, get_model_shortcut, normalize_model_key
+from .compose import get_display_shortcut, get_model_api_aliases
+from .compose import get_model_shortcut, normalize_model_key
 from .gpu_runtime import GPURuntimeStats, query_gpu_runtime_stats
 from .router import InstanceDescriptor, QWNRouter, parse_model_spec
 from .adaptive_routing import DEFAULT_FAILURE_COOLDOWN_SEC
@@ -1017,6 +1018,17 @@ class QWNMachineServer:
             return f"{display}:{instance.quant_level}"
         return display or instance.model_name
 
+    def _get_public_model_ids(self, instance: QWNInstance) -> list[str]:
+        public_ids: list[str] = []
+        for alias in get_model_api_aliases(instance.model_name, instance.quant_level):
+            if alias and alias not in public_ids:
+                public_ids.append(alias)
+
+        label = self._get_model_label(instance)
+        if label and label not in public_ids:
+            public_ids.append(label)
+        return public_ids
+
     async def health(self) -> HealthResponse:
         healthy_instances = self.get_healthy_instances()
         payload = HealthResponse(
@@ -1055,11 +1067,12 @@ class QWNMachineServer:
         for instance in self.instances:
             if not instance.healthy:
                 continue
-            label = self._get_model_label(instance)
-            if label and label not in seen:
-                seen.add(label)
+            for model_id in self._get_public_model_ids(instance):
+                if model_id in seen:
+                    continue
+                seen.add(model_id)
                 data.append(
-                    ModelInfo(id=label, created=created, owned_by="qwn-machine")
+                    ModelInfo(id=model_id, created=created, owned_by="qwn-machine")
                 )
         return ModelsResponse(data=data)
 
@@ -1213,6 +1226,11 @@ class QWNMachineServer:
                             normalized_enable_thinking = True
                         elif thinking_type in {"disabled", "disable", "false", "off"}:
                             normalized_enable_thinking = False
+
+                # OpenAI-compatible clients rarely know Qwen's thinking toggle.
+                # Default to non-thinking mode unless the caller opts in.
+                if normalized_enable_thinking is None:
+                    normalized_enable_thinking = False
 
                 if normalized_enable_thinking is not None:
                     chat_template_kwargs["enable_thinking"] = normalized_enable_thinking

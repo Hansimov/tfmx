@@ -71,6 +71,8 @@ MODEL_SHORTCUTS = {
 MODEL_ALIASES = {
     "4b-awq": "4b",
     "qwen3.5": "4b",
+    "qwen3.5-4b-awq": "4b",
+    "qwen3.5-4b-awq-4bit": "4b",
     "default": "4b",
 }
 
@@ -186,6 +188,23 @@ def get_display_shortcut(shortcut: str) -> str:
     if normalized in MODEL_ALIASES:
         normalized = MODEL_ALIASES[normalized]
     return DISPLAY_SHORTCUTS.get(normalized, shortcut)
+
+
+def get_model_api_aliases(model_name: str, quant_level: str = "") -> list[str]:
+    shortcut = normalize_model_key(get_model_shortcut(model_name))
+    quant = normalize_model_key(quant_level)
+
+    aliases: list[str] = []
+    if shortcut == "4b":
+        if quant == "4bit":
+            aliases.append("qwen3.5-4b-awq-4bit")
+        aliases.append("qwen3.5-4b")
+
+    deduped: list[str] = []
+    for alias in aliases:
+        if alias and alias not in deduped:
+            deduped.append(alias)
+    return deduped
 
 
 @dataclass

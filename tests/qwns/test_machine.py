@@ -193,6 +193,42 @@ class TestQWNMachineServer:
         assert payload["chat_template_kwargs"]["enable_thinking"] is False
         assert "thinking" not in payload
 
+    def test_rewrite_model_in_body_defaults_thinking_to_disabled(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            model_name="4b:4bit",
+            quant_level="4bit",
+        )
+        server = QWNMachineServer(instances=[instance])
+        body = b'{"model":"qwen3.5-4b-awq-4bit","messages":[{"role":"user","content":"hello"}]}'
+
+        rewritten = server._rewrite_model_in_body(body, instance)
+        payload = orjson.loads(rewritten)
+
+        assert payload["model"] == "4b:4bit"
+        assert payload["chat_template_kwargs"]["enable_thinking"] is False
+
+    def test_alias_model_request_routes_to_existing_instance(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            gpu_id=0,
+            healthy=True,
+            model_name="4b:4bit",
+            quant_level="4bit",
+        )
+        server = QWNMachineServer(instances=[instance])
+        server._build_router()
+
+        candidates = server._get_candidate_instances("qwen3.5-4b-awq-4bit")
+
+        assert [candidate.container_name for candidate in candidates] == [
+            "qwn-multi--gpu0"
+        ]
+
     def test_blank_model_requests_use_stable_default_model(self):
         default_a = QWNInstance(
             container_name="qwn-multi--gpu0",
@@ -361,11 +397,16 @@ class TestQWNMachineServer:
             port=27880,
             healthy=True,
             model_name="4b:4bit",
+            quant_level="4bit",
         )
         server = QWNMachineServer(instances=[instance])
         result = asyncio.run(server.models())
         assert isinstance(result, ModelsResponse)
-        assert result.data[0].id == "4b:4bit"
+        assert [item.id for item in result.data] == [
+            "qwen3.5-4b-awq-4bit",
+            "qwen3.5-4b",
+            "4b:4bit",
+        ]
 
     def test_check_instance_health_uses_short_timeout(self):
         instance = QWNInstance(
