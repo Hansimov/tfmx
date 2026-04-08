@@ -5,7 +5,7 @@ import httpx
 import orjson
 
 from argparse import Namespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import numpy as np
 
@@ -86,6 +86,22 @@ class TestTEIMachineAutoStart:
             "tei--gpu1"
         ]
         assert [instance.gpu_id for instance in server.instances] == [0, 1]
+
+    def test_machine_server_uses_docker_health_without_http(self):
+        instance = TEIInstance(
+            container_name="tei--gpu0",
+            host="localhost",
+            port=28880,
+            gpu_id=0,
+            healthy=False,
+            docker_health=True,
+            docker_status="Up 5 seconds (healthy)",
+        )
+        server = TEIMachineServer(instances=[instance], port=28800, timeout=1.0)
+        server._client = AsyncMock()
+
+        assert asyncio.run(server._check_instance_health(instance)) is True
+        server._client.get.assert_not_called()
 
     def test_run_embeddings_with_failover_retries_after_runtime_failure(self):
         first = TEIInstance(

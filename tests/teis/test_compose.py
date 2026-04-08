@@ -5,9 +5,11 @@ from unittest.mock import patch
 
 import pytest
 
+from tests.proxy_test_values import PLACEHOLDER_HOST_PROXY_URL
 from tfmx.teis.compose import ComposeFileGenerator
 from tfmx.teis.compose import GPUInfo
 from tfmx.teis.compose import GpuModelConfig
+from tfmx.teis.compose import HEALTHCHECK_TCP_PROBE_TEMPLATE
 from tfmx.teis.compose import MODEL_NAME
 from tfmx.teis.compose import SERVER_PORT
 from tfmx.teis.compose import TEIComposer
@@ -60,6 +62,23 @@ class TestComposeFileGenerator:
         assert "CUDA_VISIBLE_DEVICES=0" in compose_text
         assert "NVIDIA_VISIBLE_DEVICES=0" in compose_text
         assert "    environment:" not in compose_text
+        assert "CMD-SHELL" in compose_text
+        assert HEALTHCHECK_TCP_PROBE_TEMPLATE.format(port=80) in compose_text
+
+    def test_generate_host_mode_healthcheck_uses_bound_port(self):
+        generator = ComposeFileGenerator(
+            gpus=[GPUInfo(index=0, compute_cap="8.6")],
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name="tei-test",
+            data_dir=Path("/tmp/tei-test"),
+            http_proxy=PLACEHOLDER_HOST_PROXY_URL,
+        )
+
+        compose_text = generator.generate()
+
+        assert "network_mode: host" in compose_text
+        assert HEALTHCHECK_TCP_PROBE_TEMPLATE.format(port=SERVER_PORT) in compose_text
 
 
 class TestTEIComposer:
@@ -71,3 +90,22 @@ class TestTEIComposer:
 
         mock_detect.assert_called_once_with("0")
         assert composer.gpu_ids == "0"
+
+    @patch("tfmx.teis.compose.wait_for_healthy_docker_containers", return_value=True)
+    @patch("tfmx.teis.compose.GPUDetector.detect")
+    def test_wait_for_healthy_backends_uses_docker_health(
+        self,
+        mock_detect,
+        mock_wait,
+    ):
+        mock_detect.return_value = [GPUInfo(index=0, compute_cap="8.6")]
+
+        composer = TEIComposer(project_name="tei-test")
+
+        assert composer.wait_for_healthy_backends(label="[test]") is True
+        mock_wait.assert_called_once_with(
+            ["tei-test--gpu0"],
+            timeout_sec=300.0,
+            poll_interval_sec=5.0,
+            label="[test]",
+        )

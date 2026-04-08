@@ -4,6 +4,8 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 from tfmx.utils.service_bootstrap import PortConflict
+from tfmx.utils.service_bootstrap import docker_status_to_health
+from tfmx.utils.service_bootstrap import wait_for_healthy_docker_containers
 from tfmx.utils.service_bootstrap import handle_port_conflicts
 from tfmx.utils.service_bootstrap import wait_for_available_backend_instances
 
@@ -58,6 +60,64 @@ class TestWaitForAvailableBackendInstances:
         assert returned == instances
         assert instances[0].healthy is True
         assert instances[1].healthy is False
+
+    @patch("tfmx.utils.service_bootstrap.time.monotonic", side_effect=[0.0] * 6)
+    def test_prefers_docker_health_metadata_when_available(self, _mock_monotonic):
+        instances = [
+            SimpleNamespace(
+                endpoint="http://localhost:27880",
+                health_url="http://localhost:27880/health",
+                healthy=False,
+                docker_health=True,
+            ),
+        ]
+
+        returned = wait_for_available_backend_instances(
+            lambda: instances,
+            timeout_sec=1.0,
+            poll_interval_sec=1.0,
+            settle_sec=0.0,
+            label="[test]",
+        )
+
+        assert returned == instances
+        assert instances[0].healthy is True
+
+
+class TestDockerHealthHelpers:
+    def test_docker_status_to_health(self):
+        assert docker_status_to_health("Up 10 seconds (healthy)") is True
+        assert docker_status_to_health("Up 5 seconds (health: starting)") is False
+        assert docker_status_to_health("Exited (1) 2 seconds ago") is False
+        assert docker_status_to_health("Up 1 minute") is None
+
+    @patch("tfmx.utils.service_bootstrap.time.sleep", return_value=None)
+    @patch(
+        "tfmx.utils.service_bootstrap.get_docker_container_statuses",
+        side_effect=[
+            {"qwn--gpu0": "Up 2 seconds (health: starting)"},
+            {"qwn--gpu0": "Up 8 seconds (healthy)"},
+        ],
+    )
+    @patch(
+        "tfmx.utils.service_bootstrap.time.monotonic",
+        side_effect=[0.0, 0.0, 1.0, 1.0],
+    )
+    def test_wait_for_healthy_docker_containers(
+        self,
+        _mock_monotonic,
+        _mock_statuses,
+        _mock_sleep,
+    ):
+        assert (
+            wait_for_healthy_docker_containers(
+                ["qwn--gpu0"],
+                timeout_sec=10.0,
+                poll_interval_sec=1.0,
+                label="[test]",
+            )
+            is True
+        )
 
 
 class TestHandlePortConflicts:

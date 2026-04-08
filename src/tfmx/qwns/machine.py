@@ -23,12 +23,14 @@ from tclogger import logger, logstr
 from typing import Callable, Literal, Optional, Union
 from webu import setup_swagger_ui
 
+from ..utils.service_bootstrap import docker_status_to_health
 from ..utils.service_bootstrap import ensure_backend_instances
 from ..utils.service_bootstrap import handle_port_conflicts
 from .compose import GPU_LAYOUT_UNIFORM_AWQ, MACHINE_PORT
 from .compose import MAX_CONCURRENT_REQUESTS, MAX_MODEL_LEN
 from .compose import MODEL_NAME as COMPOSE_MODEL_NAME
 from .compose import QWNComposer, SERVER_PORT as COMPOSE_SERVER_PORT
+from .compose import get_backend_sleep_state
 from .compose import get_display_shortcut, get_model_api_aliases
 from .compose import get_model_shortcut, normalize_model_key, parse_gpu_configs
 from .gpu_runtime import GPURuntimeStats, query_gpu_runtime_stats
@@ -242,6 +244,8 @@ class QWNInstance:
     healthy: bool = False
     sleeping: bool = False
     sleep_mode_supported: Optional[bool] = None
+    docker_status: str = ""
+    docker_health: bool | None = None
     _active_requests: int = 0
     model_name: str = ""
     quant_method: str = ""
@@ -333,6 +337,24 @@ class QWNInstance:
         )
 
 
+def _apply_qwn_docker_health(instance: QWNInstance) -> bool | None:
+    if instance.docker_health is None:
+        return None
+
+    instance._latency_ms = 0.0
+    if not instance.docker_health:
+        instance.healthy = False
+        instance.sleeping = False
+        return False
+
+    sleeping_state = get_backend_sleep_state(instance.endpoint)
+    instance.sleeping = bool(sleeping_state)
+    if instance.sleeping:
+        instance.sleep_mode_supported = True
+    instance.healthy = not instance.sleeping
+    return instance.healthy
+
+
 @dataclass
 class QWNStatsData:
     total_requests: int = 0
@@ -379,7 +401,7 @@ class QWNInstanceDiscovery:
     def discover(name_pattern: Optional[str] = None) -> list[QWNInstance]:
         try:
             result = subprocess.run(
-                "docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}'",
+                "docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}|{{.Status}}'",
                 shell=True,
                 capture_output=True,
                 text=True,
@@ -399,6 +421,7 @@ class QWNInstanceDiscovery:
                 if len(parts) < 3:
                     continue
                 container_name, image, ports = parts[0], parts[1], parts[2]
+                status = parts[3].strip() if len(parts) > 3 else ""
                 if QWN_CONTAINER_IMAGE_PATTERN not in image:
                     continue
                 if not re.search(pattern, container_name):
@@ -415,6 +438,8 @@ class QWNInstanceDiscovery:
                         host="localhost",
                         port=host_port,
                         gpu_id=gpu_id,
+                        docker_status=status,
+                        docker_health=docker_status_to_health(status),
                     )
                 )
             instances.sort(
@@ -556,11 +581,13 @@ class QWNMachineServer:
         existing_by_identity = {
             self._instance_identity(instance): instance for instance in self.instances
         }
+        discovered_identities: set[str] = set()
         changed = False
         added_instances: list[QWNInstance] = []
 
         for discovered_instance in discovered:
             identity = self._instance_identity(discovered_instance)
+            discovered_identities.add(identity)
             existing = existing_by_identity.get(identity)
             if existing is None:
                 self.instances.append(discovered_instance)
@@ -573,10 +600,27 @@ class QWNMachineServer:
                 existing.host != discovered_instance.host
                 or existing.port != discovered_instance.port
                 or existing.gpu_id != discovered_instance.gpu_id
+                or existing.docker_status != discovered_instance.docker_status
+                or existing.docker_health != discovered_instance.docker_health
             ):
                 existing.host = discovered_instance.host
                 existing.port = discovered_instance.port
                 existing.gpu_id = discovered_instance.gpu_id
+                existing.docker_status = discovered_instance.docker_status
+                existing.docker_health = discovered_instance.docker_health
+                changed = True
+
+        for identity, existing in existing_by_identity.items():
+            if identity in discovered_identities:
+                continue
+            if (
+                existing.docker_status != "missing"
+                or existing.docker_health is not False
+            ):
+                existing.docker_status = "missing"
+                existing.docker_health = False
+                existing.healthy = False
+                existing.sleeping = False
                 changed = True
 
         if changed:
@@ -588,9 +632,6 @@ class QWNMachineServer:
             return
 
         discovered = await asyncio.to_thread(self._discover_instances_fn)
-        if not discovered:
-            return
-
         changed, added_instances = self._merge_discovered_instances(discovered)
         if not changed:
             return
@@ -1068,6 +1109,18 @@ class QWNMachineServer:
 
     async def _check_instance_health(self, instance: QWNInstance) -> bool:
         was_healthy = instance.healthy
+        quiet_health = _apply_qwn_docker_health(instance)
+        if quiet_health is not None:
+            became_sleeping = instance.sleeping
+            if instance.healthy and not was_healthy:
+                instance.telemetry.record_recovery()
+                await self._notify_capacity_changed()
+            elif not instance.healthy and was_healthy:
+                if not became_sleeping:
+                    instance.telemetry.record_failure("docker health check failed")
+                await self._notify_capacity_changed()
+            return instance.healthy
+
         try:
             started_at = time.perf_counter()
             response = await self._client.get(
@@ -2466,6 +2519,9 @@ def log_instances(instances: list[QWNInstance], show_health: bool = False) -> No
 async def check_health(instances: list[QWNInstance]) -> None:
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         for instance in instances:
+            quiet_health = _apply_qwn_docker_health(instance)
+            if quiet_health is not None:
+                continue
             try:
                 response = await client.get(instance.health_url)
                 instance.healthy = response.status_code == 200

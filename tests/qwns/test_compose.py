@@ -7,6 +7,8 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
+from tests.proxy_test_values import PLACEHOLDER_PROXY_URL
+from tests.proxy_test_values import build_proxy_url
 from tfmx.qwns.compose import AWQ_MODELS
 from tfmx.qwns.compose import AWQ_QUANT_LEVELS
 from tfmx.qwns.compose import CUDAGRAPH_MODE_CHOICES
@@ -21,6 +23,7 @@ from tfmx.qwns.compose import GPUInfo
 from tfmx.qwns.compose import GPU_LAYOUT_UNIFORM_AWQ
 from tfmx.qwns.compose import GpuModelConfig
 from tfmx.qwns.compose import HEALTHCHECK_INTERVAL
+from tfmx.qwns.compose import HEALTHCHECK_TCP_PROBE
 from tfmx.qwns.compose import HEALTHCHECK_START_PERIOD
 from tfmx.qwns.compose import MACHINE_PORT
 from tfmx.qwns.compose import MODEL_NAME
@@ -163,6 +166,8 @@ class TestComposeFileGenerator:
         assert "${HOME}/.cache/vllm:/root/.cache/vllm" in compose_text
         assert "--skip-mm-profiling" in compose_text
         assert "--compilation-config" not in compose_text
+        assert "CMD-SHELL" in compose_text
+        assert HEALTHCHECK_TCP_PROBE in compose_text
         assert f"interval: {HEALTHCHECK_INTERVAL}" in compose_text
         assert f"start_period: {HEALTHCHECK_START_PERIOD}" in compose_text
 
@@ -209,7 +214,7 @@ class TestComposeFileGenerator:
         assert "cudagraph_capture_sizes" not in compose_text
 
     def test_generate_single_gpu_with_local_proxy(self):
-        local_proxy = "http://localhost:" + "18080"
+        local_proxy = build_proxy_url("127.0.0.1", 18080)
         generator = ComposeFileGenerator(
             gpus=[GPUInfo(index=0, compute_cap="8.9")],
             model_name=MODEL_NAME,
@@ -229,10 +234,10 @@ class TestComposeFileGenerator:
             port=SERVER_PORT,
             project_name="qwn-test",
             data_dir=Path("/tmp/qwn-test"),
-            http_proxy="http://proxy.internal:8080",
+            http_proxy=PLACEHOLDER_PROXY_URL,
         )
         compose_text = generator.generate()
-        assert "HTTP_PROXY=http://proxy.internal:8080" in compose_text
+        assert f"HTTP_PROXY={PLACEHOLDER_PROXY_URL}" in compose_text
 
     def test_generate_single_gpu_with_network_config(self):
         generator = ComposeFileGenerator(
@@ -242,7 +247,7 @@ class TestComposeFileGenerator:
             project_name="qwn-test",
             data_dir=Path("/tmp/qwn-test"),
             network_config=QWNNetworkConfig.from_overrides(
-                proxy="http://proxy.internal:8080",
+                proxy=PLACEHOLDER_PROXY_URL,
                 hf_endpoint="https://hf-mirror.example",
                 pip_index_url="https://mirror.example/pypi/simple",
                 pip_trusted_host="mirror.example",
@@ -316,6 +321,25 @@ class TestQWNComposer:
             "4b:4bit",
             "4b:4bit",
         ]
+
+    @patch("tfmx.qwns.compose.wait_for_healthy_docker_containers", return_value=True)
+    @patch("tfmx.qwns.compose.GPUDetector.detect")
+    def test_wait_for_healthy_backends_uses_docker_health(
+        self,
+        mock_detect,
+        mock_wait,
+    ):
+        mock_detect.return_value = [GPUInfo(index=0, compute_cap="8.6")]
+
+        composer = QWNComposer(project_name="qwn-test")
+
+        assert composer.wait_for_healthy_backends(label="[test]") is True
+        mock_wait.assert_called_once_with(
+            ["qwn-test--gpu0"],
+            timeout_sec=300.0,
+            poll_interval_sec=5.0,
+            label="[test]",
+        )
 
     @patch("tfmx.qwns.compose.GPUDetector.detect")
     def test_wake_waits_for_healthy_backends(self, mock_detect):

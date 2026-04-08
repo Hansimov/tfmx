@@ -73,11 +73,12 @@ class TestQWNInstanceDiscovery:
     def test_discover(self, mock_run):
         mock_run.return_value = MagicMock(
             returncode=0,
-            stdout="qwn-multi--gpu0|vllm/vllm-openai:latest|0.0.0.0:27880->8000/tcp\n",
+            stdout="qwn-multi--gpu0|vllm/vllm-openai:latest|0.0.0.0:27880->8000/tcp|Up 3 seconds (healthy)\n",
         )
         instances = QWNInstanceDiscovery.discover()
         assert len(instances) == 1
         assert instances[0].gpu_id == 0
+        assert instances[0].docker_health is True
 
     def test_from_endpoints(self):
         instances = QWNInstanceDiscovery.from_endpoints(
@@ -444,6 +445,25 @@ class TestQWNMachineServer:
         assert asyncio.run(server._check_instance_health(instance)) is False
         assert instance.healthy is False
         assert instance.sleeping is True
+
+    @patch("tfmx.qwns.machine.get_backend_sleep_state", return_value=False)
+    def test_check_instance_health_uses_docker_health_without_http(
+        self,
+        _mock_sleep_state,
+    ):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=False,
+            docker_health=True,
+            docker_status="Up 3 seconds (healthy)",
+        )
+        server = QWNMachineServer(instances=[instance])
+        server._client = AsyncMock()
+
+        assert asyncio.run(server._check_instance_health(instance)) is True
+        server._client.get.assert_not_called()
 
     def test_discover_instance_models_uses_short_timeout(self):
         instance = QWNInstance(

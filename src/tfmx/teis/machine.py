@@ -53,6 +53,7 @@ from typing import Callable, Optional, Union
 from webu import setup_swagger_ui
 
 from ..utils.lsh import LSHConverter
+from ..utils.service_bootstrap import docker_status_to_health
 from ..utils.service_bootstrap import ensure_backend_instances
 from ..utils.service_bootstrap import handle_port_conflicts
 from .perf_tracker import PerfTracker
@@ -249,6 +250,8 @@ class TEIInstance:
     port: int
     gpu_id: Optional[int] = None
     healthy: bool = False
+    docker_status: str = ""
+    docker_health: bool | None = None
 
     @property
     def endpoint(self) -> str:
@@ -277,6 +280,13 @@ class TEIInstance:
             gpu_id=self.gpu_id,
             healthy=self.healthy,
         )
+
+
+def _apply_tei_docker_health(instance: TEIInstance) -> bool | None:
+    if instance.docker_health is None:
+        return None
+    instance.healthy = bool(instance.docker_health)
+    return instance.healthy
 
 
 @dataclass
@@ -336,11 +346,13 @@ class TEIInstanceDiscovery:
         try:
             if name_pattern:
                 # filter by user-specified name pattern
-                cmd = f"docker ps --format '{{{{.Names}}}}|{{{{.Image}}}}|{{{{.Ports}}}}' --filter 'name={name_pattern}'"
+                cmd = f"docker ps --format '{{{{.Names}}}}|{{{{.Image}}}}|{{{{.Ports}}}}|{{{{.Status}}}}' --filter 'name={name_pattern}'"
             else:
                 # get all containers and filter by image name
                 # note: 'ancestor' filter with wildcards doesn't work reliably
-                cmd = "docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}'"
+                cmd = (
+                    "docker ps --format '{{.Names}}|{{.Image}}|{{.Ports}}|{{.Status}}'"
+                )
 
             result = subprocess.run(cmd, shell=True, capture_output=True, text=True)
 
@@ -362,6 +374,7 @@ class TEIInstanceDiscovery:
                     continue
 
                 container_name, image, ports = parts[0], parts[1], parts[2]
+                status = parts[3].strip() if len(parts) > 3 else ""
 
                 # Filter by image containing TEI pattern
                 if TEI_CONTAINER_IMAGE_PATTERN not in image:
@@ -386,6 +399,8 @@ class TEIInstanceDiscovery:
                     host="localhost",
                     port=host_port,
                     gpu_id=gpu_id,
+                    docker_status=status,
+                    docker_health=docker_status_to_health(status),
                 )
                 instances.append(instance)
 
@@ -647,11 +662,13 @@ class TEIMachineServer:
         existing_by_identity = {
             self._instance_identity(instance): instance for instance in self.instances
         }
+        discovered_identities: set[str] = set()
         changed = False
         added_instances: list[TEIInstance] = []
 
         for discovered_instance in discovered:
             identity = self._instance_identity(discovered_instance)
+            discovered_identities.add(identity)
             existing = existing_by_identity.get(identity)
             if existing is None:
                 self.instances.append(discovered_instance)
@@ -664,10 +681,26 @@ class TEIMachineServer:
                 existing.host != discovered_instance.host
                 or existing.port != discovered_instance.port
                 or existing.gpu_id != discovered_instance.gpu_id
+                or existing.docker_status != discovered_instance.docker_status
+                or existing.docker_health != discovered_instance.docker_health
             ):
                 existing.host = discovered_instance.host
                 existing.port = discovered_instance.port
                 existing.gpu_id = discovered_instance.gpu_id
+                existing.docker_status = discovered_instance.docker_status
+                existing.docker_health = discovered_instance.docker_health
+                changed = True
+
+        for identity, existing in existing_by_identity.items():
+            if identity in discovered_identities:
+                continue
+            if (
+                existing.docker_status != "missing"
+                or existing.docker_health is not False
+            ):
+                existing.docker_status = "missing"
+                existing.docker_health = False
+                existing.healthy = False
                 changed = True
 
         if changed:
@@ -679,9 +712,6 @@ class TEIMachineServer:
             return
 
         discovered = await asyncio.to_thread(self._discover_instances_fn)
-        if not discovered:
-            return
-
         changed, added_instances = self._merge_discovered_instances(discovered)
         if not changed:
             return
@@ -886,6 +916,9 @@ class TEIMachineServer:
 
     async def _check_instance_health(self, instance: TEIInstance) -> bool:
         """Check health of a single instance."""
+        quiet_health = _apply_tei_docker_health(instance)
+        if quiet_health is not None:
+            return quiet_health
         try:
             resp = await self._client.get(instance.health_url)
             instance.healthy = resp.status_code == 200
@@ -1535,6 +1568,9 @@ async def check_health(instances: list[TEIInstance]) -> None:
     """Check health of all instances and print status."""
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         for inst in instances:
+            quiet_health = _apply_tei_docker_health(inst)
+            if quiet_health is not None:
+                continue
             try:
                 resp = await client.get(inst.health_url)
                 inst.healthy = resp.status_code == 200

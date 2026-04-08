@@ -95,7 +95,7 @@ from typing import Optional
 
 from tclogger import logger
 
-from ..utils.service_bootstrap import wait_for_healthy_http_endpoints
+from ..utils.service_bootstrap import wait_for_healthy_docker_containers
 
 
 SERVER_PORT = 28880
@@ -117,6 +117,7 @@ TEI_IMAGE_BASE = "ghcr.io/huggingface/text-embeddings-inference"
 TEI_IMAGE_MIRROR = "m.daocloud.io"
 
 MAX_CLIENT_BATCH_SIZE = 300
+HEALTHCHECK_TCP_PROBE_TEMPLATE = "bash -lc 'exec 3<>/dev/tcp/127.0.0.1/{port}'"
 
 # Device mount mode: 'nvidia-runtime' uses docker GPU reservation, 'manual' uses explicit device mounts
 # Manual mode bypasses nvidia-container-cli NVML detection, useful when some GPUs have issues
@@ -660,7 +661,7 @@ class ComposeFileGenerator:
             f"    container_name: {container_name}",
         ]
 
-        # Use host network when proxy is configured (to access host's proxy at 127.0.0.1)
+        # Use host network when a proxy is configured so the container can reach a host-bound proxy directly.
         if self.http_proxy:
             lines.append(f"    network_mode: host")
             # In host mode, container uses host's network stack directly
@@ -736,17 +737,11 @@ class ComposeFileGenerator:
             )
 
         # Generate healthcheck configuration
+        healthcheck_port = service_port if self.http_proxy else 80
         lines.append(f"    healthcheck:")
-        if self.http_proxy:
-            # In host network mode, check the specific port TEI binds to
-            lines.append(
-                f'      test: ["CMD", "curl", "-f", "http://localhost:{service_port}/health"]'
-            )
-        else:
-            # In bridge mode, always check port 80 (internal container port)
-            lines.append(
-                f'      test: ["CMD", "curl", "-f", "http://localhost:80/health"]'
-            )
+        lines.append(
+            f'      test: ["CMD-SHELL", "{HEALTHCHECK_TCP_PROBE_TEMPLATE.format(port=healthcheck_port)}"]'
+        )
 
         lines.extend(
             [
@@ -866,14 +861,17 @@ class TEIComposer:
     def get_backend_endpoints(self) -> list[str]:
         return [f"http://localhost:{self.port + gpu.index}" for gpu in self.gpus]
 
+    def get_backend_container_names(self) -> list[str]:
+        return [f"{self.project_name}--gpu{gpu.index}" for gpu in self.gpus]
+
     def wait_for_healthy_backends(
         self,
         timeout_sec: float = 300.0,
         poll_interval_sec: float = 5.0,
         label: str = "[tei]",
     ) -> bool:
-        return wait_for_healthy_http_endpoints(
-            self.get_backend_endpoints(),
+        return wait_for_healthy_docker_containers(
+            self.get_backend_container_names(),
             timeout_sec=timeout_sec,
             poll_interval_sec=poll_interval_sec,
             label=label,

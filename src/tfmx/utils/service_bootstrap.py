@@ -169,6 +169,104 @@ def wait_for_healthy_http_endpoints(
     return True
 
 
+def docker_status_to_health(status: str) -> bool | None:
+    normalized = (status or "").strip().lower()
+    if not normalized:
+        return None
+    if "unhealthy" in normalized:
+        return False
+    if "health: starting" in normalized:
+        return False
+    if "(healthy)" in normalized or normalized == "healthy":
+        return True
+    if normalized.startswith("up "):
+        return None
+    return False
+
+
+def get_docker_container_statuses(container_names: list[str]) -> dict[str, str]:
+    normalized_names = [
+        name.strip() for name in container_names if name and name.strip()
+    ]
+    if not normalized_names:
+        return {}
+
+    try:
+        result = subprocess.run(
+            ["docker", "ps", "-a", "--format", "{{.Names}}|{{.Status}}"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return {}
+
+    if result.returncode != 0 or not result.stdout.strip():
+        return {}
+
+    requested = set(normalized_names)
+    statuses: dict[str, str] = {}
+    for line in result.stdout.splitlines():
+        if not line.strip() or "|" not in line:
+            continue
+        container_name, status = line.split("|", 1)
+        container_name = container_name.strip()
+        if container_name in requested:
+            statuses[container_name] = status.strip()
+    return statuses
+
+
+def wait_for_healthy_docker_containers(
+    container_names: list[str],
+    *,
+    timeout_sec: float,
+    poll_interval_sec: float,
+    label: str = "[tfmx]",
+) -> bool:
+    normalized_names = [
+        name.strip() for name in container_names if name and name.strip()
+    ]
+    if not normalized_names:
+        logger.warn(f"× {label} No backend containers available for health wait")
+        return False
+
+    pending = set(normalized_names)
+    deadline = time.monotonic() + timeout_sec
+
+    logger.mesg(
+        f"{label} Waiting for {len(pending)} backend container(s) to become healthy"
+    )
+
+    last_statuses: dict[str, str] = {}
+    while pending and time.monotonic() < deadline:
+        last_statuses = get_docker_container_statuses(normalized_names)
+        for container_name in list(pending):
+            if docker_status_to_health(last_statuses.get(container_name, "")) is True:
+                pending.remove(container_name)
+
+        if pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            time.sleep(min(poll_interval_sec, remaining))
+
+    if pending:
+        missing = []
+        for container_name in sorted(pending):
+            status = last_statuses.get(container_name)
+            if status:
+                missing.append(f"{container_name} ({status})")
+            else:
+                missing.append(container_name)
+        logger.warn(
+            f"× {label} Timed out waiting for healthy containers: {', '.join(missing)}"
+        )
+        return False
+
+    logger.okay(f"{label} All backend containers are healthy")
+    return True
+
+
 def wait_for_available_backend_instances(
     rediscover,
     *,
@@ -209,8 +307,11 @@ def wait_for_available_backend_instances(
                 endpoint = getattr(instance, "endpoint", "").rstrip("/")
                 health_url = getattr(instance, "health_url", "")
                 url = health_url or (f"{endpoint}{health_path}" if endpoint else "")
+                docker_health = getattr(instance, "docker_health", None)
                 is_healthy = False
-                if url:
+                if docker_health is not None:
+                    is_healthy = bool(docker_health)
+                elif url:
                     try:
                         response = client.get(url)
                         is_healthy = response.status_code == 200

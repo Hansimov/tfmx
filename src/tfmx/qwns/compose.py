@@ -19,7 +19,7 @@ import requests
 
 from tclogger import logger
 
-from ..utils.service_bootstrap import wait_for_healthy_http_endpoints
+from ..utils.service_bootstrap import wait_for_healthy_docker_containers
 
 from .networking import DEFAULT_HF_ENDPOINT
 from .networking import DEFAULT_PIP_INDEX_URL
@@ -81,6 +81,9 @@ HEALTHCHECK_INTERVAL = "5s"
 HEALTHCHECK_TIMEOUT = "3s"
 HEALTHCHECK_RETRIES = 12
 HEALTHCHECK_START_PERIOD = "240s"
+HEALTHCHECK_TCP_PROBE = f"bash -lc 'exec 3<>/dev/tcp/127.0.0.1/{VLLM_INTERNAL_PORT}'"
+
+SLEEP_STATE_FILE = Path.home() / ".cache" / "tfmx" / "qwn_sleep_state.json"
 
 SUPPORTED_MODELS = {
     MODEL_NAME: {
@@ -238,6 +241,84 @@ def get_model_api_aliases(model_name: str, quant_level: str = "") -> list[str]:
         if alias and alias not in deduped:
             deduped.append(alias)
     return deduped
+
+
+def _normalize_backend_endpoint(endpoint: str) -> str:
+    return endpoint.rstrip("/") if endpoint else ""
+
+
+def load_backend_sleep_states() -> dict[str, bool]:
+    if not SLEEP_STATE_FILE.exists():
+        return {}
+
+    try:
+        payload = json.loads(SLEEP_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    states: dict[str, bool] = {}
+    for endpoint, sleeping in payload.items():
+        normalized = _normalize_backend_endpoint(str(endpoint))
+        if normalized:
+            states[normalized] = bool(sleeping)
+    return states
+
+
+def _write_backend_sleep_states(states: dict[str, bool]) -> None:
+    if not states:
+        try:
+            SLEEP_STATE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+
+    SLEEP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SLEEP_STATE_FILE.write_text(json.dumps(states, indent=2, sort_keys=True) + "\n")
+
+
+def update_backend_sleep_states(state_updates: dict[str, bool]) -> None:
+    normalized_updates = {
+        _normalize_backend_endpoint(endpoint): bool(sleeping)
+        for endpoint, sleeping in state_updates.items()
+        if _normalize_backend_endpoint(endpoint)
+    }
+    if not normalized_updates:
+        return
+
+    states = load_backend_sleep_states()
+    states.update(normalized_updates)
+    _write_backend_sleep_states(states)
+
+
+def set_backend_sleep_states(endpoints: list[str], *, sleeping: bool) -> None:
+    update_backend_sleep_states({endpoint: sleeping for endpoint in endpoints})
+
+
+def clear_backend_sleep_states(endpoints: list[str]) -> None:
+    normalized_endpoints = {
+        _normalize_backend_endpoint(endpoint) for endpoint in endpoints if endpoint
+    }
+    if not normalized_endpoints:
+        return
+
+    states = load_backend_sleep_states()
+    changed = False
+    for endpoint in normalized_endpoints:
+        if endpoint in states:
+            del states[endpoint]
+            changed = True
+    if changed:
+        _write_backend_sleep_states(states)
+
+
+def get_backend_sleep_state(endpoint: str) -> bool | None:
+    normalized = _normalize_backend_endpoint(endpoint)
+    if not normalized:
+        return None
+    return load_backend_sleep_states().get(normalized)
 
 
 @dataclass
@@ -1053,7 +1134,7 @@ class ComposeFileGenerator:
         lines.extend(
             [
                 "    healthcheck:",
-                f'      test: ["CMD", "curl", "-f", "http://localhost:{VLLM_INTERNAL_PORT}/health"]',
+                f'      test: ["CMD-SHELL", "{HEALTHCHECK_TCP_PROBE}"]',
                 f"      interval: {HEALTHCHECK_INTERVAL}",
                 f"      timeout: {HEALTHCHECK_TIMEOUT}",
                 f"      retries: {HEALTHCHECK_RETRIES}",
@@ -1227,6 +1308,9 @@ class QWNComposer:
     def get_backend_endpoints(self) -> list[str]:
         return [f"http://localhost:{self.port + gpu.index}" for gpu in self.gpus]
 
+    def get_backend_container_names(self) -> list[str]:
+        return [f"{self.project_name}--gpu{gpu.index}" for gpu in self.gpus]
+
     @staticmethod
     def _extract_host_port(ports_str: str) -> Optional[int]:
         match = re.search(r"(?:0\.0\.0\.0|::):(\d+)->", ports_str)
@@ -1320,6 +1404,9 @@ class QWNComposer:
         )
 
         if successes:
+            set_backend_sleep_states(
+                [endpoint for endpoint, _ in successes], sleeping=True
+            )
             logger.okay(
                 f"[qwn] Requested sleep(level={level}, mode={mode}) on {len(successes)} backend(s)"
             )
@@ -1338,6 +1425,10 @@ class QWNComposer:
         successes, unsupported, failures = self._request_backend_control("/wake_up")
 
         if successes:
+            set_backend_sleep_states(
+                [endpoint for endpoint, _ in successes],
+                sleeping=False,
+            )
             logger.okay(f"[qwn] Requested wake-up on {len(successes)} backend(s)")
         elif unsupported:
             logger.warn(
@@ -1383,6 +1474,7 @@ class QWNComposer:
 
         for endpoint, payload in successes:
             sleeping = bool((payload or {}).get("is_sleeping", False))
+            update_backend_sleep_states({endpoint: sleeping})
             state = "sleeping" if sleeping else "awake"
             logger.mesg(f"[qwn] {endpoint}: {state}")
 
@@ -1488,12 +1580,15 @@ class QWNComposer:
         poll_interval_sec: float = 5.0,
         label: str = "[qwn]",
     ) -> bool:
-        return wait_for_healthy_http_endpoints(
-            self.get_backend_endpoints(),
+        healthy = wait_for_healthy_docker_containers(
+            self.get_backend_container_names(),
             timeout_sec=timeout_sec,
             poll_interval_sec=poll_interval_sec,
             label=label,
         )
+        if healthy:
+            set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
+        return healthy
 
     def _run_compose_cmd(
         self,
@@ -1537,6 +1632,7 @@ class QWNComposer:
         logger.okay(
             f"[qwn] Started services on GPUs: {[gpu.index for gpu in self.gpus]}"
         )
+        set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
         self.ps()
 
     def down(self) -> None:
@@ -1551,6 +1647,7 @@ class QWNComposer:
         for container in containers:
             subprocess.run(f"docker rm -f {container}", shell=True, capture_output=True)
         logger.okay(f"[qwn] Removed {len(containers)} container(s)")
+        clear_backend_sleep_states(self.get_backend_endpoints())
 
     def stop(self) -> None:
         if self._resolve_compose_cmd("stop"):
@@ -1577,6 +1674,7 @@ class QWNComposer:
         for container in stopped:
             subprocess.run(f"docker start {container}", shell=True, capture_output=True)
         logger.okay(f"[qwn] Started {len(stopped)} container(s)")
+        set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
 
     def restart(self) -> None:
         if self._resolve_compose_cmd("restart"):
@@ -1591,6 +1689,7 @@ class QWNComposer:
                 f"docker restart {container}", shell=True, capture_output=True
             )
         logger.okay(f"[qwn] Restarted {len(containers)} container(s)")
+        set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
 
     def ps(self) -> None:
         if self._resolve_compose_cmd("ps"):
