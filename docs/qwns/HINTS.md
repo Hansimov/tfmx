@@ -23,6 +23,40 @@ docker rmi tfmx-vllm-openai:qwen3.5-v0.19.0
 qwn compose up --gpu-configs "0:4b:4bit"
 ```
 
+## 启动耗时优化
+
+- `qwn compose` 现在会额外挂载宿主机的 `~/.cache/vllm` 到容器内的 `/root/.cache/vllm`
+- 这会把 vLLM 的 `torch.compile` / compile cache 跨容器重启持久化下来，避免每次重启都重新做一整轮冷编译
+- 当前 QWN 默认还会加上 `--skip-mm-profiling`，用来跳过多模态内存 profiling，直接缩短引擎 ready 前的 warmup 路径
+- 如果你需要回到更保守的默认行为，可以显式关闭：`qwn compose up --no-skip-mm-profiling`
+- 目前保留了手动实验 cudagraph 的入口，例如：`qwn compose up --cudagraph-mode FULL_DECODE_ONLY --cudagraph-capture-sizes 1,2,4,8`
+- 但在这套 `Qwen3.5-4B-AWQ-4bit` 多模态路径上的实测结果里，这组 cudagraph 收紧配置并没有明显缩短 `Initial profiling/warmup`，因此目前没有把它设成默认值
+- 继续往下深挖后，当前剩余主瓶颈仍然是 vLLM 自己的 `Initial profiling/warmup run`；它会走一次较重的合成 profile forward 路径，在不牺牲吞吐的前提下，没有找到足够安全的默认参数可以把这段成本直接抹掉
+- 因此现在新增了更安全的快启路径：保留冷启动参数不变，但允许后端进入 sleep，再在下一次启动时直接 wake，避免反复重做整轮冷初始化
+- 手动启用方式：`qwn compose up --enable-sleep-mode ...`
+- 挂起后端：`qwn compose sleep`
+- 查看状态：`qwn compose sleep-status`
+- 唤醒并等待恢复健康：`qwn compose wake --wait-healthy`
+- `qwn machine` 现在会把 sleeping 实例视为“不可路由”，避免 vLLM 的 `/health` 仍然返回 200 时被误判成可服务实例
+
+实践上，这两项优化分别针对两种不同的启动耗时：
+
+- 重启反复慢：通常是 compile cache 没持久化
+- 单次冷启动后半段慢：通常是多模态 profiling / cudagraph warmup 太重
+
+如果你要的是“尽快恢复服务”而不是“彻底销毁实例再重建”，建议直接使用 sleep/wake 流程，而不是每次都 `compose down`：
+
+```bash
+bash runs/qwns/01_deploy_uniform.sh
+bash runs/qwns/02_start_machine.sh
+
+# 暂停服务但保留容器与状态，避免下次重新冷启动
+bash runs/qwns/98_sleep_backends.sh
+
+# 下次恢复时先 wake，再启动 machine
+bash runs/qwns/02_start_machine.sh
+```
+
 ## 当前显存为什么会到 13GB 左右
 
 现在只起了一个 Docker 实例，并且只占用 GPU0，但 `gpustat` 中看到 `VLLM::EngineCore` 约 `13144 MB` 并不意外，主要原因不是单一的“模型权重太大”，而是以下几部分叠加：
@@ -161,6 +195,8 @@ export QWN_BACKEND_URL="http://$QWN_BACKEND_HOST:27880"
 ### `/health` 显示 0 个 healthy 实例
 
 - 先确认容器是否仍在加载模型
+- 如果你刚执行过 `qwn compose sleep`，那么 `qwn machine` 现在会故意把这些 sleeping 后端视为不健康；这是为了避免继续向已暂停调度的实例分发请求
+- 这时应先执行 `qwn compose wake --wait-healthy`，或者直接运行 `bash runs/qwns/02_start_machine.sh`
 - 查看 `qwn compose logs -f`
 - 若宿主机 `nvidia-smi -L` 已经报 `Unable to determine the device handle ... Unknown Error`，说明问题在 GPU/驱动层；此时 machine 层 failover 和冲突处理仍可工作，但无法把坏掉的后端重新拉健康
 - 直接访问后端：

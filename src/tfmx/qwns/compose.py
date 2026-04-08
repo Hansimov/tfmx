@@ -5,6 +5,7 @@ and provides Docker lifecycle helpers used by the unified ``qwn`` CLI.
 """
 
 import argparse
+import json
 import re
 import shlex
 import subprocess
@@ -12,6 +13,8 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
+
+import requests
 
 from tclogger import logger
 
@@ -32,6 +35,7 @@ DEFAULT_AWQ_MODEL = "cyankiwi/Qwen3.5-4B-AWQ-4bit"
 HF_ENDPOINT = DEFAULT_HF_ENDPOINT
 CACHE_HF = ".cache/huggingface"
 CACHE_HF_HUB = f"{CACHE_HF}/hub"
+CACHE_VLLM = ".cache/vllm"
 
 QWEN35_VLLM_VERSION = "0.19.0"
 VLLM_BASE_IMAGE = f"vllm/vllm-openai:v{QWEN35_VLLM_VERSION}"
@@ -50,6 +54,27 @@ MAX_NUM_SEQS = 8
 GPU_MEMORY_UTILIZATION = 0.72
 DEVICE_MOUNT_MODE = "manual"
 GPU_LAYOUT_UNIFORM_AWQ = "uniform-awq"
+DEFAULT_SKIP_MM_PROFILING = True
+DEFAULT_CUDAGRAPH_MODE: str | None = None
+DEFAULT_ENABLE_SLEEP_MODE = False
+DEFAULT_SLEEP_LEVEL = 1
+DEFAULT_SLEEP_MODE = "abort"
+SLEEP_CONTROL_TIMEOUT_SEC = 5.0
+SLEEP_WAKE_TIMEOUT_SEC = 180.0
+SLEEP_WAKE_POLL_INTERVAL_SEC = 2.0
+
+CUDAGRAPH_MODE_CHOICES = (
+    "NONE",
+    "PIECEWISE",
+    "FULL",
+    "FULL_DECODE_ONLY",
+    "FULL_AND_PIECEWISE",
+)
+
+HEALTHCHECK_INTERVAL = "5s"
+HEALTHCHECK_TIMEOUT = "3s"
+HEALTHCHECK_RETRIES = 12
+HEALTHCHECK_START_PERIOD = "240s"
 
 SUPPORTED_MODELS = {
     MODEL_NAME: {
@@ -347,6 +372,64 @@ def infer_gpu_ids(
         seen_gpu_ids.add(config.gpu_id)
         inferred_ids.append(str(config.gpu_id))
     return ",".join(inferred_ids) if inferred_ids else None
+
+
+def parse_cudagraph_capture_sizes(value: str) -> list[int]:
+    sizes: list[int] = []
+    seen: set[int] = set()
+    for raw_part in value.split(","):
+        part = raw_part.strip()
+        if not part:
+            continue
+        size = int(part)
+        if size <= 0:
+            raise ValueError("cudagraph capture sizes must be positive integers")
+        if size in seen:
+            continue
+        sizes.append(size)
+        seen.add(size)
+    if not sizes:
+        raise ValueError("expected at least one cudagraph capture size")
+    return sizes
+
+
+def build_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
+    if max_num_seqs <= 0:
+        raise ValueError("max_num_seqs must be positive")
+
+    sizes: list[int] = []
+    size = 1
+    while size < max_num_seqs:
+        sizes.append(size)
+        size *= 2
+
+    if not sizes or sizes[-1] != max_num_seqs:
+        sizes.append(max_num_seqs)
+    return sizes
+
+
+def build_compilation_config(
+    cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
+    max_num_seqs: int = MAX_NUM_SEQS,
+    cudagraph_capture_sizes: list[int] | None = None,
+) -> dict[str, object] | None:
+    if not cudagraph_mode:
+        return None
+
+    mode = cudagraph_mode.upper()
+    if mode not in CUDAGRAPH_MODE_CHOICES:
+        raise ValueError(f"Unsupported cudagraph mode: {mode}")
+
+    compilation_config: dict[str, object] = {"cudagraph_mode": mode}
+    if mode == "NONE":
+        return compilation_config
+
+    capture_sizes = cudagraph_capture_sizes or build_cudagraph_capture_sizes(
+        max_num_seqs
+    )
+    compilation_config["cudagraph_capture_sizes"] = capture_sizes
+    compilation_config["max_cudagraph_capture_size"] = max(capture_sizes)
+    return compilation_config
 
 
 def build_gpu_configs_for_layout(
@@ -675,6 +758,7 @@ class ComposeFileGenerator:
         hf_token: Optional[str] = None,
         cache_hf: str = CACHE_HF,
         cache_hf_hub: str = CACHE_HF_HUB,
+        cache_vllm: str = CACHE_VLLM,
         hf_endpoint: str = HF_ENDPOINT,
         mount_mode: str = DEVICE_MOUNT_MODE,
         driver_lib_dir: Optional[str] = None,
@@ -685,6 +769,10 @@ class ComposeFileGenerator:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
+        skip_mm_profiling: bool = DEFAULT_SKIP_MM_PROFILING,
+        enable_sleep_mode: bool = DEFAULT_ENABLE_SLEEP_MODE,
+        cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
+        cudagraph_capture_sizes: list[int] | None = None,
         gpu_configs: list[GpuModelConfig] | None = None,
         network_config: QWNNetworkConfig | None = None,
     ):
@@ -696,6 +784,7 @@ class ComposeFileGenerator:
         self.hf_token = hf_token
         self.cache_hf = cache_hf
         self.cache_hf_hub = cache_hf_hub
+        self.cache_vllm = cache_vllm
         self.mount_mode = mount_mode
         self.driver_lib_dir = driver_lib_dir or NvidiaDriverLibs.detect_driver_lib_dir()
         self.network_config = network_config or QWNNetworkConfig.from_overrides(
@@ -708,6 +797,15 @@ class ComposeFileGenerator:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.skip_mm_profiling = skip_mm_profiling
+        self.enable_sleep_mode = enable_sleep_mode
+        self.cudagraph_mode = cudagraph_mode.upper() if cudagraph_mode else None
+        self.cudagraph_capture_sizes = cudagraph_capture_sizes
+        self.compilation_config = build_compilation_config(
+            cudagraph_mode=self.cudagraph_mode,
+            max_num_seqs=self.max_num_seqs,
+            cudagraph_capture_sizes=self.cudagraph_capture_sizes,
+        )
         self.gpu_configs = gpu_configs or []
         self._gpu_config_map = {config.gpu_id: config for config in self.gpu_configs}
         self.model_config_manager = ModelConfigManager(cache_hf_hub=self.cache_hf_hub)
@@ -782,6 +880,7 @@ class ComposeFileGenerator:
             "  restart: unless-stopped",
             "  volumes:",
             f"    - ${{HOME}}/{self.cache_hf}:/root/{self.cache_hf}",
+            f"    - ${{HOME}}/{self.cache_vllm}:/root/{self.cache_vllm}",
             f"    - {self.data_dir}:/data",
         ]
 
@@ -800,6 +899,9 @@ class ComposeFileGenerator:
                 "    - VLLM_WORKER_MULTIPROC_METHOD=spawn",
             ]
         )
+
+        if self.enable_sleep_mode:
+            lines.append("    - VLLM_SERVER_DEV_MODE=1")
 
         if self._uses_runtime_offline_cache():
             lines.extend(
@@ -890,6 +992,20 @@ class ComposeFileGenerator:
                 ]
             )
 
+        if self.skip_mm_profiling:
+            serve_args.append("--skip-mm-profiling")
+
+        if self.enable_sleep_mode:
+            serve_args.append("--enable-sleep-mode")
+
+        if self.compilation_config:
+            serve_args.extend(
+                [
+                    "--compilation-config",
+                    json.dumps(self.compilation_config, separators=(",", ":")),
+                ]
+            )
+
         lines = [
             f"  qwn-gpu{gpu.index}:",
             "    <<: *common-config",
@@ -932,10 +1048,10 @@ class ComposeFileGenerator:
             [
                 "    healthcheck:",
                 f'      test: ["CMD", "curl", "-f", "http://localhost:{VLLM_INTERNAL_PORT}/health"]',
-                "      interval: 30s",
-                "      timeout: 10s",
-                "      retries: 3",
-                "      start_period: 120s",
+                f"      interval: {HEALTHCHECK_INTERVAL}",
+                f"      timeout: {HEALTHCHECK_TIMEOUT}",
+                f"      retries: {HEALTHCHECK_RETRIES}",
+                f"      start_period: {HEALTHCHECK_START_PERIOD}",
                 "",
             ]
         )
@@ -960,6 +1076,10 @@ class QWNComposer:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
+        skip_mm_profiling: bool = DEFAULT_SKIP_MM_PROFILING,
+        enable_sleep_mode: bool = DEFAULT_ENABLE_SLEEP_MODE,
+        cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
+        cudagraph_capture_sizes: list[int] | None = None,
         gpu_layout: Optional[str] = None,
         gpu_configs: list[GpuModelConfig] | None = None,
     ):
@@ -982,6 +1102,10 @@ class QWNComposer:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.skip_mm_profiling = skip_mm_profiling
+        self.enable_sleep_mode = enable_sleep_mode
+        self.cudagraph_mode = cudagraph_mode.upper() if cudagraph_mode else None
+        self.cudagraph_capture_sizes = cudagraph_capture_sizes
         self.gpu_layout = normalize_model_key(gpu_layout) if gpu_layout else None
 
         if self.gpu_layout:
@@ -1083,6 +1207,10 @@ class QWNComposer:
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             gpu_memory_utilization=self.gpu_memory_utilization,
+            skip_mm_profiling=self.skip_mm_profiling,
+            enable_sleep_mode=self.enable_sleep_mode,
+            cudagraph_mode=self.cudagraph_mode,
+            cudagraph_capture_sizes=self.cudagraph_capture_sizes,
             gpu_configs=self.gpu_configs,
             network_config=self.network_config,
         )
@@ -1092,6 +1220,170 @@ class QWNComposer:
 
     def get_backend_endpoints(self) -> list[str]:
         return [f"http://localhost:{self.port + gpu.index}" for gpu in self.gpus]
+
+    @staticmethod
+    def _extract_host_port(ports_str: str) -> Optional[int]:
+        match = re.search(r"(?:0\.0\.0\.0|::):(\d+)->", ports_str)
+        if match:
+            return int(match.group(1))
+        return None
+
+    def _discover_running_backend_endpoints(self) -> list[str]:
+        result = subprocess.run(
+            "docker ps --format '{{.Names}}|{{.Ports}}'",
+            shell=True,
+            capture_output=True,
+            text=True,
+        )
+        if result.returncode != 0 or not result.stdout.strip():
+            return []
+
+        prefix = f"{self.project_name}--gpu"
+        endpoints: list[tuple[str, int]] = []
+        for line in result.stdout.splitlines():
+            if not line.strip() or "|" not in line:
+                continue
+            container_name, ports = line.split("|", 1)
+            container_name = container_name.strip()
+            if not container_name.startswith(prefix):
+                continue
+            host_port = self._extract_host_port(ports)
+            if host_port is None:
+                continue
+            endpoints.append((container_name, host_port))
+
+        endpoints.sort()
+        return [f"http://localhost:{port}" for _, port in endpoints]
+
+    def _get_control_endpoints(self) -> list[str]:
+        return (
+            self._discover_running_backend_endpoints() or self.get_backend_endpoints()
+        )
+
+    def _request_backend_control(
+        self,
+        path: str,
+        *,
+        method: str = "POST",
+        params: dict[str, object] | None = None,
+    ) -> tuple[list[tuple[str, dict | None]], list[str], list[tuple[str, str]]]:
+        endpoints = self._get_control_endpoints()
+        if not endpoints:
+            return [], [], []
+
+        successes: list[tuple[str, dict | None]] = []
+        unsupported: list[str] = []
+        failures: list[tuple[str, str]] = []
+        for endpoint in endpoints:
+            url = f"{endpoint}{path}"
+            try:
+                response = requests.request(
+                    method,
+                    url,
+                    params=params,
+                    timeout=SLEEP_CONTROL_TIMEOUT_SEC,
+                )
+            except requests.RequestException as exc:
+                failures.append((endpoint, str(exc)))
+                continue
+
+            if response.status_code == 200:
+                payload = None
+                content_type = response.headers.get("content-type", "")
+                if "application/json" in content_type.lower():
+                    try:
+                        payload = response.json()
+                    except ValueError:
+                        payload = None
+                successes.append((endpoint, payload))
+            elif response.status_code == 404:
+                unsupported.append(endpoint)
+            else:
+                failures.append((endpoint, f"HTTP {response.status_code}"))
+
+        return successes, unsupported, failures
+
+    def sleep(
+        self,
+        level: int = DEFAULT_SLEEP_LEVEL,
+        mode: str = DEFAULT_SLEEP_MODE,
+    ) -> bool:
+        successes, unsupported, failures = self._request_backend_control(
+            "/sleep",
+            params={"level": level, "mode": mode},
+        )
+
+        if successes:
+            logger.okay(
+                f"[qwn] Requested sleep(level={level}, mode={mode}) on {len(successes)} backend(s)"
+            )
+        elif unsupported:
+            logger.warn(
+                "[qwn] Sleep endpoints are unavailable. Redeploy with --enable-sleep-mode to use fast wake/resume."
+            )
+        else:
+            logger.warn("[qwn] Failed to contact any running backend for sleep")
+
+        for endpoint, error in failures:
+            logger.warn(f"[qwn] Sleep request failed for {endpoint}: {error}")
+        return bool(successes)
+
+    def wake(self, wait_healthy: bool = False) -> bool:
+        successes, unsupported, failures = self._request_backend_control("/wake_up")
+
+        if successes:
+            logger.okay(f"[qwn] Requested wake-up on {len(successes)} backend(s)")
+        elif unsupported:
+            logger.warn(
+                "[qwn] Wake-up endpoints are unavailable. Redeploy with --enable-sleep-mode to use fast wake/resume."
+            )
+        else:
+            logger.warn("[qwn] Failed to contact any running backend for wake-up")
+
+        for endpoint, error in failures:
+            logger.warn(f"[qwn] Wake request failed for {endpoint}: {error}")
+
+        if wait_healthy and successes:
+            healthy = self.wait_for_healthy_backends(
+                timeout_sec=SLEEP_WAKE_TIMEOUT_SEC,
+                poll_interval_sec=SLEEP_WAKE_POLL_INTERVAL_SEC,
+                label="[qwn]",
+            )
+            if healthy:
+                logger.okay("[qwn] Backends are healthy after wake-up")
+            else:
+                logger.warn(
+                    "[qwn] Wake-up requested, but healthy backends did not appear in time"
+                )
+            return healthy
+
+        return bool(successes)
+
+    def sleep_status(self) -> bool:
+        successes, unsupported, failures = self._request_backend_control(
+            "/is_sleeping",
+            method="GET",
+        )
+
+        if not successes and unsupported:
+            logger.warn(
+                "[qwn] Sleep status endpoints are unavailable. Redeploy with --enable-sleep-mode to inspect sleep state."
+            )
+            return False
+
+        if not successes and not failures:
+            logger.warn("[qwn] No running backends found for sleep status")
+            return False
+
+        for endpoint, payload in successes:
+            sleeping = bool((payload or {}).get("is_sleeping", False))
+            state = "sleeping" if sleeping else "awake"
+            logger.mesg(f"[qwn] {endpoint}: {state}")
+
+        for endpoint, error in failures:
+            logger.warn(f"[qwn] Sleep status failed for {endpoint}: {error}")
+
+        return bool(successes)
 
     def wait_for_healthy_backends(
         self,
@@ -1273,6 +1565,9 @@ Examples:
     qwn compose up --gpu-configs "0,1"
   qwn compose up --gpu-configs "0:4b:4bit,1:4b:4bit"
   qwn compose generate -j qwn-awq --gpu-configs "0:4b:4bit"
+    qwn compose sleep
+    qwn compose wake --wait-healthy
+    qwn compose sleep-status
   qwn compose logs -f
   qwn compose down
 """
@@ -1315,6 +1610,20 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             help="Comma-separated GPU IDs (default: all healthy GPUs)",
         )
 
+    def add_targeting_arguments(target: argparse.ArgumentParser) -> None:
+        target.add_argument(
+            "--gpu-configs",
+            type=str,
+            default=None,
+            help='Per-GPU config: "GPU[:MODEL[:QUANT]],..."',
+        )
+        target.add_argument(
+            "--gpu-layout",
+            choices=[GPU_LAYOUT_UNIFORM_AWQ],
+            default=None,
+            help="Named multi-GPU layout preset",
+        )
+
     def add_deployment_arguments(target: argparse.ArgumentParser) -> None:
         target.add_argument("-t", "--hf-token", type=str, default=None)
         target.add_argument(
@@ -1347,18 +1656,55 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             type=float,
             default=GPU_MEMORY_UTILIZATION,
         )
+        target.set_defaults(skip_mm_profiling=DEFAULT_SKIP_MM_PROFILING)
         target.add_argument(
-            "--gpu-configs",
-            type=str,
-            default=None,
-            help='Per-GPU config: "GPU[:MODEL[:QUANT]],..."',
+            "--skip-mm-profiling",
+            dest="skip_mm_profiling",
+            action="store_true",
+            help="Skip multimodal memory profiling during startup to reduce readiness time",
         )
         target.add_argument(
-            "--gpu-layout",
-            choices=[GPU_LAYOUT_UNIFORM_AWQ],
-            default=None,
-            help="Named multi-GPU layout preset",
+            "--no-skip-mm-profiling",
+            dest="skip_mm_profiling",
+            action="store_false",
+            help="Keep vLLM multimodal memory profiling enabled during startup",
         )
+        target.set_defaults(enable_sleep_mode=DEFAULT_ENABLE_SLEEP_MODE)
+        target.add_argument(
+            "--enable-sleep-mode",
+            dest="enable_sleep_mode",
+            action="store_true",
+            help=(
+                "Enable vLLM sleep mode endpoints so running backends can be "
+                "put to sleep and woken up quickly without a full cold restart"
+            ),
+        )
+        target.add_argument(
+            "--no-enable-sleep-mode",
+            dest="enable_sleep_mode",
+            action="store_false",
+            help="Disable vLLM sleep mode endpoints",
+        )
+        target.add_argument(
+            "--cudagraph-mode",
+            type=str.upper,
+            choices=CUDAGRAPH_MODE_CHOICES,
+            default=DEFAULT_CUDAGRAPH_MODE,
+            help=(
+                "Experimental vLLM cudagraph mode override. If unset, keep the "
+                "runtime's default compilation behavior."
+            ),
+        )
+        target.add_argument(
+            "--cudagraph-capture-sizes",
+            type=parse_cudagraph_capture_sizes,
+            default=None,
+            help=(
+                "Comma-separated cudagraph batch sizes. Only used together with "
+                "--cudagraph-mode; otherwise ignored."
+            ),
+        )
+        add_targeting_arguments(target)
 
     parser_up = subparsers.add_parser("up", help="Start QWN containers")
     add_common_arguments(parser_up)
@@ -1373,6 +1719,48 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             action, help=f"{action.title()} QWN containers"
         )
         add_common_arguments(action_parser)
+
+    parser_sleep = subparsers.add_parser(
+        "sleep",
+        help="Put running QWN backends into vLLM sleep mode",
+    )
+    add_common_arguments(parser_sleep)
+    add_targeting_arguments(parser_sleep)
+    parser_sleep.add_argument(
+        "--sleep-level",
+        type=int,
+        choices=[0, 1, 2],
+        default=DEFAULT_SLEEP_LEVEL,
+        help=(
+            "vLLM sleep level: 0=pause scheduling, 1=offload weights, "
+            "2=drop all GPU memory"
+        ),
+    )
+    parser_sleep.add_argument(
+        "--sleep-mode",
+        choices=["abort", "wait"],
+        default=DEFAULT_SLEEP_MODE,
+        help="How to handle in-flight requests when entering sleep mode",
+    )
+
+    parser_wake = subparsers.add_parser(
+        "wake",
+        help="Wake running QWN backends from vLLM sleep mode",
+    )
+    add_common_arguments(parser_wake)
+    add_targeting_arguments(parser_wake)
+    parser_wake.add_argument(
+        "--wait-healthy",
+        action="store_true",
+        help="Wait for backend /health endpoints to return healthy after wake-up",
+    )
+
+    parser_sleep_status = subparsers.add_parser(
+        "sleep-status",
+        help="Show vLLM sleep state for running QWN backends",
+    )
+    add_common_arguments(parser_sleep_status)
+    add_targeting_arguments(parser_sleep_status)
 
     parser_logs = subparsers.add_parser("logs", help="View container logs")
     add_common_arguments(parser_logs)
@@ -1400,6 +1788,26 @@ def _composer_from_args(args: argparse.Namespace) -> QWNComposer:
             "gpu_memory_utilization",
             GPU_MEMORY_UTILIZATION,
         ),
+        "skip_mm_profiling": getattr(
+            args,
+            "skip_mm_profiling",
+            DEFAULT_SKIP_MM_PROFILING,
+        ),
+        "enable_sleep_mode": getattr(
+            args,
+            "enable_sleep_mode",
+            DEFAULT_ENABLE_SLEEP_MODE,
+        ),
+        "cudagraph_mode": getattr(
+            args,
+            "cudagraph_mode",
+            DEFAULT_CUDAGRAPH_MODE,
+        ),
+        "cudagraph_capture_sizes": getattr(
+            args,
+            "cudagraph_capture_sizes",
+            None,
+        ),
     }
     gpu_configs = getattr(args, "gpu_configs", None)
     if gpu_configs:
@@ -1421,6 +1829,15 @@ def run_from_args(args: argparse.Namespace) -> None:
         composer.start()
     elif action == "restart":
         composer.restart()
+    elif action == "sleep":
+        composer.sleep(
+            level=getattr(args, "sleep_level", DEFAULT_SLEEP_LEVEL),
+            mode=getattr(args, "sleep_mode", DEFAULT_SLEEP_MODE),
+        )
+    elif action == "wake":
+        composer.wake(wait_healthy=getattr(args, "wait_healthy", False))
+    elif action == "sleep-status":
+        composer.sleep_status()
     elif action == "ps":
         composer.ps()
     elif action == "logs":

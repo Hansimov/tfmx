@@ -9,5 +9,9 @@ qwn_cmd() {
 	fi
 }
 
+if [[ "${QWN_WAKE_BACKENDS:-1}" != "0" ]]; then
+	qwn_cmd compose wake --wait-healthy || true
+fi
+
 qwn_cmd machine run -b --on-conflict replace
 qwn_cmd machine status

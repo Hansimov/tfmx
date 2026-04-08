@@ -42,9 +42,10 @@ class TestQWNInstance:
         assert instance.available_slots > 0
 
     def test_to_info(self):
-        instance = self._make(healthy=True, model_name="4b:4bit")
+        instance = self._make(healthy=True, model_name="4b:4bit", sleeping=True)
         info = instance.to_info()
         assert info.healthy is True
+        assert info.sleeping is True
         assert info.model_name == "4b:4bit"
         assert info.available_slots >= 0
 
@@ -416,13 +417,33 @@ class TestQWNMachineServer:
             healthy=True,
         )
         server = QWNMachineServer(instances=[instance])
-        response = MagicMock(status_code=200)
+        health_response = MagicMock(status_code=200)
+        sleep_response = MagicMock(status_code=200)
+        sleep_response.json.return_value = {"is_sleeping": False}
         server._client = AsyncMock()
-        server._client.get.return_value = response
+        server._client.get.side_effect = [health_response, sleep_response]
 
         assert asyncio.run(server._check_instance_health(instance)) is True
-        timeout = server._client.get.call_args.kwargs["timeout"]
+        timeout = server._client.get.call_args_list[0].kwargs["timeout"]
         assert timeout.connect == 5.0
+
+    def test_check_instance_health_marks_sleeping_instance_unhealthy(self):
+        instance = QWNInstance(
+            container_name="qwn-multi--gpu0",
+            host="localhost",
+            port=27880,
+            healthy=True,
+        )
+        server = QWNMachineServer(instances=[instance])
+        health_response = MagicMock(status_code=200)
+        sleep_response = MagicMock(status_code=200)
+        sleep_response.json.return_value = {"is_sleeping": True}
+        server._client = AsyncMock()
+        server._client.get.side_effect = [health_response, sleep_response]
+
+        assert asyncio.run(server._check_instance_health(instance)) is False
+        assert instance.healthy is False
+        assert instance.sleeping is True
 
     def test_discover_instance_models_uses_short_timeout(self):
         instance = QWNInstance(

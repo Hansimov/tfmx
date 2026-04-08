@@ -135,6 +135,7 @@ class InstanceHealthDetail(BaseModel):
     name: str = Field(..., description="Container or instance name")
     endpoint: str = Field(..., description="HTTP endpoint URL")
     healthy: bool = Field(..., description="Whether instance is healthy")
+    sleeping: bool = Field(False, description="Whether instance is in vLLM sleep mode")
     latency_ms: float | None = Field(None, description="Last health check latency")
     active_requests: int = Field(0, description="Current active requests")
     model_label: str = Field(default="", description="Model label")
@@ -187,6 +188,7 @@ class InstanceInfo(BaseModel):
     endpoint: str = Field(...)
     gpu_id: int | None = Field(None)
     healthy: bool = Field(...)
+    sleeping: bool = Field(False)
     model_name: str = Field(default="")
     quant_method: str = Field(default="")
     quant_level: str = Field(default="")
@@ -238,6 +240,8 @@ class QWNInstance:
     port: int
     gpu_id: Optional[int] = None
     healthy: bool = False
+    sleeping: bool = False
+    sleep_mode_supported: Optional[bool] = None
     _active_requests: int = 0
     model_name: str = ""
     quant_method: str = ""
@@ -263,6 +267,10 @@ class QWNInstance:
     @property
     def models_url(self) -> str:
         return f"{self.endpoint}/v1/models"
+
+    @property
+    def sleep_state_url(self) -> str:
+        return f"{self.endpoint}/is_sleeping"
 
     @property
     def is_idle(self) -> bool:
@@ -310,6 +318,7 @@ class QWNInstance:
             endpoint=self.endpoint,
             gpu_id=self.gpu_id,
             healthy=self.healthy,
+            sleeping=self.sleeping,
             model_name=self.model_name,
             quant_method=self.quant_method,
             quant_level=self.quant_level,
@@ -1022,6 +1031,41 @@ class QWNMachineServer:
             instance.apply_gpu_runtime(snapshots.get(instance.gpu_id))
         self._last_gpu_refresh_monotonic = time.monotonic()
 
+    async def _check_instance_sleep_state(self, instance: QWNInstance) -> bool:
+        if instance.sleep_mode_supported is False:
+            instance.sleeping = False
+            return False
+
+        try:
+            response = await self._client.get(
+                instance.sleep_state_url,
+                timeout=httpx.Timeout(HEALTH_REQUEST_TIMEOUT_SEC),
+            )
+        except Exception:
+            if instance.sleep_mode_supported is None:
+                instance.sleep_mode_supported = False
+            instance.sleeping = False
+            return False
+
+        if response.status_code == 404:
+            instance.sleep_mode_supported = False
+            instance.sleeping = False
+            return False
+
+        if response.status_code != 200:
+            instance.sleeping = False
+            return False
+
+        instance.sleep_mode_supported = True
+        try:
+            payload = response.json()
+        except ValueError:
+            instance.sleeping = False
+            return False
+
+        instance.sleeping = bool(payload.get("is_sleeping", False))
+        return instance.sleeping
+
     async def _check_instance_health(self, instance: QWNInstance) -> bool:
         was_healthy = instance.healthy
         try:
@@ -1031,6 +1075,13 @@ class QWNMachineServer:
                 timeout=httpx.Timeout(HEALTH_REQUEST_TIMEOUT_SEC),
             )
             instance.healthy = response.status_code == 200
+            instance.sleeping = False
+            became_sleeping = False
+            if instance.healthy:
+                became_sleeping = await self._check_instance_sleep_state(instance)
+                if became_sleeping:
+                    instance.healthy = False
+
             instance._latency_ms = (
                 (time.perf_counter() - started_at) * 1000 if instance.healthy else 0.0
             )
@@ -1038,11 +1089,13 @@ class QWNMachineServer:
                 instance.telemetry.record_recovery()
                 await self._notify_capacity_changed()
             elif not instance.healthy and was_healthy:
-                instance.telemetry.record_failure("health check failed")
+                if not became_sleeping:
+                    instance.telemetry.record_failure("health check failed")
                 await self._notify_capacity_changed()
             return instance.healthy
         except Exception:
             instance.healthy = False
+            instance.sleeping = False
             instance._latency_ms = 0.0
             if was_healthy:
                 instance.telemetry.record_failure("health check failed")
@@ -1115,6 +1168,7 @@ class QWNMachineServer:
                     name=instance.container_name,
                     endpoint=instance.endpoint,
                     healthy=instance.healthy,
+                    sleeping=instance.sleeping,
                     latency_ms=(
                         round(instance._latency_ms, 2)
                         if instance._latency_ms > 0
@@ -2389,9 +2443,12 @@ def log_instances(instances: list[QWNInstance], show_health: bool = False) -> No
         gpu_text = str(instance.gpu_id) if instance.gpu_id is not None else "?"
         model_text = instance.model_name or "?"
         if show_health:
-            status = (
-                logstr.okay("✓ healthy") if instance.healthy else logstr.erro("× sick")
-            )
+            if instance.sleeping:
+                status = logstr.warn("sleeping")
+            else:
+                status = (
+                    logstr.okay("healthy") if instance.healthy else logstr.erro("sick")
+                )
             logger.mesg(
                 f"{gpu_text:<6} {instance.container_name:<35} {instance.endpoint:<25} {model_text:<20} {status:<8}"
             )
@@ -2412,8 +2469,20 @@ async def check_health(instances: list[QWNInstance]) -> None:
             try:
                 response = await client.get(instance.health_url)
                 instance.healthy = response.status_code == 200
+                instance.sleeping = False
+                if instance.healthy:
+                    try:
+                        sleep_response = await client.get(instance.sleep_state_url)
+                        if sleep_response.status_code == 200:
+                            payload = sleep_response.json()
+                            instance.sleeping = bool(payload.get("is_sleeping", False))
+                            if instance.sleeping:
+                                instance.healthy = False
+                    except Exception:
+                        instance.sleeping = False
             except Exception:
                 instance.healthy = False
+                instance.sleeping = False
     log_instances(instances, show_health=True)
 
 
