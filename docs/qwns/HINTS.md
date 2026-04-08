@@ -34,8 +34,12 @@ qwn compose up --gpu-configs "0:4b:4bit"
 - 继续往下深挖后，当前剩余主瓶颈仍然是 vLLM 自己的 `Initial profiling/warmup run`；它会走一次较重的合成 profile forward 路径，在不牺牲吞吐的前提下，没有找到足够安全的默认参数可以把这段成本直接抹掉
 - 因此现在新增了更安全的快启路径：保留冷启动参数不变，但允许后端进入 sleep，再在下一次启动时直接 wake，避免反复重做整轮冷初始化
 - 手动启用方式：`qwn compose up --enable-sleep-mode ...`
+- 另外实测还发现：即使 `/health` 已经是 200，每张卡在启动后的第一条真实生成请求上仍然会再付一次约 `2.7s` 的惰性初始化成本；如果 machine 把最初几条请求分散到不同 GPU，用户就会连续看到 `2000ms+` 的 TTFT
+- 为了把这段成本前移，`qwn compose warmup --wait-healthy` 现在会对每个 backend 并行发送一条极小的预热请求；`runs/qwns/02_start_machine.sh` 默认会先做这一步，再启动 machine
+- 这一轮预热完成后，实测 machine 路径的首 token 延迟可以回到约 `0.08s-0.11s`
 - 挂起后端：`qwn compose sleep`
 - 查看状态：`qwn compose sleep-status`
+- 预热后端：`qwn compose warmup --wait-healthy`
 - 唤醒并等待恢复健康：`qwn compose wake --wait-healthy`
 - `qwn machine` 现在会把 sleeping 实例视为“不可路由”，避免 vLLM 的 `/health` 仍然返回 200 时被误判成可服务实例
 

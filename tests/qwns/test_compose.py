@@ -349,6 +349,48 @@ class TestQWNComposer:
         )
         mock_wait.assert_called_once()
 
+    @patch("tfmx.qwns.compose.GPUDetector.detect")
+    def test_warmup_waits_for_healthy_backends(self, mock_detect):
+        mock_detect.return_value = [GPUInfo(index=0, compute_cap="8.6")]
+        composer = QWNComposer(project_name="qwn-test")
+        models_response = MagicMock(status_code=200)
+        models_response.json.return_value = {"data": [{"id": "4b:4bit"}]}
+        warmup_response = MagicMock(status_code=200)
+
+        with patch.object(
+            composer,
+            "_get_control_endpoints",
+            return_value=["http://localhost:27880"],
+        ):
+            with patch.object(
+                composer,
+                "wait_for_healthy_backends",
+                return_value=True,
+            ) as mock_wait:
+                with patch(
+                    "tfmx.qwns.compose.requests.get",
+                    return_value=models_response,
+                ) as mock_get:
+                    with patch(
+                        "tfmx.qwns.compose.requests.post",
+                        return_value=warmup_response,
+                    ) as mock_post:
+                        assert composer.warmup(wait_healthy=True) is True
+
+        mock_wait.assert_called_once()
+        mock_get.assert_called_once_with(
+            "http://localhost:27880/v1/models",
+            timeout=5.0,
+        )
+        assert (
+            mock_post.call_args.args[0] == "http://localhost:27880/v1/chat/completions"
+        )
+        payload = mock_post.call_args.kwargs["json"]
+        assert payload["model"] == "4b:4bit"
+        assert payload["messages"][0]["content"] == "你好，请只回答一个字：好"
+        assert payload["chat_template_kwargs"]["enable_thinking"] is False
+        assert payload["max_tokens"] == 16
+
 
 class TestComposeParser:
     def test_sleep_status_accepts_gpu_layout(self):
@@ -360,4 +402,15 @@ class TestComposeParser:
         args = parser.parse_args(["sleep-status", "--gpu-layout", "uniform-awq"])
 
         assert args.compose_action == "sleep-status"
+        assert args.gpu_layout == "uniform-awq"
+
+    def test_warmup_accepts_gpu_layout(self):
+        parser = argparse.ArgumentParser()
+        from tfmx.qwns.compose import configure_parser
+
+        configure_parser(parser)
+
+        args = parser.parse_args(["warmup", "--gpu-layout", "uniform-awq"])
+
+        assert args.compose_action == "warmup"
         assert args.gpu_layout == "uniform-awq"

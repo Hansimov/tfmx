@@ -10,7 +10,13 @@ qwn_cmd() {
 }
 
 if [[ "${QWN_WAKE_BACKENDS:-1}" != "0" ]]; then
-	qwn_cmd compose wake --wait-healthy || true
+	if qwn_cmd compose sleep-status >/dev/null 2>&1; then
+		qwn_cmd compose wake --wait-healthy || true
+	fi
+fi
+
+if [[ "${QWN_WARMUP_BACKENDS:-1}" != "0" ]]; then
+	qwn_cmd compose warmup --wait-healthy
 fi
 
 qwn_cmd machine run -b --on-conflict replace

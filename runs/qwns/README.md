@@ -41,6 +41,7 @@ bash runs/qwns/03_health_check.sh
 - The default qwn network config already applies the Hugging Face mirror and USTC PyPI mirror.
 - Export `QWN_PROXY` only if you want to provide an explicit build proxy override.
 - `01_deploy_uniform.sh` enables vLLM sleep mode by default; set `QWN_ENABLE_SLEEP_MODE=0` to opt out.
-- `02_start_machine.sh` tries `qwn compose wake --wait-healthy` before starting the proxy, so sleeping backends can resume without a fresh cold init.
+- `02_start_machine.sh` can wake sleeping backends and now also runs `qwn compose warmup --wait-healthy` by default, so each GPU pays its one-time first-request lazy init before user traffic arrives.
+- Set `QWN_WARMUP_BACKENDS=0` if you explicitly want to skip that warmup step.
 - `98_sleep_backends.sh` is the non-destructive stop path; `99_cleanup.sh` remains the fully destructive teardown path.
 - Benchmark results are written under `runs/qwns/results/`.

@@ -10,6 +10,7 @@ import re
 import shlex
 import subprocess
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -62,6 +63,11 @@ DEFAULT_SLEEP_MODE = "abort"
 SLEEP_CONTROL_TIMEOUT_SEC = 5.0
 SLEEP_WAKE_TIMEOUT_SEC = 180.0
 SLEEP_WAKE_POLL_INTERVAL_SEC = 2.0
+WARMUP_REQUEST_TIMEOUT_SEC = 60.0
+WARMUP_HEALTH_TIMEOUT_SEC = 300.0
+WARMUP_HEALTH_POLL_INTERVAL_SEC = 2.0
+WARMUP_PROMPT = "你好，请只回答一个字：好"
+WARMUP_MAX_TOKENS = 16
 
 CUDAGRAPH_MODE_CHOICES = (
     "NONE",
@@ -1385,6 +1391,97 @@ class QWNComposer:
 
         return bool(successes)
 
+    @staticmethod
+    def _build_warmup_payload(model_id: str) -> dict[str, object]:
+        return {
+            "model": model_id,
+            "messages": [{"role": "user", "content": WARMUP_PROMPT}],
+            "max_tokens": WARMUP_MAX_TOKENS,
+            "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False},
+        }
+
+    @staticmethod
+    def _discover_backend_model_id(endpoint: str) -> str:
+        response = requests.get(
+            f"{endpoint}/v1/models",
+            timeout=SLEEP_CONTROL_TIMEOUT_SEC,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"model discovery returned HTTP {response.status_code}")
+
+        try:
+            payload = response.json()
+        except ValueError as exc:
+            raise RuntimeError("model discovery returned invalid JSON") from exc
+
+        data = payload.get("data")
+        if not isinstance(data, list) or not data:
+            raise RuntimeError("model discovery returned no models")
+
+        model_id = str(data[0].get("id", "")).strip()
+        if not model_id:
+            raise RuntimeError("model discovery returned an empty model id")
+        return model_id
+
+    def _warmup_backend(self, endpoint: str) -> str:
+        model_id = self._discover_backend_model_id(endpoint)
+        response = requests.post(
+            f"{endpoint}/v1/chat/completions",
+            json=self._build_warmup_payload(model_id),
+            timeout=WARMUP_REQUEST_TIMEOUT_SEC,
+        )
+        if response.status_code != 200:
+            raise RuntimeError(f"warmup returned HTTP {response.status_code}")
+        return model_id
+
+    def warmup(self, wait_healthy: bool = False) -> bool:
+        if wait_healthy:
+            healthy = self.wait_for_healthy_backends(
+                timeout_sec=WARMUP_HEALTH_TIMEOUT_SEC,
+                poll_interval_sec=WARMUP_HEALTH_POLL_INTERVAL_SEC,
+                label="[qwn]",
+            )
+            if not healthy:
+                return False
+
+        endpoints = self._get_control_endpoints()
+        if not endpoints:
+            logger.warn("[qwn] No running backends found for warmup")
+            return False
+
+        successes: list[tuple[str, str]] = []
+        failures: list[tuple[str, str]] = []
+        with ThreadPoolExecutor(max_workers=min(len(endpoints), 8)) as executor:
+            future_map = {
+                executor.submit(self._warmup_backend, endpoint): endpoint
+                for endpoint in endpoints
+            }
+            for future in as_completed(future_map):
+                endpoint = future_map[future]
+                try:
+                    model_id = future.result()
+                except Exception as exc:
+                    failures.append((endpoint, str(exc)))
+                    continue
+                successes.append((endpoint, model_id))
+
+        for endpoint, model_id in successes:
+            logger.mesg(f"[qwn] Warmed {endpoint} with model {model_id}")
+        for endpoint, error in failures:
+            logger.warn(f"[qwn] Warmup failed for {endpoint}: {error}")
+
+        if successes and not failures:
+            logger.okay(f"[qwn] Warmed up {len(successes)} backend(s)")
+        elif successes:
+            logger.warn(
+                f"[qwn] Warmed {len(successes)} backend(s), but {len(failures)} backend(s) failed"
+            )
+        else:
+            logger.warn("[qwn] Failed to warm any running backend")
+
+        return bool(successes) and not failures
+
     def wait_for_healthy_backends(
         self,
         timeout_sec: float = 300.0,
@@ -1565,6 +1662,7 @@ Examples:
     qwn compose up --gpu-configs "0,1"
   qwn compose up --gpu-configs "0:4b:4bit,1:4b:4bit"
   qwn compose generate -j qwn-awq --gpu-configs "0:4b:4bit"
+        qwn compose warmup --wait-healthy
     qwn compose sleep
     qwn compose wake --wait-healthy
     qwn compose sleep-status
@@ -1762,6 +1860,18 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     add_common_arguments(parser_sleep_status)
     add_targeting_arguments(parser_sleep_status)
 
+    parser_warmup = subparsers.add_parser(
+        "warmup",
+        help="Warm QWN backends with a tiny generation request to remove first-request TTFT spikes",
+    )
+    add_common_arguments(parser_warmup)
+    add_targeting_arguments(parser_warmup)
+    parser_warmup.add_argument(
+        "--wait-healthy",
+        action="store_true",
+        help="Wait for backend /health endpoints before sending warmup requests",
+    )
+
     parser_logs = subparsers.add_parser("logs", help="View container logs")
     add_common_arguments(parser_logs)
     parser_logs.add_argument("-f", "--follow", action="store_true")
@@ -1838,6 +1948,8 @@ def run_from_args(args: argparse.Namespace) -> None:
         composer.wake(wait_healthy=getattr(args, "wait_healthy", False))
     elif action == "sleep-status":
         composer.sleep_status()
+    elif action == "warmup":
+        composer.warmup(wait_healthy=getattr(args, "wait_healthy", False))
     elif action == "ps":
         composer.ps()
     elif action == "logs":
