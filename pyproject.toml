@@ -27,6 +27,7 @@ gpu_fan = "tfmx.gpus.fan:main"
 gpu_mon = "tfmx.gpus.mon:main"
 gpu_pow = "tfmx.gpus.pow:main"
 tei = "tfmx.teis.cli:main"
+qsr = "tfmx.qsrs.cli:main"
 qvl_compose = "tfmx.qvls.compose:main"
 qvl_machine = "tfmx.qvls.machine:main"
 qvl_client = "tfmx.qvls.client:main"
@@ -45,4 +46,7 @@ where = ["src"]
 "tfmx.teis" = [
     "config_qwen3_embedding_06b.json",
     "config_sentence_transformers.json",
+]
+"tfmx.qsrs" = [
+    "docker_data/Dockerfile.qwen3-asr-vllm",
 ]

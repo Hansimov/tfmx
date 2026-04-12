@@ -57,6 +57,16 @@ class TestPackageImports:
         assert QWNComposer is not None
         assert QWNClient is not None
 
+    def test_import_qsrs_module(self):
+        from tfmx.qsrs import QSRComposer
+        from tfmx.qsrs import QSRClient, AsyncQSRClient
+        from tfmx.qsrs import QSRRouter, InstanceDescriptor
+        from tfmx.qsrs import QSRMachineServer, QSRInstance
+        from tfmx.qsrs import QSRBenchmark, ASRBenchmarkMetrics
+
+        assert QSRComposer is not None
+        assert QSRClient is not None
+
     def test_import_from_root(self):
         """All public APIs should also be importable from root tfmx"""
         from tfmx import TEIClient, TEIClients, TEIClientsWithStats
@@ -66,9 +76,11 @@ class TestPackageImports:
         from tfmx import PerfTracker, IdleFillingScheduler
         from tfmx import LSHConverter
         from tfmx import QWNClient, QWNComposer, QWNBenchmark
+        from tfmx import QSRClient, QSRComposer, QSRBenchmark
 
         assert TEIClient is not None
         assert QWNClient is not None
+        assert QSRClient is not None
 
     def test_gpus_submodules(self):
         """GPU submodule files should be importable"""
@@ -100,6 +112,15 @@ class TestPackageImports:
         from tfmx.qwns import benchmark, client, clients, compose, scheduler
         from tfmx.qwns import perf_tracker, performance
         from tfmx.qwns import cli, machine, router
+
+        assert client is not None
+        assert machine is not None
+
+    def test_qsrs_submodules(self):
+        """QSR submodule files should be importable"""
+        from tfmx.qsrs import benchmark, client, clients, compose, scheduler
+        from tfmx.qsrs import perf_tracker, performance
+        from tfmx.qsrs import cli, machine, router
 
         assert client is not None
         assert machine is not None
@@ -193,6 +214,24 @@ class TestModuleStructure:
         assert (qwns_dir / "benchmark.py").exists()
         assert (qwns_dir / "router.py").exists()
         assert (qwns_dir / "cli.py").exists()
+
+    def test_qsrs_directory_exists(self):
+        import tfmx.qsrs
+        from pathlib import Path
+
+        qsrs_dir = Path(tfmx.qsrs.__file__).parent
+        assert (qsrs_dir / "client.py").exists()
+        assert (qsrs_dir / "clients.py").exists()
+        assert (qsrs_dir / "compose.py").exists()
+        assert (qsrs_dir / "scheduler.py").exists()
+        assert (qsrs_dir / "machine.py").exists()
+        assert (qsrs_dir / "perf_tracker.py").exists()
+        assert (qsrs_dir / "performance.py").exists()
+        assert (qsrs_dir / "benchmark.py").exists()
+        assert (qsrs_dir / "clients_core.py").exists()
+        assert (qsrs_dir / "clients_stats.py").exists()
+        assert (qsrs_dir / "router.py").exists()
+        assert (qsrs_dir / "cli.py").exists()
 
     def test_utils_directory_exists(self):
         import tfmx.utils

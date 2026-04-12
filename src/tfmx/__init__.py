@@ -50,6 +50,13 @@ from .qwns import QWNClients, QWNClientsWithStats
 from .qwns import QWNComposer, QWNRouter, InstanceDescriptor as QWNInstanceDescriptor
 from .qwns import QWNMachineServer, QWNInstance, QWNMachineDaemon
 
+# QSR
+from .qsrs import QSRBenchmark, ASRBenchmarkMetrics as QSRBenchmarkMetrics
+from .qsrs import QSRClient, AsyncQSRClient, build_audio_messages
+from .qsrs import QSRClients, QSRClientsWithStats
+from .qsrs import QSRComposer, QSRRouter, InstanceDescriptor as QSRInstanceDescriptor
+from .qsrs import QSRMachineServer, QSRInstance, QSRMachineDaemon
+
 # GPU
 from .gpus.fan import NvidiaSettingsParser, GPUFanController, GPUFanArgParser
 from .gpus.pow import NvidiaSmiParser, GPUPowerController, GPUPowerArgParser

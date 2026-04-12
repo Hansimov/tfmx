@@ -62,6 +62,18 @@ qwn client chat "你好，请做个自我介绍"
 qwn benchmark run -E "$QWN_MACHINE_URL" -n 100
 ```
 
+Run qsr compose, machine, and benchmark:
+
+```sh
+export QSR_MACHINE_URL="http://$QSR_HOST:27900"
+
+qsr compose up --gpu-configs "0"
+qsr machine run --auto-start -b --on-conflict replace
+qsr client transcribe ./sample.wav
+qsr client chat --audio ./sample.wav "请转写为简体中文"
+qsr benchmark run -E "$QSR_MACHINE_URL" -n 20 --audio ./sample.wav
+```
+
 ## Staged Run Scripts
 
 For repeatable repo-local workflows, use the staged script directories:
@@ -73,9 +85,13 @@ bash runs/teis/03_health_check.sh
 bash runs/qwns/01_deploy_uniform.sh
 bash runs/qwns/02_start_machine.sh
 bash runs/qwns/03_health_check.sh
+bash runs/qsrs/01_deploy_default.sh
+bash runs/qsrs/02_start_machine.sh
+bash runs/qsrs/03_health_check.sh
 bash runs/recovery/restart_tei_qwn.sh
 ```
 
 - `runs/teis/README.md`: staged TEI deploy, health, benchmark, cleanup
 - `runs/qwns/README.md`: staged QWN deploy, health, benchmark, cleanup
+- `runs/qsrs/README.md`: staged QSR deploy, health, benchmark, cleanup
 - `runs/recovery/README.md`: joint TEI + QWN recovery and live validation
