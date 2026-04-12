@@ -6,6 +6,7 @@ from unittest.mock import patch
 from tfmx.utils.service_bootstrap import PortConflict
 from tfmx.utils.service_bootstrap import docker_status_to_health
 from tfmx.utils.service_bootstrap import wait_for_healthy_docker_containers
+from tfmx.utils.service_bootstrap import wait_for_healthy_http_endpoints
 from tfmx.utils.service_bootstrap import handle_port_conflicts
 from tfmx.utils.service_bootstrap import wait_for_available_backend_instances
 
@@ -90,6 +91,27 @@ class TestDockerHealthHelpers:
         assert docker_status_to_health("Up 5 seconds (health: starting)") is None
         assert docker_status_to_health("Exited (1) 2 seconds ago") is False
         assert docker_status_to_health("Up 1 minute") is None
+
+    @patch("tfmx.utils.service_bootstrap.httpx.get")
+    def test_wait_for_healthy_http_endpoints(self, mock_get):
+        mock_get.side_effect = [
+            SimpleNamespace(status_code=200),
+            SimpleNamespace(status_code=200),
+        ]
+
+        assert (
+            wait_for_healthy_http_endpoints(
+                ["http://localhost:27880", "http://localhost:27881"],
+                timeout_sec=1.0,
+                poll_interval_sec=0.0,
+                label="[test]",
+            )
+            is True
+        )
+        assert {call.args[0] for call in mock_get.call_args_list} == {
+            "http://localhost:27880/health",
+            "http://localhost:27881/health",
+        }
 
     @patch("tfmx.utils.service_bootstrap.time.sleep", return_value=None)
     @patch(

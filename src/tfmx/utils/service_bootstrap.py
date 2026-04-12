@@ -4,6 +4,7 @@ import signal
 import subprocess
 import time
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 
 import httpx
@@ -145,15 +146,26 @@ def wait_for_healthy_http_endpoints(
         f"{label} Waiting for {len(pending)} backend endpoint(s) to become healthy"
     )
 
-    with httpx.Client(timeout=httpx.Timeout(request_timeout_sec)) as client:
+    def probe(endpoint: str) -> tuple[str, bool]:
+        try:
+            response = httpx.get(
+                f"{endpoint}{health_path}",
+                timeout=httpx.Timeout(request_timeout_sec),
+            )
+            return endpoint, response.status_code == 200
+        except Exception:
+            return endpoint, False
+
+    max_workers = max(1, min(32, len(normalized_endpoints)))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
         while pending and time.monotonic() < deadline:
-            for endpoint in list(pending):
-                try:
-                    response = client.get(f"{endpoint}{health_path}")
-                    if response.status_code == 200:
-                        pending.remove(endpoint)
-                except Exception:
-                    continue
+            future_to_endpoint = {
+                executor.submit(probe, endpoint): endpoint for endpoint in pending
+            }
+            for future in as_completed(future_to_endpoint):
+                endpoint, healthy = future.result()
+                if healthy:
+                    pending.discard(endpoint)
 
             if pending:
                 remaining = deadline - time.monotonic()

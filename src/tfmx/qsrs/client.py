@@ -1108,6 +1108,7 @@ class AsyncQSRClient:
         self.verbose = verbose
         self.client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
         self._cached_default_model: str = ""
+        self._model_resolve_lock: asyncio.Lock | None = None
 
     def reset(self) -> None:
         return
@@ -1138,16 +1139,25 @@ class AsyncQSRClient:
             return result
         raise RuntimeError("No models endpoint available")
 
+    def _get_model_resolve_lock(self) -> asyncio.Lock:
+        if self._model_resolve_lock is None:
+            self._model_resolve_lock = asyncio.Lock()
+        return self._model_resolve_lock
+
     async def _resolve_model(self, model: str = "") -> str:
         explicit_model = (model or "").strip()
         if explicit_model:
             return explicit_model
         if self._cached_default_model:
             return self._cached_default_model
-        result = await self.models()
-        if result.models:
-            self._cached_default_model = result.models[0]
-        return self._cached_default_model
+
+        async with self._get_model_resolve_lock():
+            if self._cached_default_model:
+                return self._cached_default_model
+            result = await self.models()
+            if result.models:
+                self._cached_default_model = result.models[0]
+            return self._cached_default_model
 
     async def chat(
         self,

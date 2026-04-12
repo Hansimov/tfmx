@@ -14,6 +14,7 @@ import shlex
 import subprocess
 import wave
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
@@ -1125,13 +1126,17 @@ class QSRComposer:
 
     def wait_for_ready_backends(
         self,
+        endpoints: list[str] | None = None,
         timeout_sec: float = WARMUP_WAIT_TIMEOUT_SEC,
         poll_interval_sec: float = WARMUP_POLL_INTERVAL_SEC,
         request_timeout_sec: float = READINESS_REQUEST_TIMEOUT_SEC,
         label: str = "[qsr]",
     ) -> bool:
+        target_endpoints = [
+            endpoint.rstrip("/") for endpoint in (endpoints or []) if endpoint
+        ] or self.get_backend_endpoints()
         return wait_for_healthy_http_endpoints(
-            self.get_backend_endpoints(),
+            target_endpoints,
             timeout_sec=timeout_sec,
             poll_interval_sec=poll_interval_sec,
             request_timeout_sec=request_timeout_sec,
@@ -1266,6 +1271,7 @@ class QSRComposer:
         if wait_for_ready:
             logger.mesg(f"[qsr] Waiting for {len(targets)} backend(s) before warmup")
             if not self.wait_for_ready_backends(
+                endpoints=[endpoint for _, endpoint in targets],
                 timeout_sec=wait_timeout_sec,
                 poll_interval_sec=poll_interval_sec,
                 request_timeout_sec=READINESS_REQUEST_TIMEOUT_SEC,
@@ -1277,12 +1283,29 @@ class QSRComposer:
                 return
 
         audio_upload = self._load_warmup_audio(audio)
+        results: dict[str, tuple[bool, str]] = {}
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            future_to_name = {
+                executor.submit(
+                    self._warmup_endpoint,
+                    endpoint,
+                    audio_upload=audio_upload,
+                    request_timeout_sec=request_timeout_sec,
+                ): container_name
+                for container_name, endpoint in targets
+            }
+            for future in as_completed(future_to_name):
+                container_name = future_to_name[future]
+                try:
+                    results[container_name] = future.result()
+                except Exception as exc:
+                    results[container_name] = (False, str(exc))
+
         failures: list[str] = []
-        for container_name, endpoint in self._discover_running_backend_targets():
-            okay, message = self._warmup_endpoint(
-                endpoint,
-                audio_upload=audio_upload,
-                request_timeout_sec=request_timeout_sec,
+        for container_name, _endpoint in targets:
+            okay, message = results.get(
+                container_name,
+                (False, "warmup task did not complete"),
             )
             if okay:
                 logger.okay(f"[qsr] Warmed {container_name}: {message}")

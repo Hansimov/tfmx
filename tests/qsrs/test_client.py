@@ -1,5 +1,7 @@
 """Tests for tfmx.qsrs.client."""
 
+import asyncio
+
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -9,6 +11,7 @@ from tfmx.qsrs.client import ChatChoice
 from tfmx.qsrs.client import ChatMessage
 from tfmx.qsrs.client import ChatResponse
 from tfmx.qsrs.client import ChatUsage
+from tfmx.qsrs.client import AsyncQSRClient
 from tfmx.qsrs.client import InfoResponse
 from tfmx.qsrs.client import ModelInfo
 from tfmx.qsrs.client import QSRClient
@@ -254,3 +257,26 @@ class TestQSRClient:
 
         assert first == second
         assert mock_get.call_count == 1
+
+
+class TestAsyncQSRClient:
+    def test_resolve_model_fetches_models_once_for_concurrent_requests(self):
+        client = AsyncQSRClient(endpoint="http://localhost:27900")
+        call_count = 0
+
+        async def fake_models() -> ModelInfo:
+            nonlocal call_count
+            call_count += 1
+            await asyncio.sleep(0)
+            return ModelInfo(models=["qwen3-asr-0.6b"])
+
+        async def run_test() -> None:
+            with patch.object(client, "models", side_effect=fake_models):
+                resolved = await asyncio.gather(
+                    *[client._resolve_model("") for _ in range(8)]
+                )
+            assert resolved == ["qwen3-asr-0.6b"] * 8
+            assert call_count == 1
+            await client.close()
+
+        asyncio.run(run_test())

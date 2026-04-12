@@ -189,15 +189,9 @@ class TestQSRComposerWarmup:
         with patch.object(
             composer_obj,
             "_discover_running_backend_targets",
-            side_effect=[
-                [
-                    ("qsr-uniform--gpu0", "http://localhost:27980"),
-                    ("qsr-uniform--gpu1", "http://localhost:27981"),
-                ],
-                [
-                    ("qsr-uniform--gpu0", "http://localhost:27980"),
-                    ("qsr-uniform--gpu1", "http://localhost:27981"),
-                ],
+            return_value=[
+                ("qsr-uniform--gpu0", "http://localhost:27980"),
+                ("qsr-uniform--gpu1", "http://localhost:27981"),
             ],
         ), patch.object(
             compose.QSRComposer,
@@ -206,7 +200,7 @@ class TestQSRComposerWarmup:
         ), patch.object(
             composer_obj,
             "_warmup_endpoint",
-            side_effect=[(True, "ok"), (True, "ok")],
+            side_effect=lambda endpoint, **_kwargs: (True, f"ok:{endpoint}"),
         ) as mock_warmup:
             composer_obj.warmup(
                 audio="./sample.wav",
@@ -216,13 +210,18 @@ class TestQSRComposerWarmup:
             )
 
         mock_wait_for_ready.assert_called_once_with(
+            endpoints=["http://localhost:27980", "http://localhost:27981"],
             timeout_sec=12.0,
             poll_interval_sec=0.5,
             request_timeout_sec=1.0,
             label="[qsr]",
         )
         assert mock_warmup.call_count == 2
-        assert mock_warmup.call_args_list[0].args == ("http://localhost:27980",)
+        called_endpoints = {call.args[0] for call in mock_warmup.call_args_list}
+        assert called_endpoints == {
+            "http://localhost:27980",
+            "http://localhost:27981",
+        }
         assert mock_warmup.call_args_list[0].kwargs == {
             "audio_upload": ("sample.wav", b"RIFF1234WAVEfmt ", "audio/wav"),
             "request_timeout_sec": 34.0,
