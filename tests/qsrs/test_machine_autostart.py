@@ -53,7 +53,7 @@ class TestQSRMachineAutoStart:
         assert mock_wait_for_available.call_args.kwargs == {
             "timeout_sec": 12.0,
             "poll_interval_sec": 0.5,
-            "settle_sec": 10.0,
+            "settle_sec": 2.0,
             "label": "[qsr_machine]",
         }
         assert [instance.port for instance in instances] == [27980]

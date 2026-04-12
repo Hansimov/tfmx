@@ -69,6 +69,9 @@ qsr compose up --gpu-configs "0"
 # 所有健康 GPU 统一部署默认 Qwen3-ASR
 qsr compose up --gpu-layout uniform
 
+# 如需尽快返回而不等待默认预热，可显式跳过
+qsr compose up --gpu-layout uniform --skip-warmup
+
 # 只在 0,1 两张卡上部署
 qsr compose up --gpu-layout uniform -g 0,1
 
@@ -83,7 +86,8 @@ qsr compose up --gpu-layout uniform --pip-index-url https://mirrors.ustc.edu.cn/
 
 - `--gpu-layout uniform` 会对所有选中 GPU 使用同一个默认 ASR 模型
 - `--gpu-configs "0,2"` 也是合法写法，表示 GPU0/GPU2 使用默认 `Qwen/Qwen3-ASR-0.6B`
-- 当前 compose 层没有额外的 warmup/sleep 子命令，逻辑保持尽量简单
+- `qsr compose up` 现在默认会等待 backend 可达后做一次短转写 warmup，不再需要额外手动执行 `qsr compose warmup`
+- 如果你只是想先把容器拉起、稍后再手动预热，可显式加 `--skip-warmup`
 
 ### 3. 启动本地聚合代理
 
@@ -108,6 +112,7 @@ qsr machine logs
 
 - `qsr machine` 当前监听 `0.0.0.0:27900`，不仅是 `localhost`
 - `--auto-start` 会在没有检测到运行中的 QSR 后端时自动调用 `qsr compose up`
+- `--auto-start` 走到 `qsr compose up` 时也会继承默认 warmup，因此冷启动后不需要再额外手动预热一遍
 - `--on-conflict replace` 适合替换旧 machine 或已占用 `27900` 的旧进程
 - 后台 daemon 的 PID 与日志位于 `~/.cache/tfmx/qsr_machine.pid` 与 `~/.cache/tfmx/qsr_machine.log`
 

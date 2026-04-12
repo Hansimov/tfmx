@@ -87,7 +87,7 @@ class TestWaitForAvailableBackendInstances:
 class TestDockerHealthHelpers:
     def test_docker_status_to_health(self):
         assert docker_status_to_health("Up 10 seconds (healthy)") is True
-        assert docker_status_to_health("Up 5 seconds (health: starting)") is False
+        assert docker_status_to_health("Up 5 seconds (health: starting)") is None
         assert docker_status_to_health("Exited (1) 2 seconds ago") is False
         assert docker_status_to_health("Up 1 minute") is None
 

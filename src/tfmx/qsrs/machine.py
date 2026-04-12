@@ -51,8 +51,8 @@ HEALTH_REQUEST_TIMEOUT_SEC = 5.0
 MODEL_DISCOVERY_TIMEOUT_SEC = 10.0
 INSTANCE_ACQUIRE_TIMEOUT_SEC = 5.0
 BACKEND_STARTUP_TIMEOUT_SEC = 300.0
-BACKEND_STARTUP_POLL_INTERVAL_SEC = 5.0
-BACKEND_DISCOVERY_SETTLE_SEC = 10.0
+BACKEND_STARTUP_POLL_INTERVAL_SEC = 1.0
+BACKEND_DISCOVERY_SETTLE_SEC = 2.0
 SCHEDULER_ALGORITHM = "least_active_idle"
 
 
@@ -461,6 +461,7 @@ class QSRMachineServer:
         self._transcription_client: Optional[httpx.Client] = None
         self._health_task: Optional[asyncio.Task] = None
         self._capacity_cond: Optional[asyncio.Condition] = None
+        self._idle_tiebreak_counter: int = 0
         self._last_health_refresh_monotonic: float = 0.0
         self.router = QSRRouter()
         self._build_router()
@@ -733,7 +734,15 @@ class QSRMachineServer:
                 instance.container_name,
             )
         )
-        return idle_candidates[0], True
+        lowest_active = idle_candidates[0]._active_requests
+        tied_candidates = [
+            instance
+            for instance in idle_candidates
+            if instance._active_requests == lowest_active
+        ]
+        index = self._idle_tiebreak_counter % len(tied_candidates)
+        self._idle_tiebreak_counter += 1
+        return tied_candidates[index], True
 
     def _reserve_idle_instance_locked(
         self,

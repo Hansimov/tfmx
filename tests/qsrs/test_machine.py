@@ -168,6 +168,31 @@ class TestQSRMachineServer:
         assert "/audio/transcriptions" in route_paths
         assert "/v1/audio/transcriptions" in route_paths
 
+    def test_select_idle_instance_round_robins_when_load_ties(self):
+        first_instance = QSRInstance(
+            container_name="qsr-uniform--gpu0",
+            host="localhost",
+            port=27980,
+            gpu_id=0,
+            healthy=True,
+        )
+        second_instance = QSRInstance(
+            container_name="qsr-uniform--gpu1",
+            host="localhost",
+            port=27981,
+            gpu_id=1,
+            healthy=True,
+        )
+        server = QSRMachineServer(instances=[first_instance, second_instance])
+
+        selected_a, has_candidates_a = server._select_idle_instance()
+        selected_b, has_candidates_b = server._select_idle_instance()
+
+        assert has_candidates_a is True
+        assert has_candidates_b is True
+        assert selected_a is first_instance
+        assert selected_b is second_instance
+
     def test_forward_transcription_uses_sync_bridge(self):
         instance = QSRInstance(
             container_name="qsr-multi--gpu0",

@@ -13,6 +13,11 @@
 
 这套流程的目的不是“最少命令”，而是先确认后端容器能拉起，再启动聚合代理，最后才进入实际 ASR 请求与压测。
 
+补充说明：
+
+- `qsr compose up` 现在默认就会等待 backend 可达并做一次短转写 warmup；只有你显式使用 `--skip-warmup` 时，才需要后续单独再跑 `qsr compose warmup`
+- 在当前这台 20GB RTX 3080 机器上，QSR 多卡冷启动的主瓶颈已经验证是后端自身的 vLLM/Qwen3-ASR 初始化，不是 `docker compose up` 或额外的 warmup HTTP 请求
+
 ## 模型标签
 
 - Docker 层当前默认加载的模型仓库是 `Qwen/Qwen3-ASR-0.6B`
@@ -99,7 +104,7 @@ qsr machine run -e http://localhost:27980,http://localhost:27981
 
 ## 当前调度与可观测性
 
-- 当前调度器是轻量级 `least_active_idle`，不是像 `qwn machine` 那样的复杂自适应调度器
+- 当前调度器是轻量级 `least_active_idle`，不是像 `qwn machine` 那样的复杂自适应调度器；当多张卡的 `active_requests` 相同，会做轮转平手打破，避免持续偏向 GPU0
 - `/info` 会返回实例列表、每实例当前活跃请求数、最近健康检查延迟、累计请求统计和当前可用模型
 - `/metrics` 当前暴露的是基础 Prometheus 指标，例如实例数、健康实例数、总请求数、错误数、failover 数和当前活跃请求数
 
@@ -126,5 +131,5 @@ qsr client chat --audio ./sample.wav --max-tokens 256 "请转写并总结"
 ## 当前实现边界
 
 - 当前 repo 内的默认 compose/脚本/文档都围绕 `Qwen/Qwen3-ASR-0.6B`
-- 当前 `qsr compose` 没有额外的 `setup`、`warmup`、`sleep`、`wake` 子命令
+- 当前 `qsr compose` 已提供 `warmup` 子命令，用于在容器 healthy 后做一次短音频预热；`sleep`、`wake` 等生命周期能力仍未引入
 - 当前 `qsr machine` 是单机聚合代理，不负责跨机器统一入口

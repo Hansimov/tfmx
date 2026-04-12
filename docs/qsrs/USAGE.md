@@ -17,6 +17,8 @@ export QSR_BACKEND_B_URL="http://$QSR_BACKEND_HOST_B:27981"
 qsr compose up
 qsr compose up -g 0,1
 qsr compose up --gpu-layout uniform
+qsr compose up --gpu-layout uniform --skip-warmup
+qsr compose warmup --gpu-layout uniform -g 0,1
 qsr compose up --gpu-configs "0,2"
 qsr compose up --gpu-configs "0:Qwen/Qwen3-ASR-0.6B,1:Qwen/Qwen3-ASR-0.6B"
 qsr compose generate -j qsr-demo --gpu-configs "0"
@@ -37,6 +39,9 @@ qsr compose down
 - `--max-num-seqs`：每个 vLLM 实例允许的并发序列数，默认 `8`
 - `--gpu-memory-utilization`：vLLM 显存利用率上限，默认 `0.35`
 - `--project-name`：自定义 compose 项目名
+- `--skip-warmup`：只启动容器，不等待默认 warmup 完成；适合你只想先把后端拉起的场景
+- `compose warmup --audio`：对运行中的 backend 发起一次短转写预热；未提供时自动使用内置 WAV
+- `compose warmup --wait-timeout/--request-timeout`：控制 warmup 前健康等待和单 backend 请求超时
 
 ### 行为说明
 
@@ -44,6 +49,7 @@ qsr compose down
 - 若你只是想快速把所有健康 GPU 拉起，优先使用 `--gpu-layout uniform`
 - 若你要精确控制 per-GPU 部署，优先使用 `--gpu-configs`
 - 当前默认值已经按 `Qwen3-ASR-0.6B` 的实际需求收窄，避免 0.6B 模型在 20GB 卡上预留过大的 KV cache
+- `qsr compose up` 默认会在 backend 可达后自动做一次短转写 warmup；只有在你显式加了 `--skip-warmup` 时，才需要之后单独手动执行 `qsr compose warmup`
 
 ## `qsr machine`
 
@@ -67,6 +73,7 @@ qsr machine restart
 - `-e/--endpoints`：跳过容器自动发现，直接使用给定后端地址列表
 - `-b/--background`：以 daemon 模式运行
 - `--auto-start`：没有后端时自动调用 compose 拉起后端
+- `--auto-start`：没有后端时自动调用 compose 拉起后端，并继承 compose 的默认 warmup 行为
 - `--compose-gpus`：限制 auto-start 只用哪些 GPU
 - `--compose-gpu-layout`：指定 auto-start 的 named layout，当前支持 `uniform`
 - `--compose-gpu-configs`：用 `GPU[:MODEL],...` 精确控制 auto-start 的 per-GPU 模型配置
@@ -75,7 +82,7 @@ qsr machine restart
 ### 行为说明
 
 - `qsr machine` 是单机多 GPU 聚合层，不是跨机器入口
-- 调度算法当前是轻量级 `least_active_idle`，优先选择健康且当前活跃请求最少的实例
+- 调度算法当前是轻量级 `least_active_idle`，优先选择健康且当前活跃请求最少的实例；若活跃数相同，会在平手实例之间轮转，避免固定偏向低编号 GPU
 - 若上游实例在响应开始前返回 `5xx`、超时或断连，machine 会在健康实例之间做受控 failover
 - 若流式响应已经开始输出，则不会再切换实例，以避免混合多个上游流
 

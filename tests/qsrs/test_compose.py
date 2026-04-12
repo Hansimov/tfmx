@@ -1,10 +1,15 @@
 """Tests for tfmx.qsrs.compose."""
 
+from argparse import Namespace
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
+from tfmx.qsrs import compose
 from tfmx.qsrs.compose import ComposeFileGenerator
+from tfmx.qsrs.compose import CUDAGRAPH_MODE_CHOICES
+from tfmx.qsrs.compose import DEFAULT_CUDAGRAPH_MODE
 from tfmx.qsrs.compose import GPUInfo
 from tfmx.qsrs.compose import GPU_MEMORY_UTILIZATION
 from tfmx.qsrs.compose import GPU_LAYOUT_UNIFORM
@@ -28,6 +33,7 @@ from tfmx.qsrs.compose import build_gpu_configs_for_layout
 from tfmx.qsrs.compose import get_model_shortcut
 from tfmx.qsrs.compose import infer_gpu_ids
 from tfmx.qsrs.compose import parse_gpu_configs
+from tfmx.qsrs.compose import build_compilation_config
 
 
 class TestConstants:
@@ -53,6 +59,19 @@ class TestConstants:
         assert MAX_MODEL_LEN == 4096
         assert MAX_NUM_SEQS == 8
         assert GPU_MEMORY_UTILIZATION == 0.35
+        assert DEFAULT_CUDAGRAPH_MODE is None
+
+
+class TestCompilationConfig:
+    def test_build_compilation_config_default(self):
+        assert "NONE" in CUDAGRAPH_MODE_CHOICES
+        assert build_compilation_config() is None
+
+    def test_build_compilation_config_can_be_disabled(self):
+        assert build_compilation_config(None) is None
+
+    def test_build_compilation_config_with_override(self):
+        assert build_compilation_config("NONE") == {"cudagraph_mode": "NONE"}
 
 
 class TestModelShortcuts:
@@ -126,3 +145,157 @@ class TestComposeFileGenerator:
         assert HEALTHCHECK_TCP_PROBE in compose_text
         assert f"interval: {HEALTHCHECK_INTERVAL}" in compose_text
         assert f"start_period: {HEALTHCHECK_START_PERIOD}" in compose_text
+
+    def test_generate_single_gpu_can_enable_startup_shortcuts(self):
+        generator = ComposeFileGenerator(
+            gpus=[GPUInfo(index=0, compute_cap="8.9")],
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name="qsr-test",
+            data_dir=Path("/tmp/qsr-test"),
+            skip_mm_profiling=True,
+            cudagraph_mode="NONE",
+        )
+        compose_text = generator.generate()
+
+        assert "--skip-mm-profiling" in compose_text
+        assert 'cudagraph_mode":"NONE"' in compose_text
+
+
+class TestQSRComposerWarmup:
+    def test_build_embedded_warmup_audio(self):
+        filename, payload, mime_type = compose.QSRComposer._load_warmup_audio(None)
+
+        assert filename == "qsr-warmup.wav"
+        assert mime_type == "audio/wav"
+        assert payload.startswith(b"RIFF")
+        assert b"WAVE" in payload[:16]
+
+    @patch.object(compose.QSRComposer, "wait_for_ready_backends", return_value=True)
+    @patch("tfmx.qsrs.compose.GPUDetector.detect")
+    def test_warmup_targets_running_backends(
+        self,
+        mock_detect,
+        mock_wait_for_ready,
+    ):
+        mock_detect.return_value = [
+            GPUInfo(index=0, compute_cap="8.6"),
+            GPUInfo(index=1, compute_cap="8.6"),
+        ]
+        composer_obj = compose.QSRComposer(
+            project_name="qsr-uniform",
+            gpu_ids="0,1",
+        )
+        with patch.object(
+            composer_obj,
+            "_discover_running_backend_targets",
+            side_effect=[
+                [
+                    ("qsr-uniform--gpu0", "http://localhost:27980"),
+                    ("qsr-uniform--gpu1", "http://localhost:27981"),
+                ],
+                [
+                    ("qsr-uniform--gpu0", "http://localhost:27980"),
+                    ("qsr-uniform--gpu1", "http://localhost:27981"),
+                ],
+            ],
+        ), patch.object(
+            compose.QSRComposer,
+            "_load_warmup_audio",
+            return_value=("sample.wav", b"RIFF1234WAVEfmt ", "audio/wav"),
+        ), patch.object(
+            composer_obj,
+            "_warmup_endpoint",
+            side_effect=[(True, "ok"), (True, "ok")],
+        ) as mock_warmup:
+            composer_obj.warmup(
+                audio="./sample.wav",
+                wait_timeout_sec=12.0,
+                poll_interval_sec=0.5,
+                request_timeout_sec=34.0,
+            )
+
+        mock_wait_for_ready.assert_called_once_with(
+            timeout_sec=12.0,
+            poll_interval_sec=0.5,
+            request_timeout_sec=1.0,
+            label="[qsr]",
+        )
+        assert mock_warmup.call_count == 2
+        assert mock_warmup.call_args_list[0].args == ("http://localhost:27980",)
+        assert mock_warmup.call_args_list[0].kwargs == {
+            "audio_upload": ("sample.wav", b"RIFF1234WAVEfmt ", "audio/wav"),
+            "request_timeout_sec": 34.0,
+        }
+
+    @patch("tfmx.qsrs.compose.QSRComposer")
+    def test_run_from_args_dispatches_warmup(self, mock_composer_cls):
+        args = Namespace(
+            compose_action="warmup",
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name=None,
+            gpus=None,
+            hf_token=None,
+            mount_mode="manual",
+            proxy=None,
+            hf_endpoint=None,
+            pip_index_url=None,
+            pip_trusted_host=None,
+            max_model_len=MAX_MODEL_LEN,
+            max_num_seqs=MAX_NUM_SEQS,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            skip_mm_profiling=True,
+            gpu_layout=None,
+            gpu_configs=None,
+            audio="./sample.wav",
+            wait_timeout=45.0,
+            poll_interval=0.75,
+            request_timeout=60.0,
+        )
+
+        compose.run_from_args(args)
+
+        mock_composer_cls.return_value.warmup.assert_called_once_with(
+            audio="./sample.wav",
+            wait_timeout_sec=45.0,
+            poll_interval_sec=0.75,
+            request_timeout_sec=60.0,
+        )
+
+    @patch("tfmx.qsrs.compose.QSRComposer")
+    def test_run_from_args_dispatches_up_with_default_warmup(self, mock_composer_cls):
+        args = Namespace(
+            compose_action="up",
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name=None,
+            gpus=None,
+            hf_token=None,
+            mount_mode="manual",
+            proxy=None,
+            hf_endpoint=None,
+            pip_index_url=None,
+            pip_trusted_host=None,
+            max_model_len=MAX_MODEL_LEN,
+            max_num_seqs=MAX_NUM_SEQS,
+            gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
+            skip_mm_profiling=True,
+            gpu_layout=None,
+            gpu_configs=None,
+            skip_warmup=False,
+            warmup_audio="./sample.wav",
+            wait_timeout=45.0,
+            poll_interval=0.75,
+            request_timeout=60.0,
+        )
+
+        compose.run_from_args(args)
+
+        mock_composer_cls.return_value.up.assert_called_once_with(
+            skip_warmup=False,
+            warmup_audio="./sample.wav",
+            wait_timeout_sec=45.0,
+            poll_interval_sec=0.75,
+            request_timeout_sec=60.0,
+        )

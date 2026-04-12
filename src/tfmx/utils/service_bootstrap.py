@@ -129,6 +129,7 @@ def wait_for_healthy_http_endpoints(
     *,
     timeout_sec: float,
     poll_interval_sec: float,
+    request_timeout_sec: float = 5.0,
     health_path: str = "/health",
     label: str = "[tfmx]",
 ) -> bool:
@@ -144,7 +145,7 @@ def wait_for_healthy_http_endpoints(
         f"{label} Waiting for {len(pending)} backend endpoint(s) to become healthy"
     )
 
-    with httpx.Client(timeout=httpx.Timeout(5.0)) as client:
+    with httpx.Client(timeout=httpx.Timeout(request_timeout_sec)) as client:
         while pending and time.monotonic() < deadline:
             for endpoint in list(pending):
                 try:
@@ -176,7 +177,7 @@ def docker_status_to_health(status: str) -> bool | None:
     if "unhealthy" in normalized:
         return False
     if "health: starting" in normalized:
-        return False
+        return None
     if "(healthy)" in normalized or normalized == "healthy":
         return True
     if normalized.startswith("up "):

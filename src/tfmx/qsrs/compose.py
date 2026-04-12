@@ -5,16 +5,24 @@ Docker lifecycle helpers used by the unified ``qsr`` CLI.
 """
 
 import argparse
+import io
+import json
+import math
+import mimetypes
 import re
 import shlex
 import subprocess
+import wave
 
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+import httpx
+
 from tclogger import logger
 
+from ..utils.service_bootstrap import wait_for_healthy_http_endpoints
 from ..utils.service_bootstrap import wait_for_healthy_docker_containers
 from .networking import DEFAULT_HF_ENDPOINT
 from .networking import DEFAULT_PIP_INDEX_URL
@@ -57,12 +65,26 @@ MAX_NUM_SEQS = 8
 GPU_MEMORY_UTILIZATION = 0.35
 DEVICE_MOUNT_MODE = "manual"
 GPU_LAYOUT_UNIFORM = "uniform"
+DEFAULT_SKIP_MM_PROFILING = False
+DEFAULT_CUDAGRAPH_MODE: str | None = None
+
+CUDAGRAPH_MODE_CHOICES = (
+    "NONE",
+    "PIECEWISE",
+    "FULL",
+    "FULL_DECODE_ONLY",
+    "FULL_AND_PIECEWISE",
+)
 
 HEALTHCHECK_INTERVAL = "5s"
 HEALTHCHECK_TIMEOUT = "3s"
 HEALTHCHECK_RETRIES = 12
 HEALTHCHECK_START_PERIOD = "180s"
 HEALTHCHECK_TCP_PROBE = f"bash -lc 'exec 3<>/dev/tcp/127.0.0.1/{VLLM_INTERNAL_PORT}'"
+WARMUP_WAIT_TIMEOUT_SEC = 300.0
+WARMUP_POLL_INTERVAL_SEC = 1.0
+READINESS_REQUEST_TIMEOUT_SEC = 1.0
+WARMUP_REQUEST_TIMEOUT_SEC = 120.0
 
 SUPPORTED_MODELS = {
     MODEL_NAME: {
@@ -248,6 +270,18 @@ def build_gpu_configs_for_layout(
         raise ValueError(f"Unsupported GPU layout: {layout}")
 
     return [GpuModelConfig(gpu_id=gpu.index, model_name=MODEL_NAME) for gpu in gpus]
+
+
+def build_compilation_config(
+    cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
+) -> dict[str, object] | None:
+    if not cudagraph_mode:
+        return None
+
+    mode = cudagraph_mode.upper()
+    if mode not in CUDAGRAPH_MODE_CHOICES:
+        raise ValueError(f"Unsupported cudagraph mode: {cudagraph_mode}")
+    return {"cudagraph_mode": mode}
 
 
 class NvidiaDriverLibs:
@@ -536,6 +570,8 @@ class ComposeFileGenerator:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
+        skip_mm_profiling: bool = DEFAULT_SKIP_MM_PROFILING,
+        cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
         gpu_configs: list[GpuModelConfig] | None = None,
         network_config: QSRNetworkConfig | None = None,
     ):
@@ -559,6 +595,9 @@ class ComposeFileGenerator:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.skip_mm_profiling = skip_mm_profiling
+        self.cudagraph_mode = cudagraph_mode.upper() if cudagraph_mode else None
+        self.compilation_config = build_compilation_config(self.cudagraph_mode)
         self.gpu_configs = gpu_configs or []
         self._gpu_config_map = {config.gpu_id: config for config in self.gpu_configs}
         self.model_config_manager = ModelConfigManager(cache_hf_hub=self.cache_hf_hub)
@@ -706,6 +745,17 @@ class ComposeFileGenerator:
             "--trust-remote-code",
         ]
 
+        if self.skip_mm_profiling:
+            serve_args.append("--skip-mm-profiling")
+
+        if self.compilation_config:
+            serve_args.extend(
+                [
+                    "--compilation-config",
+                    json.dumps(self.compilation_config, separators=(",", ":")),
+                ]
+            )
+
         if self.hf_token:
             serve_args.extend(["--api-key", self.hf_token])
 
@@ -773,6 +823,8 @@ class QSRComposer:
         max_model_len: int = MAX_MODEL_LEN,
         max_num_seqs: int = MAX_NUM_SEQS,
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
+        skip_mm_profiling: bool = DEFAULT_SKIP_MM_PROFILING,
+        cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
         gpu_layout: Optional[str] = None,
         gpu_configs: list[GpuModelConfig] | None = None,
     ):
@@ -793,6 +845,8 @@ class QSRComposer:
         self.max_model_len = max_model_len
         self.max_num_seqs = max_num_seqs
         self.gpu_memory_utilization = gpu_memory_utilization
+        self.skip_mm_profiling = skip_mm_profiling
+        self.cudagraph_mode = cudagraph_mode.upper() if cudagraph_mode else None
         self.gpu_layout = normalize_model_key(gpu_layout) if gpu_layout else None
 
         if self.gpu_layout:
@@ -821,6 +875,12 @@ class QSRComposer:
             gpu.image = VLLM_IMAGE
         self.model_config_manager = ModelConfigManager()
         self.image_manager = DockerImageManager()
+
+    def _get_discovery_project_name(self) -> str:
+        compose_file = self._find_compose_file()
+        if compose_file is not None:
+            return compose_file.stem
+        return self.project_name
 
     def _find_compose_file(self) -> Path | None:
         if self.compose_file.exists():
@@ -893,6 +953,8 @@ class QSRComposer:
             max_model_len=self.max_model_len,
             max_num_seqs=self.max_num_seqs,
             gpu_memory_utilization=self.gpu_memory_utilization,
+            skip_mm_profiling=self.skip_mm_profiling,
+            cudagraph_mode=self.cudagraph_mode,
             gpu_configs=self.gpu_configs,
             network_config=self.network_config,
         )
@@ -913,7 +975,7 @@ class QSRComposer:
             return int(match.group(1))
         return None
 
-    def _discover_running_backend_endpoints(self) -> list[str]:
+    def _discover_running_backend_targets(self) -> list[tuple[str, str]]:
         result = subprocess.run(
             "docker ps --format '{{.Names}}|{{.Ports}}'",
             shell=True,
@@ -923,8 +985,8 @@ class QSRComposer:
         if result.returncode != 0 or not result.stdout.strip():
             return []
 
-        prefix = f"{self.project_name}--gpu"
-        endpoints: list[tuple[str, int]] = []
+        prefix = f"{self._get_discovery_project_name()}--gpu"
+        targets: list[tuple[str, str]] = []
         for line in result.stdout.splitlines():
             if not line.strip() or "|" not in line:
                 continue
@@ -935,10 +997,118 @@ class QSRComposer:
             host_port = self._extract_host_port(ports)
             if host_port is None:
                 continue
-            endpoints.append((container_name, host_port))
+            targets.append((container_name, f"http://localhost:{host_port}"))
 
-        endpoints.sort()
-        return [f"http://localhost:{port}" for _, port in endpoints]
+        targets.sort()
+        return targets
+
+    def _discover_running_backend_endpoints(self) -> list[str]:
+        return [endpoint for _, endpoint in self._discover_running_backend_targets()]
+
+    @staticmethod
+    def _build_embedded_warmup_audio() -> tuple[str, bytes, str]:
+        sample_rate = 16000
+        duration_sec = 0.25
+        frequency_hz = 440.0
+        amplitude = 0.2
+        frame_count = max(1, int(sample_rate * duration_sec))
+
+        pcm = bytearray()
+        for index in range(frame_count):
+            sample = math.sin(2.0 * math.pi * frequency_hz * index / sample_rate)
+            sample_int = int(32767 * amplitude * sample)
+            pcm.extend(sample_int.to_bytes(2, byteorder="little", signed=True))
+
+        buffer = io.BytesIO()
+        with wave.open(buffer, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(sample_rate)
+            wav_file.writeframes(bytes(pcm))
+
+        return "qsr-warmup.wav", buffer.getvalue(), "audio/wav"
+
+    @staticmethod
+    def _load_warmup_audio(audio: str | None) -> tuple[str, bytes, str]:
+        if not audio:
+            return QSRComposer._build_embedded_warmup_audio()
+
+        audio_path = Path(audio)
+        if not audio_path.exists():
+            raise FileNotFoundError(f"Warmup audio not found: {audio}")
+
+        mime_type, _ = mimetypes.guess_type(audio_path.name)
+        return (
+            audio_path.name,
+            audio_path.read_bytes(),
+            mime_type or "application/octet-stream",
+        )
+
+    @staticmethod
+    def _resolve_warmup_model(
+        client: httpx.Client,
+        endpoint: str,
+        fallback_model: str,
+    ) -> str:
+        for route in ("/v1/models", "/models"):
+            response = client.get(f"{endpoint}{route}")
+            if response.status_code in (404, 405):
+                continue
+            response.raise_for_status()
+
+            payload = response.json()
+            for item in payload.get("data", []):
+                model_id = str(item.get("id", "")).strip()
+                if model_id:
+                    return model_id
+            break
+        return fallback_model
+
+    def _warmup_endpoint(
+        self,
+        endpoint: str,
+        *,
+        audio_upload: tuple[str, bytes, str],
+        request_timeout_sec: float,
+    ) -> tuple[bool, str]:
+        filename, payload, mime_type = audio_upload
+        fallback_model = get_model_shortcut(self.model_name) or self.model_name
+        client = httpx.Client(timeout=httpx.Timeout(request_timeout_sec))
+        try:
+            model_name = self._resolve_warmup_model(client, endpoint, fallback_model)
+            files: list[tuple[str, object]] = []
+            if model_name:
+                files.append(("model", (None, model_name)))
+            files.append(("response_format", (None, "text")))
+            files.append(("file", (filename, payload, mime_type)))
+
+            last_error: Exception | None = None
+            for route in ("/v1/audio/transcriptions", "/audio/transcriptions"):
+                try:
+                    response = client.post(f"{endpoint}{route}", files=files)
+                    if response.status_code in (404, 405):
+                        continue
+                    response.raise_for_status()
+                    preview = " ".join(response.text.strip().split())
+                    if len(preview) > 96:
+                        preview = preview[:93] + "..."
+                    return True, preview or "ok"
+                except httpx.HTTPStatusError as exc:
+                    if exc.response.status_code in (404, 405):
+                        last_error = exc
+                        continue
+                    detail = exc.response.text.strip() or str(exc)
+                    return False, detail
+                except Exception as exc:
+                    return False, str(exc)
+
+            if last_error is not None:
+                return False, str(last_error)
+            return False, "No transcription endpoint available"
+        except Exception as exc:
+            return False, str(exc)
+        finally:
+            client.close()
 
     def wait_for_healthy_backends(
         self,
@@ -953,6 +1123,21 @@ class QSRComposer:
             label=label,
         )
 
+    def wait_for_ready_backends(
+        self,
+        timeout_sec: float = WARMUP_WAIT_TIMEOUT_SEC,
+        poll_interval_sec: float = WARMUP_POLL_INTERVAL_SEC,
+        request_timeout_sec: float = READINESS_REQUEST_TIMEOUT_SEC,
+        label: str = "[qsr]",
+    ) -> bool:
+        return wait_for_healthy_http_endpoints(
+            self.get_backend_endpoints(),
+            timeout_sec=timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            request_timeout_sec=request_timeout_sec,
+            label=label,
+        )
+
     def _run_compose_cmd(
         self,
         cmd: str,
@@ -962,7 +1147,15 @@ class QSRComposer:
         logger.mesg(f"[qsr] Running: {full_cmd}")
         return subprocess.run(full_cmd, shell=True, capture_output=capture_output)
 
-    def up(self) -> None:
+    def up(
+        self,
+        *,
+        skip_warmup: bool = False,
+        warmup_audio: str | None = None,
+        wait_timeout_sec: float = WARMUP_WAIT_TIMEOUT_SEC,
+        poll_interval_sec: float = WARMUP_POLL_INTERVAL_SEC,
+        request_timeout_sec: float = WARMUP_REQUEST_TIMEOUT_SEC,
+    ) -> None:
         if not self.gpus:
             logger.warn("× No healthy GPUs detected")
             summary = GPUDetector.get_unhealthy_gpu_summary()
@@ -995,6 +1188,14 @@ class QSRComposer:
             f"[qsr] Started services on GPUs: {[gpu.index for gpu in self.gpus]}"
         )
         self.ps()
+        if skip_warmup:
+            return
+        self.warmup(
+            audio=warmup_audio,
+            wait_timeout_sec=wait_timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            request_timeout_sec=request_timeout_sec,
+        )
 
     def down(self) -> None:
         if self._resolve_compose_cmd("down --remove-orphans"):
@@ -1048,6 +1249,51 @@ class QSRComposer:
                 f"docker restart {container}", shell=True, capture_output=True
             )
         logger.okay(f"[qsr] Restarted {len(containers)} container(s)")
+
+    def warmup(
+        self,
+        audio: str | None = None,
+        wait_timeout_sec: float = WARMUP_WAIT_TIMEOUT_SEC,
+        poll_interval_sec: float = WARMUP_POLL_INTERVAL_SEC,
+        request_timeout_sec: float = WARMUP_REQUEST_TIMEOUT_SEC,
+        wait_for_ready: bool = True,
+    ) -> None:
+        targets = self._discover_running_backend_targets()
+        if not targets:
+            logger.warn("[qsr] No running QSR backends found for warmup")
+            return
+
+        if wait_for_ready:
+            logger.mesg(f"[qsr] Waiting for {len(targets)} backend(s) before warmup")
+            if not self.wait_for_ready_backends(
+                timeout_sec=wait_timeout_sec,
+                poll_interval_sec=poll_interval_sec,
+                request_timeout_sec=READINESS_REQUEST_TIMEOUT_SEC,
+                label="[qsr]",
+            ):
+                logger.warn(
+                    "[qsr] Warmup aborted: backends did not become healthy in time"
+                )
+                return
+
+        audio_upload = self._load_warmup_audio(audio)
+        failures: list[str] = []
+        for container_name, endpoint in self._discover_running_backend_targets():
+            okay, message = self._warmup_endpoint(
+                endpoint,
+                audio_upload=audio_upload,
+                request_timeout_sec=request_timeout_sec,
+            )
+            if okay:
+                logger.okay(f"[qsr] Warmed {container_name}: {message}")
+            else:
+                logger.warn(f"[qsr] Warmup failed for {container_name}: {message}")
+                failures.append(container_name)
+
+        if failures:
+            logger.warn(f"[qsr] Warmup completed with failures: {', '.join(failures)}")
+            return
+        logger.okay(f"[qsr] Warmed {len(targets)} backend(s)")
 
     def ps(self) -> None:
         if self._resolve_compose_cmd("ps"):
@@ -1116,6 +1362,7 @@ Examples:
   qsr compose up
   qsr compose up -g 0,1
   qsr compose up --gpu-layout uniform
+    qsr compose warmup --gpu-layout uniform
   qsr compose up --gpu-configs "0,1"
   qsr compose up --gpu-configs "0:Qwen/Qwen3-ASR-0.6B,1:Qwen/Qwen3-ASR-0.6B"
   qsr compose generate -j qsr-demo --gpu-configs "0"
@@ -1201,6 +1448,57 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             type=float,
             default=GPU_MEMORY_UTILIZATION,
         )
+        target.set_defaults(skip_mm_profiling=DEFAULT_SKIP_MM_PROFILING)
+        target.add_argument(
+            "--skip-mm-profiling",
+            dest="skip_mm_profiling",
+            action="store_true",
+            help="Skip multimodal memory profiling during startup to reduce readiness time",
+        )
+        target.add_argument(
+            "--no-skip-mm-profiling",
+            dest="skip_mm_profiling",
+            action="store_false",
+            help="Keep vLLM multimodal memory profiling enabled during startup",
+        )
+        target.add_argument(
+            "--cudagraph-mode",
+            choices=CUDAGRAPH_MODE_CHOICES,
+            default=DEFAULT_CUDAGRAPH_MODE,
+            help=(
+                "vLLM cudagraph startup mode override. Default NONE prefers faster "
+                "readiness for QSR cold starts."
+            ),
+        )
+        target.add_argument(
+            "--skip-warmup",
+            action="store_true",
+            help="Start containers without waiting for readiness and default warmup",
+        )
+        target.add_argument(
+            "--warmup-audio",
+            type=str,
+            default=None,
+            help="Optional local audio file to use for the default warmup probe",
+        )
+        target.add_argument(
+            "--wait-timeout",
+            type=float,
+            default=WARMUP_WAIT_TIMEOUT_SEC,
+            help=f"Seconds to wait for backend readiness (default: {WARMUP_WAIT_TIMEOUT_SEC})",
+        )
+        target.add_argument(
+            "--poll-interval",
+            type=float,
+            default=WARMUP_POLL_INTERVAL_SEC,
+            help=f"Backend readiness polling interval in seconds (default: {WARMUP_POLL_INTERVAL_SEC})",
+        )
+        target.add_argument(
+            "--request-timeout",
+            type=float,
+            default=WARMUP_REQUEST_TIMEOUT_SEC,
+            help=f"Per-backend warmup request timeout in seconds (default: {WARMUP_REQUEST_TIMEOUT_SEC})",
+        )
         add_targeting_arguments(target)
 
     parser_up = subparsers.add_parser("up", help="Start QSR containers")
@@ -1210,6 +1508,37 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser_generate = subparsers.add_parser("generate", help="Generate compose file")
     add_common_arguments(parser_generate)
     add_deployment_arguments(parser_generate)
+
+    parser_warmup = subparsers.add_parser(
+        "warmup",
+        help="Warm running QSR backends with a short transcription probe",
+    )
+    add_common_arguments(parser_warmup)
+    add_targeting_arguments(parser_warmup)
+    parser_warmup.add_argument(
+        "--audio",
+        type=str,
+        default=None,
+        help="Optional local audio file for warmup; uses an embedded WAV when omitted",
+    )
+    parser_warmup.add_argument(
+        "--wait-timeout",
+        type=float,
+        default=WARMUP_WAIT_TIMEOUT_SEC,
+        help=f"Seconds to wait for healthy backends (default: {WARMUP_WAIT_TIMEOUT_SEC})",
+    )
+    parser_warmup.add_argument(
+        "--poll-interval",
+        type=float,
+        default=WARMUP_POLL_INTERVAL_SEC,
+        help=f"Health polling interval in seconds (default: {WARMUP_POLL_INTERVAL_SEC})",
+    )
+    parser_warmup.add_argument(
+        "--request-timeout",
+        type=float,
+        default=WARMUP_REQUEST_TIMEOUT_SEC,
+        help=f"Per-backend warmup request timeout in seconds (default: {WARMUP_REQUEST_TIMEOUT_SEC})",
+    )
 
     for action in ("down", "stop", "start", "restart", "ps", "health"):
         action_parser = subparsers.add_parser(
@@ -1246,6 +1575,16 @@ def run_from_args(args: argparse.Namespace) -> None:
             "gpu_memory_utilization",
             GPU_MEMORY_UTILIZATION,
         ),
+        skip_mm_profiling=getattr(
+            args,
+            "skip_mm_profiling",
+            DEFAULT_SKIP_MM_PROFILING,
+        ),
+        cudagraph_mode=getattr(
+            args,
+            "cudagraph_mode",
+            DEFAULT_CUDAGRAPH_MODE,
+        ),
         gpu_layout=getattr(args, "gpu_layout", None),
         gpu_configs=gpu_configs,
     )
@@ -1254,7 +1593,36 @@ def run_from_args(args: argparse.Namespace) -> None:
     if action == "generate":
         composer.generate_compose_file()
     elif action == "up":
-        composer.up()
+        composer.up(
+            skip_warmup=getattr(args, "skip_warmup", False),
+            warmup_audio=getattr(args, "warmup_audio", None),
+            wait_timeout_sec=getattr(args, "wait_timeout", WARMUP_WAIT_TIMEOUT_SEC),
+            poll_interval_sec=getattr(
+                args,
+                "poll_interval",
+                WARMUP_POLL_INTERVAL_SEC,
+            ),
+            request_timeout_sec=getattr(
+                args,
+                "request_timeout",
+                WARMUP_REQUEST_TIMEOUT_SEC,
+            ),
+        )
+    elif action == "warmup":
+        composer.warmup(
+            audio=getattr(args, "audio", None),
+            wait_timeout_sec=getattr(args, "wait_timeout", WARMUP_WAIT_TIMEOUT_SEC),
+            poll_interval_sec=getattr(
+                args,
+                "poll_interval",
+                WARMUP_POLL_INTERVAL_SEC,
+            ),
+            request_timeout_sec=getattr(
+                args,
+                "request_timeout",
+                WARMUP_REQUEST_TIMEOUT_SEC,
+            ),
+        )
     elif action == "down":
         composer.down()
     elif action == "stop":

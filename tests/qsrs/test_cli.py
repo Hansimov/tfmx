@@ -4,6 +4,46 @@ from tfmx.qsrs.cli import build_parser
 
 
 class TestQsrCliParser:
+    def test_compose_up_default_warmup_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "compose",
+                "up",
+                "--warmup-audio",
+                "./sample.wav",
+                "--no-skip-mm-profiling",
+                "--cudagraph-mode",
+                "FULL",
+                "--poll-interval",
+                "0.5",
+            ]
+        )
+        assert args.command == "compose"
+        assert args.compose_action == "up"
+        assert args.skip_warmup is False
+        assert args.warmup_audio == "./sample.wav"
+        assert args.skip_mm_profiling is False
+        assert args.cudagraph_mode == "FULL"
+        assert args.poll_interval == 0.5
+
+    def test_compose_warmup_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "compose",
+                "warmup",
+                "--audio",
+                "./sample.wav",
+                "--wait-timeout",
+                "30",
+            ]
+        )
+        assert args.command == "compose"
+        assert args.compose_action == "warmup"
+        assert args.audio == "./sample.wav"
+        assert args.wait_timeout == 30.0
+
     def test_compose_parse_gpu_configs(self):
         parser = build_parser()
         args = parser.parse_args(["compose", "up", "--gpu-configs", "0,1"])
