@@ -191,7 +191,10 @@ class TestQSRMachineServer:
         assert instance.healthy is False
         assert instance.sleeping is True
 
-    @patch("tfmx.qsrs.machine.get_backend_sleep_state", return_value=True)
+    @patch(
+        "tfmx.qsrs.machine.load_backend_sleep_states",
+        return_value={"http://localhost:27980": True},
+    )
     def test_check_instance_health_uses_docker_health_sleep_state_without_http(
         self,
         _mock_sleep_state,
@@ -286,7 +289,9 @@ class TestQSRMachineServer:
         )
         client = MagicMock()
         client.post.return_value = response
-        server._transcription_client = client
+        server._transcription_clients = {
+            "http://localhost:27980/v1/audio/transcriptions": client
+        }
 
         status_code, headers, content = server._post_transcription_sync(
             "http://localhost:27980/v1/audio/transcriptions",
@@ -297,3 +302,26 @@ class TestQSRMachineServer:
         assert headers == {"content-type": "application/json"}
         assert content == b"{}"
         client.post.assert_called_once()
+
+    def test_handle_retryable_instance_error_preserves_healthy_backend(self):
+        instance = QSRInstance(
+            container_name="qsr-multi--gpu0",
+            host="localhost",
+            port=27980,
+            gpu_id=0,
+            healthy=True,
+        )
+        server = QSRMachineServer(instances=[instance])
+        server._probe_instance_http_health = AsyncMock(return_value=True)
+        server._mark_instance_unhealthy = MagicMock()
+
+        asyncio.run(
+            server._handle_retryable_instance_error(
+                instance,
+                OSError(9, "Bad file descriptor"),
+                reset_transcription_client=True,
+            )
+        )
+
+        server._probe_instance_http_health.assert_awaited_once_with(instance)
+        server._mark_instance_unhealthy.assert_not_called()

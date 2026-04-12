@@ -72,6 +72,9 @@ qsr compose up --gpu-layout uniform
 # 如果你需要更快的重复启动/恢复，可在首次部署时开启 sleep mode
 qsr compose up --gpu-layout uniform --enable-sleep-mode
 
+# 如果你要分析 cold start 各阶段耗时，可显式输出 startup profile
+qsr compose up --gpu-layout uniform --profile-startup
+
 # 如需尽快返回而不等待默认预热，可显式跳过
 qsr compose up --gpu-layout uniform --skip-warmup
 
@@ -92,6 +95,7 @@ qsr compose up --gpu-layout uniform --pip-index-url https://mirrors.ustc.edu.cn/
 - `qsr compose up` 现在默认会等待 backend 可达后做一次短转写 warmup，不再需要额外手动执行 `qsr compose warmup`
 - 如果你只是想先把容器拉起、稍后再手动预热，可显式加 `--skip-warmup`
 - 如果你希望以后用 wake/resume 代替重复 cold start，请在这里就加 `--enable-sleep-mode`，后续即可使用 `qsr compose sleep` / `qsr compose wake --wait-healthy`
+- 如果你要看首轮 cold start 的瓶颈落在哪个阶段，加 `--profile-startup` 可以直接看到 compose、Docker health、HTTP readiness 和 warmup 的分段耗时
 
 ### 3. 启动本地聚合代理
 
@@ -176,13 +180,17 @@ bash runs/qsrs/03_health_check.sh
 bash runs/qsrs/04_benchmark.sh
 ```
 
-如果你想让 staged workflow 使用 fast wake/resume：
+repo 内置 staged workflow 现在默认就会启用 sleep mode 并优先走 wake-first；如果你想保留旧的 cold-start-only 行为：
 
 ```bash
-export QSR_ENABLE_SLEEP_MODE=1
+export QSR_ENABLE_SLEEP_MODE=0
+```
+
+如果你想让 `01_deploy_default.sh` 额外打印 cold-start phase profile：
+
+```bash
+export QSR_PROFILE_STARTUP=1
 bash runs/qsrs/01_deploy_default.sh
-bash runs/qsrs/98_sleep_backends.sh
-bash runs/qsrs/02_start_machine.sh
 ```
 
 更多 staged workflow 见 `runs/qsrs/README.md`。

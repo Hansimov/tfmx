@@ -12,7 +12,7 @@ if [[ "$expected_total" -eq 0 ]]; then
 fi
 
 cd "$QSR_REPO_ROOT"
-if [[ "${QSR_ENABLE_SLEEP_MODE:-0}" == "1" ]]; then
+if [[ "$QSR_ENABLE_SLEEP_MODE" != "0" ]]; then
     qsr_cmd compose wake \
         --gpu-layout uniform \
         -g "$deploy_gpus" \
@@ -26,7 +26,7 @@ machine_args=(
     --compose-gpu-layout uniform
     --on-conflict replace
 )
-if [[ "${QSR_ENABLE_SLEEP_MODE:-0}" == "1" ]]; then
+if [[ "$QSR_ENABLE_SLEEP_MODE" != "0" ]]; then
     machine_args+=(--compose-enable-sleep-mode)
 fi
 

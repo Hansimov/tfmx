@@ -18,6 +18,7 @@ qsr compose up
 qsr compose up -g 0,1
 qsr compose up --gpu-layout uniform
 qsr compose up --gpu-layout uniform --enable-sleep-mode
+qsr compose up --gpu-layout uniform --profile-startup
 qsr compose up --gpu-layout uniform --skip-warmup
 qsr compose warmup --gpu-layout uniform -g 0,1
 qsr compose wake --wait-healthy
@@ -44,6 +45,7 @@ qsr compose down
 - `--gpu-memory-utilization`：vLLM 显存利用率上限，默认 `0.35`
 - `--project-name`：自定义 compose 项目名
 - `--enable-sleep-mode`：开启 vLLM 的 sleep/wake 端点，后续可用 `compose wake` 快速恢复，避免再次完整 cold start
+- `--profile-startup`：输出 cold start 分阶段耗时，区分 compose、Docker health、HTTP readiness 和 warmup
 - `--skip-warmup`：只启动容器，不等待默认 warmup 完成；适合你只想先把后端拉起的场景
 - `compose warmup --audio`：对运行中的 backend 发起一次短转写预热；未提供时自动使用内置 WAV
 - `compose warmup --wait-timeout/--request-timeout`：控制 warmup 前健康等待和单 backend 请求超时
@@ -57,6 +59,7 @@ qsr compose down
 - 当前默认值已经按 `Qwen3-ASR-0.6B` 的实际需求收窄，避免 0.6B 模型在 20GB 卡上预留过大的 KV cache
 - `qsr compose up` 默认会在 backend 可达后自动做一次短转写 warmup；只有在你显式加了 `--skip-warmup` 时，才需要之后单独手动执行 `qsr compose warmup`
 - 若你追求的是重复重启场景下的恢复时间，而不是首次从零启动，请在部署时加 `--enable-sleep-mode`，随后优先使用 `qsr compose sleep` / `qsr compose wake --wait-healthy`
+- 若你要定位 cold start 瓶颈，请在 `qsr compose up` 上加 `--profile-startup`
 
 ## `qsr machine`
 
@@ -172,7 +175,8 @@ bash runs/qsrs/98_sleep_backends.sh
 
 - 默认使用当前 VM 中全部可见 GPU
 - 若想只跑子集，可先导出 `QSR_DEPLOY_GPUS=0,1`
-- 若想让 staged workflow 走 fast wake/resume，请先导出 `QSR_ENABLE_SLEEP_MODE=1`
+- staged workflow 现在默认就会启用 sleep mode 并优先走 wake-first；若你需要退回旧的 cold-start-only 行为，请导出 `QSR_ENABLE_SLEEP_MODE=0`
+- 若想让 staged deploy 额外打印 cold-start phase profile，请导出 `QSR_PROFILE_STARTUP=1`
 - 更多分步说明见 `runs/qsrs/README.md`
 
 ## Python API

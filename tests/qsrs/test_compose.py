@@ -330,6 +330,8 @@ class TestQSRComposerWarmup:
             max_num_seqs=MAX_NUM_SEQS,
             gpu_memory_utilization=GPU_MEMORY_UTILIZATION,
             skip_mm_profiling=True,
+            enable_sleep_mode=False,
+            cudagraph_mode=None,
             gpu_layout=None,
             gpu_configs=None,
             skip_warmup=False,
@@ -337,6 +339,7 @@ class TestQSRComposerWarmup:
             wait_timeout=45.0,
             poll_interval=0.75,
             request_timeout=60.0,
+            profile_startup=True,
         )
 
         compose.run_from_args(args)
@@ -347,4 +350,5 @@ class TestQSRComposerWarmup:
             wait_timeout_sec=45.0,
             poll_interval_sec=0.75,
             request_timeout_sec=60.0,
+            profile_startup=True,
         )

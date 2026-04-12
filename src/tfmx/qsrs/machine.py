@@ -7,12 +7,14 @@ import re
 import signal
 import subprocess
 import sys
+import threading
 import time
 
 import httpx
 import orjson
 import uvicorn
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
@@ -39,7 +41,7 @@ from .compose import MAX_MODEL_LEN, MAX_NUM_SEQS
 from .compose import MODEL_NAME as COMPOSE_MODEL_NAME
 from .compose import QSRComposer, SERVER_PORT as COMPOSE_SERVER_PORT
 from .compose import SLEEP_CONTROL_TIMEOUT_SEC, SLEEP_WAKE_POLL_INTERVAL_SEC
-from .compose import get_backend_sleep_state, set_backend_sleep_states
+from .compose import load_backend_sleep_states, set_backend_sleep_states
 from .compose import get_display_shortcut, get_model_api_aliases
 from .compose import get_model_shortcut, normalize_model_key, parse_gpu_configs
 from .router import InstanceDescriptor, QSRRouter
@@ -286,7 +288,10 @@ class QSRInstance:
         )
 
 
-def _apply_qsr_docker_health(instance: QSRInstance) -> bool | None:
+def _apply_qsr_docker_health(
+    instance: QSRInstance,
+    sleep_states: dict[str, bool] | None = None,
+) -> bool | None:
     if instance.docker_health is None:
         return None
     instance._latency_ms = 0.0
@@ -295,7 +300,9 @@ def _apply_qsr_docker_health(instance: QSRInstance) -> bool | None:
         instance.sleeping = False
         return False
 
-    sleeping_state = get_backend_sleep_state(instance.endpoint)
+    if sleep_states is None:
+        sleep_states = load_backend_sleep_states()
+    sleeping_state = sleep_states.get(instance.endpoint.rstrip("/"))
     instance.sleeping = bool(sleeping_state)
     if instance.sleeping:
         instance.sleep_mode_supported = True
@@ -315,24 +322,37 @@ def _wake_sleeping_backends(
         return False
 
     successes: list[str] = []
-    with httpx.Client(timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC)) as client:
-        for endpoint in normalized:
+    failures: list[tuple[str, str]] = []
+
+    def wake_endpoint(endpoint: str) -> tuple[str, bool, str | None]:
+        with httpx.Client(timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC)) as client:
             try:
                 response = client.post(f"{endpoint}/wake_up")
             except Exception as exc:
-                logger.warn(f"{label} Wake request failed for {endpoint}: {exc}")
-                continue
+                return endpoint, False, str(exc)
 
             if response.status_code == 200:
+                return endpoint, True, None
+            if response.status_code == 404:
+                return endpoint, False, "unsupported"
+            return endpoint, False, f"HTTP {response.status_code}"
+
+    with ThreadPoolExecutor(max_workers=max(1, len(normalized))) as executor:
+        futures = [executor.submit(wake_endpoint, endpoint) for endpoint in normalized]
+        for future in as_completed(futures):
+            endpoint, succeeded, detail = future.result()
+            if succeeded:
                 successes.append(endpoint)
-            elif response.status_code == 404:
+                continue
+            if detail == "unsupported":
                 logger.warn(
                     f"{label} Wake endpoint unavailable for {endpoint}; redeploy with --enable-sleep-mode"
                 )
-            else:
-                logger.warn(
-                    f"{label} Wake request failed for {endpoint}: HTTP {response.status_code}"
-                )
+                continue
+            failures.append((endpoint, detail or "unknown error"))
+
+    for endpoint, detail in sorted(failures):
+        logger.warn(f"{label} Wake request failed for {endpoint}: {detail}")
 
     if not successes:
         return False
@@ -523,7 +543,8 @@ class QSRMachineServer:
         self._discover_instances_fn = discover_instances_fn
         self.stats = QSRStatsData()
         self._client: Optional[httpx.AsyncClient] = None
-        self._transcription_client: Optional[httpx.Client] = None
+        self._transcription_clients: dict[str, httpx.Client] = {}
+        self._transcription_client_lock = threading.Lock()
         self._health_task: Optional[asyncio.Task] = None
         self._capacity_cond: Optional[asyncio.Condition] = None
         self._idle_tiebreak_counter: int = 0
@@ -685,8 +706,12 @@ class QSRMachineServer:
             return
         loop.create_task(self._notify_capacity_changed())
 
-    async def _check_instance_health(self, instance: QSRInstance) -> bool:
-        quiet_health = _apply_qsr_docker_health(instance)
+    async def _check_instance_health(
+        self,
+        instance: QSRInstance,
+        sleep_states: dict[str, bool] | None = None,
+    ) -> bool:
+        quiet_health = _apply_qsr_docker_health(instance, sleep_states=sleep_states)
         if quiet_health is not None:
             return quiet_health
         try:
@@ -698,6 +723,7 @@ class QSRMachineServer:
             instance.healthy = response.status_code == 200
             instance.sleeping = False
             if instance.healthy:
+                instance.last_error = ""
                 try:
                     sleep_response = await self._client.get(
                         instance.sleep_state_url,
@@ -749,9 +775,10 @@ class QSRMachineServer:
             self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
         await self._refresh_instances_from_discovery()
         changed = False
+        sleep_states = load_backend_sleep_states()
         for instance in self.instances:
             was_healthy = instance.healthy
-            await self._check_instance_health(instance)
+            await self._check_instance_health(instance, sleep_states=sleep_states)
             if instance.healthy and not instance.model_name:
                 await self._discover_instance_model(instance)
             if instance.healthy != was_healthy:
@@ -948,18 +975,65 @@ class QSRMachineServer:
             text = response.text.strip()
             return text or response.reason_phrase
 
+    def _get_transcription_client(self, url: str) -> httpx.Client:
+        with self._transcription_client_lock:
+            client = self._transcription_clients.get(url)
+            if client is None:
+                client = httpx.Client(timeout=httpx.Timeout(self.timeout))
+                self._transcription_clients[url] = client
+            return client
+
+    def _reset_transcription_client(self, url: str) -> None:
+        with self._transcription_client_lock:
+            client = self._transcription_clients.pop(url, None)
+        if client is not None:
+            client.close()
+
+    async def _probe_instance_http_health(self, instance: QSRInstance) -> bool:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+        try:
+            response = await self._client.get(
+                instance.health_url,
+                timeout=httpx.Timeout(HEALTH_REQUEST_TIMEOUT_SEC),
+            )
+        except Exception:
+            return False
+
+        if response.status_code != 200:
+            return False
+
+        instance.healthy = True
+        instance.sleeping = False
+        instance.last_error = ""
+        instance._latency_ms = 0.0
+        return True
+
+    async def _handle_retryable_instance_error(
+        self,
+        instance: QSRInstance,
+        exc: Exception,
+        *,
+        reset_transcription_client: bool = False,
+    ) -> None:
+        instance.last_error = str(exc)
+        if reset_transcription_client:
+            self._reset_transcription_client(instance.transcription_url)
+        if await self._probe_instance_http_health(instance):
+            logger.note(
+                f"[qsr_machine] Preserving healthy backend after transient transport error: {instance.container_name}"
+            )
+            return
+        self._mark_instance_unhealthy(instance, exc)
+
     def _post_transcription_sync(
         self,
         url: str,
         files: list[tuple[str, object]],
     ) -> tuple[int, dict[str, str], bytes]:
-        if self._transcription_client is not None:
-            response = self._transcription_client.post(url, files=files)
-            return response.status_code, dict(response.headers), response.content
-
-        with httpx.Client(timeout=httpx.Timeout(self.timeout)) as client:
-            response = client.post(url, files=files)
-            return response.status_code, dict(response.headers), response.content
+        client = self._get_transcription_client(url)
+        response = client.post(url, files=files)
+        return response.status_code, dict(response.headers), response.content
 
     async def _forward_chat(
         self,
@@ -997,6 +1071,7 @@ class QSRMachineServer:
 
                 payload = response.json()
                 usage = payload.get("usage") or {}
+                instance.last_error = ""
                 self.stats.total_requests += 1
                 self.stats.total_tokens += int(usage.get("total_tokens", 0) or 0)
                 return ChatCompletionResponse.model_validate(payload)
@@ -1006,7 +1081,7 @@ class QSRMachineServer:
                 if self._is_retryable_upstream_exception(exc):
                     excluded_instances.add(instance.container_name)
                     self.stats.total_failovers += 1
-                    self._mark_instance_unhealthy(instance, exc)
+                    await self._handle_retryable_instance_error(instance, exc)
                     last_exc = HTTPException(status_code=502, detail=str(exc))
                     continue
                 self.stats.total_errors += 1
@@ -1077,6 +1152,7 @@ class QSRMachineServer:
                             return
 
                         self.stats.total_requests += 1
+                        instance.last_error = ""
                         async for chunk in response.aiter_bytes():
                             if chunk:
                                 yield chunk
@@ -1085,7 +1161,7 @@ class QSRMachineServer:
                     if self._is_retryable_upstream_exception(exc):
                         excluded_instances.add(instance.container_name)
                         self.stats.total_failovers += 1
-                        self._mark_instance_unhealthy(instance, exc)
+                        await self._handle_retryable_instance_error(instance, exc)
                         continue
                     self.stats.total_errors += 1
                     yield self._build_stream_error_chunk(
@@ -1155,6 +1231,7 @@ class QSRMachineServer:
                     raise HTTPException(status_code=response.status_code, detail=detail)
 
                 self.stats.total_requests += 1
+                instance.last_error = ""
                 content_type_header = response.headers.get("content-type", "")
                 if "application/json" in content_type_header.lower():
                     return JSONResponse(content=response.json())
@@ -1166,7 +1243,11 @@ class QSRMachineServer:
                 if self._is_retryable_upstream_exception(exc):
                     excluded_instances.add(instance.container_name)
                     self.stats.total_failovers += 1
-                    self._mark_instance_unhealthy(instance, exc)
+                    await self._handle_retryable_instance_error(
+                        instance,
+                        exc,
+                        reset_transcription_client=True,
+                    )
                     continue
                 self.stats.total_errors += 1
                 raise HTTPException(status_code=502, detail=str(exc)) from exc
@@ -1332,7 +1413,7 @@ class QSRMachineServer:
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
-        self._transcription_client = httpx.Client(timeout=httpx.Timeout(self.timeout))
+        self._transcription_clients = {}
         await self._refresh_health()
         self._health_task = asyncio.create_task(self._health_loop())
         try:
@@ -1347,9 +1428,11 @@ class QSRMachineServer:
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
-            if self._transcription_client is not None:
-                self._transcription_client.close()
-                self._transcription_client = None
+            with self._transcription_client_lock:
+                transcription_clients = list(self._transcription_clients.values())
+                self._transcription_clients = {}
+            for client in transcription_clients:
+                client.close()
 
     def _create_app(self) -> FastAPI:
         app = FastAPI(
@@ -1798,10 +1881,11 @@ def discover_instances(args: argparse.Namespace) -> list[QSRInstance]:
 
     instances = _discover_instances_from_docker(args.name_pattern)
     if getattr(args, "auto_start", False):
+        sleep_states = load_backend_sleep_states()
         sleeping_endpoints = [
             instance.endpoint
             for instance in instances
-            if get_backend_sleep_state(instance.endpoint) is True
+            if sleep_states.get(instance.endpoint.rstrip("/")) is True
         ]
         if sleeping_endpoints:
             logger.note(
@@ -1876,9 +1960,10 @@ def log_instances(instances: list[QSRInstance], show_health: bool = False) -> No
 
 
 async def check_health(instances: list[QSRInstance]) -> None:
+    sleep_states = load_backend_sleep_states()
     async with httpx.AsyncClient(timeout=httpx.Timeout(5.0)) as client:
         for instance in instances:
-            quiet_health = _apply_qsr_docker_health(instance)
+            quiet_health = _apply_qsr_docker_health(instance, sleep_states=sleep_states)
             if quiet_health is not None:
                 continue
             try:

@@ -27,6 +27,14 @@ class TestQsrCliParser:
         assert args.cudagraph_mode == "FULL"
         assert args.poll_interval == 0.5
 
+    def test_compose_up_startup_profile_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(["compose", "up", "--profile-startup"])
+
+        assert args.command == "compose"
+        assert args.compose_action == "up"
+        assert args.profile_startup is True
+
     def test_compose_warmup_parse(self):
         parser = build_parser()
         args = parser.parse_args(

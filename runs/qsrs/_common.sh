@@ -10,6 +10,8 @@ QSR_MACHINE_PORT="${QSR_MACHINE_PORT:-27900}"
 QSR_BACKEND_BASE_PORT="${QSR_BACKEND_BASE_PORT:-27980}"
 QSR_DEFAULT_AUDIO="${QSR_DEFAULT_AUDIO:-https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav}"
 QSR_ALT_AUDIO="${QSR_ALT_AUDIO:-https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav}"
+QSR_ENABLE_SLEEP_MODE="${QSR_ENABLE_SLEEP_MODE:-1}"
+QSR_PROFILE_STARTUP="${QSR_PROFILE_STARTUP:-0}"
 
 mkdir -p "$QSR_RESULTS_DIR"
 mkdir -p "$QSR_AUDIO_CACHE_DIR"

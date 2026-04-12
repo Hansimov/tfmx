@@ -12,10 +12,11 @@ import mimetypes
 import re
 import shlex
 import subprocess
+import time
 import wave
 
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
 
@@ -23,6 +24,8 @@ import httpx
 
 from tclogger import logger
 
+from ..utils.service_bootstrap import docker_status_to_health
+from ..utils.service_bootstrap import get_docker_container_statuses
 from ..utils.service_bootstrap import wait_for_healthy_http_endpoints
 from ..utils.service_bootstrap import wait_for_healthy_docker_containers
 from .networking import DEFAULT_HF_ENDPOINT
@@ -260,6 +263,70 @@ def get_backend_sleep_state(endpoint: str) -> bool | None:
     if not normalized:
         return None
     return load_backend_sleep_states().get(normalized)
+
+
+@dataclass
+class StartupProfile:
+    image_ready_elapsed_sec: float = 0.0
+    compose_generate_elapsed_sec: float = 0.0
+    compose_up_elapsed_sec: float = 0.0
+    container_health_elapsed_sec: float | None = None
+    endpoint_ready_elapsed_sec: float | None = None
+    warmup_elapsed_sec: float | None = None
+    total_elapsed_sec: float = 0.0
+    endpoint_by_container: dict[str, str] = field(default_factory=dict)
+    container_health_by_container: dict[str, float] = field(default_factory=dict)
+    endpoint_ready_by_container: dict[str, float] = field(default_factory=dict)
+    warmup_by_container: dict[str, float] = field(default_factory=dict)
+    warmup_result_by_container: dict[str, str] = field(default_factory=dict)
+
+    @staticmethod
+    def _format_seconds(value: float | None) -> str:
+        if value is None:
+            return "n/a"
+        return f"{value:.2f}s"
+
+    def log(self, label: str = "[qsr]") -> None:
+        logger.note(f"{label} Startup profile:")
+        logger.mesg(
+            f"{label}   image-ready={self.image_ready_elapsed_sec:.2f}s | "
+            f"compose-generate={self.compose_generate_elapsed_sec:.2f}s | "
+            f"compose-up={self.compose_up_elapsed_sec:.2f}s | "
+            f"docker-healthy={self._format_seconds(self.container_health_elapsed_sec)} | "
+            f"http-ready={self._format_seconds(self.endpoint_ready_elapsed_sec)} | "
+            f"warmup={self._format_seconds(self.warmup_elapsed_sec)} | "
+            f"total={self.total_elapsed_sec:.2f}s"
+        )
+
+        container_names = sorted(
+            {
+                *self.endpoint_by_container.keys(),
+                *self.container_health_by_container.keys(),
+                *self.endpoint_ready_by_container.keys(),
+                *self.warmup_by_container.keys(),
+                *self.warmup_result_by_container.keys(),
+            }
+        )
+        for container_name in container_names:
+            endpoint = self.endpoint_by_container.get(container_name, "")
+            details = []
+            if endpoint:
+                details.append(endpoint)
+            if container_name in self.container_health_by_container:
+                details.append(
+                    f"docker={self.container_health_by_container[container_name]:.2f}s"
+                )
+            if container_name in self.endpoint_ready_by_container:
+                details.append(
+                    f"http={self.endpoint_ready_by_container[container_name]:.2f}s"
+                )
+            if container_name in self.warmup_by_container:
+                details.append(
+                    f"warmup={self.warmup_by_container[container_name]:.2f}s"
+                )
+            if container_name in self.warmup_result_by_container:
+                details.append(self.warmup_result_by_container[container_name])
+            logger.mesg(f"{label}   {container_name}: {' | '.join(details)}")
 
 
 @dataclass
@@ -1122,14 +1189,15 @@ class QSRComposer:
         unsupported: list[str] = []
         failures: list[tuple[str, str]] = []
 
-        with httpx.Client(timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC)) as client:
-            for endpoint in endpoints:
+        def request_endpoint(endpoint: str) -> tuple[str, str, dict | str | None]:
+            with httpx.Client(
+                timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC)
+            ) as client:
                 url = f"{endpoint}{path}"
                 try:
                     response = client.request(method, url, params=params)
                 except Exception as exc:
-                    failures.append((endpoint, str(exc)))
-                    continue
+                    return endpoint, "failure", str(exc)
 
                 if response.status_code == 200:
                     payload = None
@@ -1139,11 +1207,29 @@ class QSRComposer:
                             payload = response.json()
                         except ValueError:
                             payload = None
-                    successes.append((endpoint, payload))
-                elif response.status_code == 404:
+                    return endpoint, "success", payload
+                if response.status_code == 404:
+                    return endpoint, "unsupported", None
+                return endpoint, "failure", f"HTTP {response.status_code}"
+
+        with ThreadPoolExecutor(max_workers=max(1, len(endpoints))) as executor:
+            futures = [
+                executor.submit(request_endpoint, endpoint) for endpoint in endpoints
+            ]
+            for future in as_completed(futures):
+                endpoint, status, payload = future.result()
+                if status == "success":
+                    successes.append(
+                        (endpoint, payload if isinstance(payload, dict) else None)
+                    )
+                elif status == "unsupported":
                     unsupported.append(endpoint)
                 else:
-                    failures.append((endpoint, f"HTTP {response.status_code}"))
+                    failures.append((endpoint, str(payload)))
+
+        successes.sort(key=lambda item: item[0])
+        unsupported.sort()
+        failures.sort(key=lambda item: item[0])
 
         return successes, unsupported, failures
 
@@ -1290,6 +1376,172 @@ class QSRComposer:
             set_backend_sleep_states(target_endpoints, sleeping=False)
         return healthy
 
+    def _profile_container_health(
+        self,
+        *,
+        timeout_sec: float,
+        poll_interval_sec: float,
+        label: str,
+    ) -> tuple[bool, dict[str, float]]:
+        container_names = self.get_backend_container_names()
+        if not container_names:
+            logger.warn(
+                f"× {label} No backend containers available for startup profile"
+            )
+            return False, {}
+
+        pending = set(container_names)
+        timings: dict[str, float] = {}
+        started_at = time.monotonic()
+        deadline = time.monotonic() + timeout_sec
+
+        logger.mesg(
+            f"{label} Profiling {len(pending)} backend container(s) until Docker health is ready"
+        )
+        last_statuses: dict[str, str] = {}
+        while pending and time.monotonic() < deadline:
+            last_statuses = get_docker_container_statuses(container_names)
+            now = time.monotonic()
+            for container_name in list(pending):
+                if (
+                    docker_status_to_health(last_statuses.get(container_name, ""))
+                    is True
+                ):
+                    timings[container_name] = now - started_at
+                    pending.remove(container_name)
+
+            if pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    break
+                time.sleep(min(poll_interval_sec, remaining))
+
+        if pending:
+            missing = []
+            for container_name in sorted(pending):
+                status = last_statuses.get(container_name)
+                if status:
+                    missing.append(f"{container_name} ({status})")
+                else:
+                    missing.append(container_name)
+            logger.warn(
+                f"× {label} Timed out profiling healthy containers: {', '.join(missing)}"
+            )
+            return False, timings
+
+        return True, timings
+
+    def _profile_endpoint_readiness(
+        self,
+        targets: list[tuple[str, str]],
+        *,
+        timeout_sec: float,
+        poll_interval_sec: float,
+        request_timeout_sec: float,
+        label: str,
+    ) -> tuple[bool, dict[str, float]]:
+        if not targets:
+            logger.warn(f"× {label} No backend endpoints available for startup profile")
+            return False, {}
+
+        pending = {
+            container_name: endpoint.rstrip("/")
+            for container_name, endpoint in targets
+            if endpoint
+        }
+        timings: dict[str, float] = {}
+        started_at = time.monotonic()
+        deadline = time.monotonic() + timeout_sec
+
+        logger.mesg(
+            f"{label} Profiling {len(pending)} backend endpoint(s) until HTTP readiness"
+        )
+
+        def probe(container_name: str, endpoint: str) -> tuple[str, bool]:
+            try:
+                response = httpx.get(
+                    f"{endpoint}/health",
+                    timeout=httpx.Timeout(request_timeout_sec),
+                )
+                return container_name, response.status_code == 200
+            except Exception:
+                return container_name, False
+
+        max_workers = max(1, min(32, len(pending)))
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            while pending and time.monotonic() < deadline:
+                future_to_name = {
+                    executor.submit(probe, container_name, endpoint): container_name
+                    for container_name, endpoint in pending.items()
+                }
+                for future in as_completed(future_to_name):
+                    container_name, healthy = future.result()
+                    if healthy and container_name in pending:
+                        timings[container_name] = time.monotonic() - started_at
+                        del pending[container_name]
+
+                if pending:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    time.sleep(min(poll_interval_sec, remaining))
+
+        if pending:
+            missing = ", ".join(sorted(pending))
+            logger.warn(f"× {label} Timed out profiling ready endpoints: {missing}")
+            return False, timings
+
+        return True, timings
+
+    def _run_warmup_targets(
+        self,
+        targets: list[tuple[str, str]],
+        *,
+        audio_upload: tuple[str, bytes, str],
+        request_timeout_sec: float,
+    ) -> tuple[dict[str, tuple[bool, str]], dict[str, float]]:
+        results: dict[str, tuple[bool, str]] = {}
+        durations: dict[str, float] = {}
+
+        def warm(container_name: str, endpoint: str) -> tuple[str, bool, str, float]:
+            started_at = time.perf_counter()
+            okay, message = self._warmup_endpoint(
+                endpoint,
+                audio_upload=audio_upload,
+                request_timeout_sec=request_timeout_sec,
+            )
+            return container_name, okay, message, time.perf_counter() - started_at
+
+        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
+            future_to_name = {
+                executor.submit(warm, container_name, endpoint): container_name
+                for container_name, endpoint in targets
+            }
+            for future in as_completed(future_to_name):
+                container_name, okay, message, duration = future.result()
+                results[container_name] = (okay, message)
+                durations[container_name] = duration
+
+        return results, durations
+
+    @staticmethod
+    def _log_warmup_results(
+        targets: list[tuple[str, str]],
+        results: dict[str, tuple[bool, str]],
+    ) -> list[str]:
+        failures: list[str] = []
+        for container_name, _endpoint in targets:
+            okay, message = results.get(
+                container_name,
+                (False, "warmup task did not complete"),
+            )
+            if okay:
+                logger.okay(f"[qsr] Warmed {container_name}: {message}")
+            else:
+                logger.warn(f"[qsr] Warmup failed for {container_name}: {message}")
+                failures.append(container_name)
+        return failures
+
     def _run_compose_cmd(
         self,
         cmd: str,
@@ -1299,6 +1551,100 @@ class QSRComposer:
         logger.mesg(f"[qsr] Running: {full_cmd}")
         return subprocess.run(full_cmd, shell=True, capture_output=capture_output)
 
+    def _profile_startup(
+        self,
+        *,
+        warmup_audio: str | None,
+        wait_timeout_sec: float,
+        poll_interval_sec: float,
+        request_timeout_sec: float,
+        profile: StartupProfile,
+    ) -> None:
+        container_started_at = time.perf_counter()
+        container_healthy, container_timings = self._profile_container_health(
+            timeout_sec=wait_timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            label="[qsr]",
+        )
+        profile.container_health_elapsed_sec = (
+            time.perf_counter() - container_started_at
+        )
+        profile.container_health_by_container = container_timings
+
+        targets = self._discover_running_backend_targets()
+        profile.endpoint_by_container = {
+            container_name: endpoint for container_name, endpoint in targets
+        }
+        if not targets:
+            logger.warn("[qsr] Startup profile could not find any running backends")
+            profile.total_elapsed_sec = (
+                profile.image_ready_elapsed_sec
+                + profile.compose_generate_elapsed_sec
+                + profile.compose_up_elapsed_sec
+                + (profile.container_health_elapsed_sec or 0.0)
+            )
+            profile.log()
+            return
+
+        endpoint_started_at = time.perf_counter()
+        ready, endpoint_timings = self._profile_endpoint_readiness(
+            targets,
+            timeout_sec=wait_timeout_sec,
+            poll_interval_sec=poll_interval_sec,
+            request_timeout_sec=READINESS_REQUEST_TIMEOUT_SEC,
+            label="[qsr]",
+        )
+        profile.endpoint_ready_elapsed_sec = time.perf_counter() - endpoint_started_at
+        profile.endpoint_ready_by_container = endpoint_timings
+        if endpoint_timings:
+            set_backend_sleep_states(
+                [endpoint for _, endpoint in targets], sleeping=False
+            )
+
+        if not container_healthy or not ready:
+            profile.total_elapsed_sec = (
+                profile.image_ready_elapsed_sec
+                + profile.compose_generate_elapsed_sec
+                + profile.compose_up_elapsed_sec
+                + (profile.container_health_elapsed_sec or 0.0)
+                + (profile.endpoint_ready_elapsed_sec or 0.0)
+            )
+            profile.log()
+            return
+
+        audio_upload = self._load_warmup_audio(warmup_audio)
+        warmup_started_at = time.perf_counter()
+        results, durations = self._run_warmup_targets(
+            targets,
+            audio_upload=audio_upload,
+            request_timeout_sec=request_timeout_sec,
+        )
+        profile.warmup_elapsed_sec = time.perf_counter() - warmup_started_at
+        profile.warmup_by_container = durations
+        profile.warmup_result_by_container = {
+            container_name: message
+            for container_name, (_okay, message) in results.items()
+        }
+
+        failures = self._log_warmup_results(targets, results)
+        if failures:
+            logger.warn(f"[qsr] Warmup completed with failures: {', '.join(failures)}")
+        else:
+            logger.okay(f"[qsr] Warmed {len(targets)} backend(s)")
+            set_backend_sleep_states(
+                [endpoint for _, endpoint in targets], sleeping=False
+            )
+
+        profile.total_elapsed_sec = (
+            profile.image_ready_elapsed_sec
+            + profile.compose_generate_elapsed_sec
+            + profile.compose_up_elapsed_sec
+            + (profile.container_health_elapsed_sec or 0.0)
+            + (profile.endpoint_ready_elapsed_sec or 0.0)
+            + (profile.warmup_elapsed_sec or 0.0)
+        )
+        profile.log()
+
     def up(
         self,
         *,
@@ -1307,6 +1653,7 @@ class QSRComposer:
         wait_timeout_sec: float = WARMUP_WAIT_TIMEOUT_SEC,
         poll_interval_sec: float = WARMUP_POLL_INTERVAL_SEC,
         request_timeout_sec: float = WARMUP_REQUEST_TIMEOUT_SEC,
+        profile_startup: bool = False,
     ) -> None:
         if not self.gpus:
             logger.warn("× No healthy GPUs detected")
@@ -1320,14 +1667,22 @@ class QSRComposer:
             for config in self.gpu_configs:
                 logger.mesg(f"[qsr]   GPU {config.gpu_id}: {config.display_label}")
 
+        profile = StartupProfile()
+
+        image_started_at = time.perf_counter()
         if not self.image_manager.ensure_image(
             VLLM_IMAGE, network_config=self.network_config
         ):
             return
+        profile.image_ready_elapsed_sec = time.perf_counter() - image_started_at
 
         self._ensure_data_dir()
+        generate_started_at = time.perf_counter()
         self.generate_compose_file()
+        profile.compose_generate_elapsed_sec = time.perf_counter() - generate_started_at
+        compose_up_started_at = time.perf_counter()
         result = self._run_compose_cmd("up -d --remove-orphans", capture_output=True)
+        profile.compose_up_elapsed_sec = time.perf_counter() - compose_up_started_at
         if result.returncode != 0:
             stderr = (
                 result.stderr.decode("utf-8", errors="replace")
@@ -1341,6 +1696,26 @@ class QSRComposer:
         )
         set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
         self.ps()
+        if profile_startup:
+            if skip_warmup:
+                profile.total_elapsed_sec = (
+                    profile.image_ready_elapsed_sec
+                    + profile.compose_generate_elapsed_sec
+                    + profile.compose_up_elapsed_sec
+                )
+                logger.note(
+                    "[qsr] Startup profiling requested with --skip-warmup; reporting compose-only timings"
+                )
+                profile.log()
+                return
+            self._profile_startup(
+                warmup_audio=warmup_audio,
+                wait_timeout_sec=wait_timeout_sec,
+                poll_interval_sec=poll_interval_sec,
+                request_timeout_sec=request_timeout_sec,
+                profile=profile,
+            )
+            return
         if skip_warmup:
             return
         self.warmup(
@@ -1437,35 +1812,12 @@ class QSRComposer:
                 return
 
         audio_upload = self._load_warmup_audio(audio)
-        results: dict[str, tuple[bool, str]] = {}
-        with ThreadPoolExecutor(max_workers=len(targets)) as executor:
-            future_to_name = {
-                executor.submit(
-                    self._warmup_endpoint,
-                    endpoint,
-                    audio_upload=audio_upload,
-                    request_timeout_sec=request_timeout_sec,
-                ): container_name
-                for container_name, endpoint in targets
-            }
-            for future in as_completed(future_to_name):
-                container_name = future_to_name[future]
-                try:
-                    results[container_name] = future.result()
-                except Exception as exc:
-                    results[container_name] = (False, str(exc))
-
-        failures: list[str] = []
-        for container_name, _endpoint in targets:
-            okay, message = results.get(
-                container_name,
-                (False, "warmup task did not complete"),
-            )
-            if okay:
-                logger.okay(f"[qsr] Warmed {container_name}: {message}")
-            else:
-                logger.warn(f"[qsr] Warmup failed for {container_name}: {message}")
-                failures.append(container_name)
+        results, _durations = self._run_warmup_targets(
+            targets,
+            audio_upload=audio_upload,
+            request_timeout_sec=request_timeout_sec,
+        )
+        failures = self._log_warmup_results(targets, results)
 
         if failures:
             logger.warn(f"[qsr] Warmup completed with failures: {', '.join(failures)}")
@@ -1784,6 +2136,11 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             default=WARMUP_REQUEST_TIMEOUT_SEC,
             help=f"Per-backend warmup request timeout in seconds (default: {WARMUP_REQUEST_TIMEOUT_SEC})",
         )
+        target.add_argument(
+            "--profile-startup",
+            action="store_true",
+            help="Measure and report cold-start phases including Docker health, HTTP readiness, and warmup",
+        )
         add_targeting_arguments(target)
 
     parser_up = subparsers.add_parser("up", help="Start QSR containers")
@@ -1935,6 +2292,7 @@ def run_from_args(args: argparse.Namespace) -> None:
                 "request_timeout",
                 WARMUP_REQUEST_TIMEOUT_SEC,
             ),
+            profile_startup=getattr(args, "profile_startup", False),
         )
     elif action == "warmup":
         composer.warmup(
