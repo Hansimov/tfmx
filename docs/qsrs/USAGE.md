@@ -33,9 +33,9 @@ qsr compose down
 - `--proxy`：覆盖默认 build/runtime 代理
 - `--hf-endpoint`：覆盖默认 Hugging Face mirror
 - `--pip-index-url`：覆盖默认 PyPI mirror
-- `--max-model-len`：覆盖服务端最大上下文长度，默认 `8192`
+- `--max-model-len`：覆盖服务端最大上下文长度，默认 `4096`
 - `--max-num-seqs`：每个 vLLM 实例允许的并发序列数，默认 `8`
-- `--gpu-memory-utilization`：vLLM 显存利用率上限，默认 `0.72`
+- `--gpu-memory-utilization`：vLLM 显存利用率上限，默认 `0.35`
 - `--project-name`：自定义 compose 项目名
 
 ### 行为说明
@@ -43,6 +43,7 @@ qsr compose down
 - 默认会先筛掉当前不健康的 GPU，再对健康 GPU 起容器
 - 若你只是想快速把所有健康 GPU 拉起，优先使用 `--gpu-layout uniform`
 - 若你要精确控制 per-GPU 部署，优先使用 `--gpu-configs`
+- 当前默认值已经按 `Qwen3-ASR-0.6B` 的实际需求收窄，避免 0.6B 模型在 20GB 卡上预留过大的 KV cache
 
 ## `qsr machine`
 

@@ -1,6 +1,7 @@
 """QSR client helpers for ASR chat and transcription endpoints."""
 
 import argparse
+import asyncio
 import base64
 import mimetypes
 import re
@@ -10,6 +11,7 @@ import httpx
 import orjson
 
 from dataclasses import dataclass, field
+from functools import lru_cache
 from pathlib import Path
 from tclogger import dict_to_lines, logger, logstr
 from typing import Callable, Optional
@@ -456,11 +458,7 @@ def _encode_audio_to_data_url(audio_path: str) -> str:
     path = Path(audio_path)
     if not path.exists():
         raise FileNotFoundError(f"Audio not found: {audio_path}")
-
-    mime_type, _ = mimetypes.guess_type(path.name)
-    mime_type = mime_type or "audio/wav"
-    data = base64.b64encode(path.read_bytes()).decode("utf-8")
-    return f"data:{mime_type};base64,{data}"
+    return _encode_local_audio_data_url_cached(*_get_local_audio_cache_identity(path))
 
 
 def normalize_audio_url(audio: str) -> str:
@@ -660,6 +658,50 @@ def _guess_upload_name_and_type(
     return filename, mime_type
 
 
+def _get_local_audio_cache_identity(path: Path) -> tuple[str, int, int]:
+    resolved_path = path.resolve()
+    stat = resolved_path.stat()
+    return str(resolved_path), stat.st_mtime_ns, stat.st_size
+
+
+@lru_cache(maxsize=128)
+def _read_local_audio_upload_cached(
+    resolved_path: str,
+    modified_time_ns: int,
+    file_size: int,
+) -> tuple[str, bytes, str]:
+    del modified_time_ns
+    del file_size
+    path = Path(resolved_path)
+    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    return path.name, path.read_bytes(), mime_type
+
+
+@lru_cache(maxsize=128)
+def _encode_local_audio_data_url_cached(
+    resolved_path: str,
+    modified_time_ns: int,
+    file_size: int,
+) -> str:
+    del modified_time_ns
+    del file_size
+    path = Path(resolved_path)
+    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
+    data = base64.b64encode(path.read_bytes()).decode("utf-8")
+    return f"data:{mime_type};base64,{data}"
+
+
+@lru_cache(maxsize=64)
+def _download_audio_upload_cached(source: str) -> tuple[str, bytes, str]:
+    response = httpx.get(source, timeout=httpx.Timeout(120.0), follow_redirects=True)
+    response.raise_for_status()
+    filename, mime_type = _guess_upload_name_and_type(
+        source,
+        response.headers.get("content-type"),
+    )
+    return filename, response.content, mime_type
+
+
 def _load_audio_upload(source: str) -> tuple[str, bytes, str]:
     if source.startswith("data:"):
         match = re.match(r"^data:([^;]+);base64,(.*)$", source, re.DOTALL)
@@ -671,21 +713,12 @@ def _load_audio_upload(source: str) -> tuple[str, bytes, str]:
         return filename, payload, mime_type
 
     if source.startswith(("http://", "https://")):
-        response = httpx.get(
-            source, timeout=httpx.Timeout(120.0), follow_redirects=True
-        )
-        response.raise_for_status()
-        filename, mime_type = _guess_upload_name_and_type(
-            source,
-            response.headers.get("content-type"),
-        )
-        return filename, response.content, mime_type
+        return _download_audio_upload_cached(source)
 
     path = Path(source)
     if not path.exists():
         raise FileNotFoundError(f"Audio not found: {source}")
-    mime_type = mimetypes.guess_type(path.name)[0] or "audio/wav"
-    return path.name, path.read_bytes(), mime_type
+    return _read_local_audio_upload_cached(*_get_local_audio_cache_identity(path))
 
 
 def _build_transcription_multipart_fields(
@@ -1194,7 +1227,9 @@ class AsyncQSRClient:
         timestamp_granularities: list[str] | None = None,
     ) -> TranscriptionResponse:
         resolved_model = await self._resolve_model(model)
-        filename, payload, mime_type = _load_audio_upload(audio)
+        filename, payload, mime_type = await asyncio.to_thread(
+            _load_audio_upload, audio
+        )
         response = await self.client.post(
             self.transcriptions_endpoint,
             files=_build_transcription_multipart_fields(

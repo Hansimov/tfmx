@@ -208,3 +208,24 @@ class TestQSRMachineServer:
             for field in multipart_fields
         )
         assert any(field[0] == "file" for field in multipart_fields)
+
+    def test_post_transcription_sync_reuses_persistent_client(self):
+        server = QSRMachineServer(instances=[])
+        response = MagicMock(
+            status_code=200,
+            headers={"content-type": "application/json"},
+            content=b"{}",
+        )
+        client = MagicMock()
+        client.post.return_value = response
+        server._transcription_client = client
+
+        status_code, headers, content = server._post_transcription_sync(
+            "http://localhost:27980/v1/audio/transcriptions",
+            [("model", (None, "0.6b"))],
+        )
+
+        assert status_code == 200
+        assert headers == {"content-type": "application/json"}
+        assert content == b"{}"
+        client.post.assert_called_once()

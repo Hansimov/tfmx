@@ -458,6 +458,7 @@ class QSRMachineServer:
         self._discover_instances_fn = discover_instances_fn
         self.stats = QSRStatsData()
         self._client: Optional[httpx.AsyncClient] = None
+        self._transcription_client: Optional[httpx.Client] = None
         self._health_task: Optional[asyncio.Task] = None
         self._capacity_cond: Optional[asyncio.Condition] = None
         self._last_health_refresh_monotonic: float = 0.0
@@ -858,6 +859,10 @@ class QSRMachineServer:
         url: str,
         files: list[tuple[str, object]],
     ) -> tuple[int, dict[str, str], bytes]:
+        if self._transcription_client is not None:
+            response = self._transcription_client.post(url, files=files)
+            return response.status_code, dict(response.headers), response.content
+
         with httpx.Client(timeout=httpx.Timeout(self.timeout)) as client:
             response = client.post(url, files=files)
             return response.status_code, dict(response.headers), response.content
@@ -1232,6 +1237,7 @@ class QSRMachineServer:
     @asynccontextmanager
     async def _lifespan(self, _app: FastAPI):
         self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+        self._transcription_client = httpx.Client(timeout=httpx.Timeout(self.timeout))
         await self._refresh_health()
         self._health_task = asyncio.create_task(self._health_loop())
         try:
@@ -1246,6 +1252,9 @@ class QSRMachineServer:
             if self._client is not None:
                 await self._client.aclose()
                 self._client = None
+            if self._transcription_client is not None:
+                self._transcription_client.close()
+                self._transcription_client = None
 
     def _create_app(self) -> FastAPI:
         app = FastAPI(

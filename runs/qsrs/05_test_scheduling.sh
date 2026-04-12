@@ -4,8 +4,8 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
 num_samples="${QSR_SCHED_SAMPLES:-40}"
-audio_a="${QSR_SCHED_AUDIO_A:-$QSR_DEFAULT_AUDIO}"
-audio_b="${QSR_SCHED_AUDIO_B:-$QSR_ALT_AUDIO}"
+audio_a="$(materialize_qsr_audio "${QSR_SCHED_AUDIO_A:-$QSR_DEFAULT_AUDIO}")"
+audio_b="$(materialize_qsr_audio "${QSR_SCHED_AUDIO_B:-$QSR_ALT_AUDIO}")"
 prompt="${QSR_SCHED_PROMPT:-请先转写音频，再简要说明这是哪种语言。}"
 output_path="$(result_json_path qsr_scheduling)"
 

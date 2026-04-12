@@ -58,6 +58,8 @@ docker pull vllm/vllm-openai:v0.19.0
 
 第一次执行 `qsr compose up` 时，会在 `vllm/vllm-openai:v0.19.0` 之上构建本地镜像 `tfmx-vllm-openai:qwen3-asr-v0.19.0`。当前镜像会固定安装 `vllm[audio]==0.19.0`、`qwen-asr==0.0.6`、与 `transformers 4.57.x` 兼容的 `huggingface-hub>=0.34.0,<1.0`，以及 `qwen-asr` 运行期实际需要的辅助依赖，避免上游 `qwen-asr[vllm]` 把 `vllm` 回退到旧版本。
 
+当前默认 runtime 也针对 `0.6B` ASR 做了收敛：默认 `max_model_len=4096`、`max_num_seqs=8`、`gpu_memory_utilization=0.35`。这样单卡 20GB RTX 3080 上的常驻显存会明显低于之前的大块 KV cache 预留；如果你确实需要更长音频上下文或更高并发，再按需覆盖这些参数。
+
 ### 2. 启动一个或多个 GPU 实例
 
 ```bash

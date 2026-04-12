@@ -6,12 +6,15 @@ import pytest
 
 from tfmx.qsrs.compose import ComposeFileGenerator
 from tfmx.qsrs.compose import GPUInfo
+from tfmx.qsrs.compose import GPU_MEMORY_UTILIZATION
 from tfmx.qsrs.compose import GPU_LAYOUT_UNIFORM
 from tfmx.qsrs.compose import GpuModelConfig
 from tfmx.qsrs.compose import HEALTHCHECK_INTERVAL
 from tfmx.qsrs.compose import HEALTHCHECK_START_PERIOD
 from tfmx.qsrs.compose import HEALTHCHECK_TCP_PROBE
 from tfmx.qsrs.compose import MACHINE_PORT
+from tfmx.qsrs.compose import MAX_MODEL_LEN
+from tfmx.qsrs.compose import MAX_NUM_SEQS
 from tfmx.qsrs.compose import MODEL_NAME
 from tfmx.qsrs.compose import MODEL_SHORTCUTS
 from tfmx.qsrs.compose import QWEN_ASR_HF_HUB_SPEC
@@ -45,6 +48,11 @@ class TestConstants:
     def test_default_model(self):
         assert MODEL_NAME in SUPPORTED_MODELS
         assert MODEL_SHORTCUTS["0.6b"] == MODEL_NAME
+
+    def test_runtime_defaults_are_tuned_for_asr(self):
+        assert MAX_MODEL_LEN == 4096
+        assert MAX_NUM_SEQS == 8
+        assert GPU_MEMORY_UTILIZATION == 0.35
 
 
 class TestModelShortcuts:
@@ -111,6 +119,9 @@ class TestComposeFileGenerator:
         assert "CUDA_VISIBLE_DEVICES=0" in compose_text
         assert "NVIDIA_VISIBLE_DEVICES=0" in compose_text
         assert "${HOME}/.cache/vllm:/root/.cache/vllm" in compose_text
+        assert "--max-model-len 4096" in compose_text
+        assert "--max-num-seqs 8" in compose_text
+        assert "--gpu-memory-utilization 0.35" in compose_text
         assert "CMD-SHELL" in compose_text
         assert HEALTHCHECK_TCP_PROBE in compose_text
         assert f"interval: {HEALTHCHECK_INTERVAL}" in compose_text

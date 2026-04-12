@@ -3,6 +3,8 @@
 QSR_RUNS_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 QSR_REPO_ROOT="$(cd "$QSR_RUNS_DIR/../.." && pwd)"
 QSR_RESULTS_DIR="$QSR_REPO_ROOT/runs/qsrs/results"
+QSR_CACHE_DIR="${QSR_CACHE_DIR:-$HOME/.cache/tfmx/qsrs}"
+QSR_AUDIO_CACHE_DIR="$QSR_CACHE_DIR/audio"
 QSR_MACHINE_URL="${QSR_MACHINE_URL:-http://127.0.0.1:27900}"
 QSR_MACHINE_PORT="${QSR_MACHINE_PORT:-27900}"
 QSR_BACKEND_BASE_PORT="${QSR_BACKEND_BASE_PORT:-27980}"
@@ -10,6 +12,7 @@ QSR_DEFAULT_AUDIO="${QSR_DEFAULT_AUDIO:-https://qianwen-res.oss-cn-beijing.aliyu
 QSR_ALT_AUDIO="${QSR_ALT_AUDIO:-https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav}"
 
 mkdir -p "$QSR_RESULTS_DIR"
+mkdir -p "$QSR_AUDIO_CACHE_DIR"
 
 qsr_cmd() {
     if command -v qsr >/dev/null 2>&1; then
@@ -17,6 +20,31 @@ qsr_cmd() {
     else
         python -m tfmx.qsrs.cli "$@"
     fi
+}
+
+materialize_qsr_audio() {
+    local source="$1"
+    if [[ "$source" == http://* || "$source" == https://* ]]; then
+        local source_without_query="${source%%\?*}"
+        local base_name="${source_without_query##*/}"
+        local cache_key
+        local target_path
+        local tmp_path
+
+        [[ -n "$base_name" ]] || base_name="audio.wav"
+        cache_key="$(printf '%s' "$source" | sha256sum | awk '{print substr($1, 1, 16)}')"
+        target_path="$QSR_AUDIO_CACHE_DIR/${cache_key}_${base_name}"
+        if [[ ! -s "$target_path" ]]; then
+            tmp_path="${target_path}.tmp"
+            rm -f "$tmp_path"
+            curl -L --fail -o "$tmp_path" "$source"
+            mv "$tmp_path" "$target_path"
+        fi
+        printf '%s\n' "$target_path"
+        return
+    fi
+
+    printf '%s\n' "$source"
 }
 
 detect_visible_gpu_csv() {

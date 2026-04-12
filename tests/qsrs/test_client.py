@@ -1,7 +1,7 @@
 """Tests for tfmx.qsrs.client."""
 
 from pathlib import Path
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import httpx
 
@@ -13,6 +13,7 @@ from tfmx.qsrs.client import InfoResponse
 from tfmx.qsrs.client import ModelInfo
 from tfmx.qsrs.client import QSRClient
 from tfmx.qsrs.client import StreamChatResult
+from tfmx.qsrs.client import _load_audio_upload
 from tfmx.qsrs.client import build_audio_messages
 from tfmx.qsrs.client import build_text_messages
 from tfmx.qsrs.client import format_elapsed_time
@@ -239,3 +240,17 @@ class TestQSRClient:
         assert b'name="timestamp_granularities[]"' in captured["body"]
         assert b'filename="sample.wav"' in captured["body"]
         client.close()
+
+    def test_load_audio_upload_caches_remote_downloads(self):
+        url = "https://example.com/cache-audio.wav"
+        response = MagicMock()
+        response.raise_for_status.return_value = None
+        response.content = b"RIFF1234WAVEfmt "
+        response.headers = {"content-type": "audio/wav"}
+
+        with patch("tfmx.qsrs.client.httpx.get", return_value=response) as mock_get:
+            first = _load_audio_upload(url)
+            second = _load_audio_upload(url)
+
+        assert first == second
+        assert mock_get.call_count == 1

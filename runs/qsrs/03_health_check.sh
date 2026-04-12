@@ -3,7 +3,7 @@ set -euo pipefail
 
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
-smoke_audio="${QSR_SMOKE_AUDIO:-$QSR_DEFAULT_AUDIO}"
+smoke_audio="$(materialize_qsr_audio "${QSR_SMOKE_AUDIO:-$QSR_DEFAULT_AUDIO}")"
 
 cd "$QSR_REPO_ROOT"
 qsr_cmd client health -E "$QSR_MACHINE_URL"

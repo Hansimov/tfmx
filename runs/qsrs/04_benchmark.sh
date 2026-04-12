@@ -5,7 +5,7 @@ source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
 mode="${QSR_BENCH_MODE:-transcribe}"
 num_samples="${QSR_BENCH_SAMPLES:-20}"
-audio="${QSR_BENCH_AUDIO:-$QSR_DEFAULT_AUDIO}"
+audio="$(materialize_qsr_audio "${QSR_BENCH_AUDIO:-$QSR_DEFAULT_AUDIO}")"
 prompt="${QSR_BENCH_PROMPT:-请转写为简体中文。}"
 output_path="$(result_json_path qsr_benchmark)"
 

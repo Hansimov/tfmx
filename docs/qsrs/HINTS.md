@@ -25,6 +25,7 @@
 - `qsr` 会自动基于 `vllm/vllm-openai:v0.19.0` 构建本地镜像 `tfmx-vllm-openai:qwen3-asr-v0.19.0`
 - 构建时会固定安装 `vllm[audio]==0.19.0`、`qwen-asr==0.0.6` 与 `huggingface-hub>=0.34.0,<1.0`
 - 这样做是为了避开上游 `qwen-asr[vllm]` 当前内置的 `vllm==0.14.0` 约束，防止 `pip` 在 Docker build 中回溯到需要源码编译 `xformers` 的旧版本链路
+- 当前默认还把 `max_model_len` 收到 `4096`、`gpu_memory_utilization` 收到 `0.35`；对 `0.6B` ASR 来说，这比大模型常见的高预留策略更合理，能显著降低单卡常驻显存
 - Hugging Face 默认使用 `hf-mirror.com`，`pip` 默认使用 USTC mirror
 - 若环境里存在 `QSR_PROXY_URL`、`TFMX_QSR_PROXY` 或系统代理，构建和容器内 runtime 会自动复用
 
@@ -44,6 +45,8 @@ qsr compose up --gpu-configs "0"
 - `data:` URI
 
 如果你只是想做最稳定的最小链路验证，优先使用本地文件；这样可以避免把问题混到远端音频下载或代理链路里。
+
+`runs/qsrs/*` 里的 staged 脚本现在会把默认公网样本先落到本地缓存，再做 smoke/benchmark；这样测出来的是 `qsr` 服务，而不是公网下载速度。
 
 ## `transcribe` 和 `chat` 的职责边界
 

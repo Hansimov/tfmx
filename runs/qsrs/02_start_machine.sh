@@ -20,6 +20,13 @@ qsr_cmd machine run \
     --on-conflict replace
 
 wait_machine_health "$expected_total"
+
+if [[ "${QSR_SKIP_WARMUP:-0}" != "1" ]]; then
+    warmup_audio="$(materialize_qsr_audio "${QSR_WARMUP_AUDIO:-$QSR_DEFAULT_AUDIO}")"
+    echo "[qsr-runs] warming up qsr machine with: $warmup_audio"
+    qsr_cmd client transcribe -E "$QSR_MACHINE_URL" "$warmup_audio" --response-format text >/dev/null
+fi
+
 qsr_cmd machine status
 
 echo "[qsr-runs] qsr machine log: $HOME/.cache/tfmx/qsr_machine.log"
