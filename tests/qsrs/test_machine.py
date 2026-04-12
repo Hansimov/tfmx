@@ -34,9 +34,14 @@ class TestQSRInstance:
         assert instance.available_slots > 0
 
     def test_to_info(self):
-        instance = self._make(healthy=True, model_name="qwen3-asr-0.6b")
+        instance = self._make(
+            healthy=True,
+            sleeping=True,
+            model_name="qwen3-asr-0.6b",
+        )
         info = instance.to_info()
         assert info.healthy is True
+        assert info.sleeping is True
         assert info.model_name == "qwen3-asr-0.6b"
         assert info.available_slots >= 0
 
@@ -167,6 +172,44 @@ class TestQSRMachineServer:
         assert "/v1/chat/completions" in route_paths
         assert "/audio/transcriptions" in route_paths
         assert "/v1/audio/transcriptions" in route_paths
+
+    def test_check_instance_health_marks_sleeping_instance_unhealthy(self):
+        instance = QSRInstance(
+            container_name="qsr-multi--gpu0",
+            host="localhost",
+            port=27980,
+            healthy=True,
+        )
+        server = QSRMachineServer(instances=[instance])
+        health_response = MagicMock(status_code=200)
+        sleep_response = MagicMock(status_code=200)
+        sleep_response.json.return_value = {"is_sleeping": True}
+        server._client = AsyncMock()
+        server._client.get.side_effect = [health_response, sleep_response]
+
+        assert asyncio.run(server._check_instance_health(instance)) is False
+        assert instance.healthy is False
+        assert instance.sleeping is True
+
+    @patch("tfmx.qsrs.machine.get_backend_sleep_state", return_value=True)
+    def test_check_instance_health_uses_docker_health_sleep_state_without_http(
+        self,
+        _mock_sleep_state,
+    ):
+        instance = QSRInstance(
+            container_name="qsr-multi--gpu0",
+            host="localhost",
+            port=27980,
+            healthy=False,
+            docker_health=True,
+            docker_status="Up 3 seconds (healthy)",
+        )
+        server = QSRMachineServer(instances=[instance])
+        server._client = AsyncMock()
+
+        assert asyncio.run(server._check_instance_health(instance)) is False
+        assert instance.sleeping is True
+        server._client.get.assert_not_called()
 
     def test_select_idle_instance_round_robins_when_load_ties(self):
         first_instance = QSRInstance(

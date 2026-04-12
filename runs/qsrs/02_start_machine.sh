@@ -12,12 +12,26 @@ if [[ "$expected_total" -eq 0 ]]; then
 fi
 
 cd "$QSR_REPO_ROOT"
-qsr_cmd machine run \
-    --auto-start \
-    -b \
-    --compose-gpus "$deploy_gpus" \
-    --compose-gpu-layout uniform \
+if [[ "${QSR_ENABLE_SLEEP_MODE:-0}" == "1" ]]; then
+    qsr_cmd compose wake \
+        --gpu-layout uniform \
+        -g "$deploy_gpus" \
+        --wait-healthy || true
+fi
+
+machine_args=(
+    --auto-start
+    -b
+    --compose-gpus "$deploy_gpus"
+    --compose-gpu-layout uniform
     --on-conflict replace
+)
+if [[ "${QSR_ENABLE_SLEEP_MODE:-0}" == "1" ]]; then
+    machine_args+=(--compose-enable-sleep-mode)
+fi
+
+qsr_cmd machine run \
+    "${machine_args[@]}"
 
 wait_machine_health "$expected_total"
 

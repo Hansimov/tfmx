@@ -32,11 +32,14 @@ from webu import setup_swagger_ui
 from ..utils.service_bootstrap import docker_status_to_health
 from ..utils.service_bootstrap import ensure_backend_instances
 from ..utils.service_bootstrap import handle_port_conflicts
+from ..utils.service_bootstrap import wait_for_healthy_http_endpoints
 from .client import _build_transcription_multipart_fields
 from .compose import GPU_LAYOUT_UNIFORM, MACHINE_PORT
 from .compose import MAX_MODEL_LEN, MAX_NUM_SEQS
 from .compose import MODEL_NAME as COMPOSE_MODEL_NAME
 from .compose import QSRComposer, SERVER_PORT as COMPOSE_SERVER_PORT
+from .compose import SLEEP_CONTROL_TIMEOUT_SEC, SLEEP_WAKE_POLL_INTERVAL_SEC
+from .compose import get_backend_sleep_state, set_backend_sleep_states
 from .compose import get_display_shortcut, get_model_api_aliases
 from .compose import get_model_shortcut, normalize_model_key, parse_gpu_configs
 from .router import InstanceDescriptor, QSRRouter
@@ -128,6 +131,7 @@ class InstanceHealthDetail(BaseModel):
     name: str = Field(..., description="Container or instance name")
     endpoint: str = Field(..., description="HTTP endpoint URL")
     healthy: bool = Field(..., description="Whether instance is healthy")
+    sleeping: bool = Field(False, description="Whether instance is in vLLM sleep mode")
     latency_ms: float | None = Field(None, description="Last health check latency")
     active_requests: int = Field(0, description="Current active requests")
     model_label: str = Field(default="", description="Model label")
@@ -173,6 +177,7 @@ class InstanceInfo(BaseModel):
     endpoint: str = Field(...)
     gpu_id: int | None = Field(None)
     healthy: bool = Field(...)
+    sleeping: bool = Field(False)
     model_name: str = Field(default="")
     model_label: str = Field(default="")
     active_requests: int = Field(0)
@@ -213,6 +218,8 @@ class QSRInstance:
     port: int
     gpu_id: Optional[int] = None
     healthy: bool = False
+    sleeping: bool = False
+    sleep_mode_supported: Optional[bool] = None
     docker_status: str = ""
     docker_health: bool | None = None
     _active_requests: int = 0
@@ -241,6 +248,10 @@ class QSRInstance:
         return f"{self.endpoint}/v1/models"
 
     @property
+    def sleep_state_url(self) -> str:
+        return f"{self.endpoint}/is_sleeping"
+
+    @property
     def is_idle(self) -> bool:
         return self._active_requests < MAX_CONCURRENT
 
@@ -260,6 +271,7 @@ class QSRInstance:
             endpoint=self.endpoint,
             gpu_id=self.gpu_id,
             healthy=self.healthy,
+            sleeping=self.sleeping,
             model_name=self.model_name,
             model_label=model_label or self.model_name,
             active_requests=self._active_requests,
@@ -278,8 +290,61 @@ def _apply_qsr_docker_health(instance: QSRInstance) -> bool | None:
     if instance.docker_health is None:
         return None
     instance._latency_ms = 0.0
-    instance.healthy = bool(instance.docker_health)
+    if not instance.docker_health:
+        instance.healthy = False
+        instance.sleeping = False
+        return False
+
+    sleeping_state = get_backend_sleep_state(instance.endpoint)
+    instance.sleeping = bool(sleeping_state)
+    if instance.sleeping:
+        instance.sleep_mode_supported = True
+    instance.healthy = not instance.sleeping
     return instance.healthy
+
+
+def _wake_sleeping_backends(
+    endpoints: list[str],
+    *,
+    timeout_sec: float,
+    poll_interval_sec: float,
+    label: str,
+) -> bool:
+    normalized = [endpoint.rstrip("/") for endpoint in endpoints if endpoint]
+    if not normalized:
+        return False
+
+    successes: list[str] = []
+    with httpx.Client(timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC)) as client:
+        for endpoint in normalized:
+            try:
+                response = client.post(f"{endpoint}/wake_up")
+            except Exception as exc:
+                logger.warn(f"{label} Wake request failed for {endpoint}: {exc}")
+                continue
+
+            if response.status_code == 200:
+                successes.append(endpoint)
+            elif response.status_code == 404:
+                logger.warn(
+                    f"{label} Wake endpoint unavailable for {endpoint}; redeploy with --enable-sleep-mode"
+                )
+            else:
+                logger.warn(
+                    f"{label} Wake request failed for {endpoint}: HTTP {response.status_code}"
+                )
+
+    if not successes:
+        return False
+
+    set_backend_sleep_states(successes, sleeping=False)
+    return wait_for_healthy_http_endpoints(
+        successes,
+        timeout_sec=timeout_sec,
+        poll_interval_sec=poll_interval_sec,
+        request_timeout_sec=HEALTH_REQUEST_TIMEOUT_SEC,
+        label=label,
+    )
 
 
 @dataclass
@@ -578,6 +643,7 @@ class QSRMachineServer:
                 existing.docker_status = "missing"
                 existing.docker_health = False
                 existing.healthy = False
+                existing.sleeping = False
                 changed = True
 
         if changed:
@@ -630,12 +696,31 @@ class QSRMachineServer:
                 timeout=httpx.Timeout(HEALTH_REQUEST_TIMEOUT_SEC),
             )
             instance.healthy = response.status_code == 200
+            instance.sleeping = False
+            if instance.healthy:
+                try:
+                    sleep_response = await self._client.get(
+                        instance.sleep_state_url,
+                        timeout=httpx.Timeout(HEALTH_REQUEST_TIMEOUT_SEC),
+                    )
+                    if sleep_response.status_code == 200:
+                        instance.sleep_mode_supported = True
+                        payload = sleep_response.json()
+                        instance.sleeping = bool(payload.get("is_sleeping", False))
+                        if instance.sleeping:
+                            instance.healthy = False
+                    elif sleep_response.status_code == 404:
+                        instance.sleep_mode_supported = False
+                except Exception:
+                    if instance.sleep_mode_supported is None:
+                        instance.sleep_mode_supported = False
             instance._latency_ms = (
                 (time.perf_counter() - started_at) * 1000 if instance.healthy else 0.0
             )
             return instance.healthy
         except Exception:
             instance.healthy = False
+            instance.sleeping = False
             instance._latency_ms = 0.0
             return False
 
@@ -1099,6 +1184,7 @@ class QSRMachineServer:
                     name=instance.container_name,
                     endpoint=instance.endpoint,
                     healthy=instance.healthy,
+                    sleeping=instance.sleeping,
                     latency_ms=(
                         round(instance._latency_ms, 2)
                         if instance._latency_ms > 0
@@ -1666,6 +1752,11 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         help='Per-GPU config for auto-started backends: "GPU[:MODEL],..."',
     )
     parser.add_argument(
+        "--compose-enable-sleep-mode",
+        action="store_true",
+        help="Enable vLLM sleep-mode endpoints on auto-started compose backends",
+    )
+    parser.add_argument(
         "-f", "--follow", action="store_true", help="Follow logs in real time"
     )
     parser.add_argument("--tail", type=int, default=50, help="Log lines to show")
@@ -1689,6 +1780,8 @@ def _build_auto_start_composer(args: argparse.Namespace) -> QSRComposer:
         composer_kwargs["gpu_layout"] = args.compose_gpu_layout
     if getattr(args, "compose_gpu_configs", None):
         composer_kwargs["gpu_configs"] = parse_gpu_configs(args.compose_gpu_configs)
+    if getattr(args, "compose_enable_sleep_mode", False):
+        composer_kwargs["enable_sleep_mode"] = True
     return QSRComposer(**composer_kwargs)
 
 
@@ -1704,6 +1797,30 @@ def discover_instances(args: argparse.Namespace) -> list[QSRInstance]:
         return instances
 
     instances = _discover_instances_from_docker(args.name_pattern)
+    if getattr(args, "auto_start", False):
+        sleeping_endpoints = [
+            instance.endpoint
+            for instance in instances
+            if get_backend_sleep_state(instance.endpoint) is True
+        ]
+        if sleeping_endpoints:
+            logger.note(
+                f"[qsr_machine] Found {len(sleeping_endpoints)} sleeping QSR backend(s); requesting wake-up"
+            )
+            _wake_sleeping_backends(
+                sleeping_endpoints,
+                timeout_sec=getattr(
+                    args, "startup_timeout", BACKEND_STARTUP_TIMEOUT_SEC
+                ),
+                poll_interval_sec=getattr(
+                    args,
+                    "startup_poll_interval",
+                    SLEEP_WAKE_POLL_INTERVAL_SEC,
+                ),
+                label="[qsr_machine]",
+            )
+            instances = _discover_instances_from_docker(args.name_pattern)
+
     instances = ensure_backend_instances(
         instances,
         enabled=getattr(args, "auto_start", False),

@@ -17,6 +17,7 @@
 
 - `qsr compose up` 现在默认就会等待 backend 可达并做一次短转写 warmup；只有你显式使用 `--skip-warmup` 时，才需要后续单独再跑 `qsr compose warmup`
 - 在当前这台 20GB RTX 3080 机器上，QSR 多卡冷启动的主瓶颈已经验证是后端自身的 vLLM/Qwen3-ASR 初始化，不是 `docker compose up` 或额外的 warmup HTTP 请求
+- 如果你的场景是“同一批 backend 反复停机再恢复”，不要再反复走 full cold start；部署时加 `--enable-sleep-mode`，然后用 `qsr compose sleep` / `qsr compose wake --wait-healthy` 走快恢复路径
 
 ## 模型标签
 
@@ -131,5 +132,5 @@ qsr client chat --audio ./sample.wav --max-tokens 256 "请转写并总结"
 ## 当前实现边界
 
 - 当前 repo 内的默认 compose/脚本/文档都围绕 `Qwen/Qwen3-ASR-0.6B`
-- 当前 `qsr compose` 已提供 `warmup` 子命令，用于在容器 healthy 后做一次短音频预热；`sleep`、`wake` 等生命周期能力仍未引入
+- 当前 `qsr compose` 已提供 `warmup`、`sleep`、`wake`、`sleep-status`；对重复重启场景，优先使用 sleep/wake，而不是销毁后再 cold start
 - 当前 `qsr machine` 是单机聚合代理，不负责跨机器统一入口

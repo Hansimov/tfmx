@@ -69,6 +69,9 @@ qsr compose up --gpu-configs "0"
 # 所有健康 GPU 统一部署默认 Qwen3-ASR
 qsr compose up --gpu-layout uniform
 
+# 如果你需要更快的重复启动/恢复，可在首次部署时开启 sleep mode
+qsr compose up --gpu-layout uniform --enable-sleep-mode
+
 # 如需尽快返回而不等待默认预热，可显式跳过
 qsr compose up --gpu-layout uniform --skip-warmup
 
@@ -88,6 +91,7 @@ qsr compose up --gpu-layout uniform --pip-index-url https://mirrors.ustc.edu.cn/
 - `--gpu-configs "0,2"` 也是合法写法，表示 GPU0/GPU2 使用默认 `Qwen/Qwen3-ASR-0.6B`
 - `qsr compose up` 现在默认会等待 backend 可达后做一次短转写 warmup，不再需要额外手动执行 `qsr compose warmup`
 - 如果你只是想先把容器拉起、稍后再手动预热，可显式加 `--skip-warmup`
+- 如果你希望以后用 wake/resume 代替重复 cold start，请在这里就加 `--enable-sleep-mode`，后续即可使用 `qsr compose sleep` / `qsr compose wake --wait-healthy`
 
 ### 3. 启动本地聚合代理
 
@@ -104,6 +108,9 @@ qsr machine run --auto-start -b --on-conflict replace
 # 只让 auto-start 使用 0,1 这两张卡
 qsr machine run --auto-start -b --compose-gpus "0,1" --compose-gpu-layout uniform --on-conflict replace
 
+# auto-start 新拉起 backend 时也可以直接启用 sleep mode
+qsr machine run --auto-start -b --compose-enable-sleep-mode --on-conflict replace
+
 qsr machine status
 qsr machine logs
 ```
@@ -113,6 +120,7 @@ qsr machine logs
 - `qsr machine` 当前监听 `0.0.0.0:27900`，不仅是 `localhost`
 - `--auto-start` 会在没有检测到运行中的 QSR 后端时自动调用 `qsr compose up`
 - `--auto-start` 走到 `qsr compose up` 时也会继承默认 warmup，因此冷启动后不需要再额外手动预热一遍
+- 如果检测到已有后端处于 sleep 状态，`--auto-start` 会先请求 wake-up；若没有运行中的后端，再回退到普通 compose cold start
 - `--on-conflict replace` 适合替换旧 machine 或已占用 `27900` 的旧进程
 - 后台 daemon 的 PID 与日志位于 `~/.cache/tfmx/qsr_machine.pid` 与 `~/.cache/tfmx/qsr_machine.log`
 
@@ -166,6 +174,15 @@ bash runs/qsrs/01_deploy_default.sh
 bash runs/qsrs/02_start_machine.sh
 bash runs/qsrs/03_health_check.sh
 bash runs/qsrs/04_benchmark.sh
+```
+
+如果你想让 staged workflow 使用 fast wake/resume：
+
+```bash
+export QSR_ENABLE_SLEEP_MODE=1
+bash runs/qsrs/01_deploy_default.sh
+bash runs/qsrs/98_sleep_backends.sh
+bash runs/qsrs/02_start_machine.sh
 ```
 
 更多 staged workflow 见 `runs/qsrs/README.md`。

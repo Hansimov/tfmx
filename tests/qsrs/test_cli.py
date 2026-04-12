@@ -44,6 +44,28 @@ class TestQsrCliParser:
         assert args.audio == "./sample.wav"
         assert args.wait_timeout == 30.0
 
+    def test_compose_sleep_status_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(["compose", "sleep-status", "--gpu-layout", "uniform"])
+
+        assert args.command == "compose"
+        assert args.compose_action == "sleep-status"
+        assert args.gpu_layout == "uniform"
+
+    def test_compose_wake_parse(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "compose",
+                "up",
+                "--enable-sleep-mode",
+            ]
+        )
+
+        assert args.command == "compose"
+        assert args.compose_action == "up"
+        assert args.enable_sleep_mode is True
+
     def test_compose_parse_gpu_configs(self):
         parser = build_parser()
         args = parser.parse_args(["compose", "up", "--gpu-configs", "0,1"])

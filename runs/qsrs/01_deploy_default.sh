@@ -33,6 +33,9 @@ fi
 if [[ -n "${QSR_GPU_MEMORY_UTILIZATION:-}" ]]; then
     compose_args+=(--gpu-memory-utilization "$QSR_GPU_MEMORY_UTILIZATION")
 fi
+if [[ "${QSR_ENABLE_SLEEP_MODE:-0}" == "1" ]]; then
+    compose_args+=(--enable-sleep-mode)
+fi
 
 cd "$QSR_REPO_ROOT"
 qsr_cmd compose up "${compose_args[@]}"

@@ -2,7 +2,7 @@
 
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import pytest
 
@@ -10,6 +10,7 @@ from tfmx.qsrs import compose
 from tfmx.qsrs.compose import ComposeFileGenerator
 from tfmx.qsrs.compose import CUDAGRAPH_MODE_CHOICES
 from tfmx.qsrs.compose import DEFAULT_CUDAGRAPH_MODE
+from tfmx.qsrs.compose import DEFAULT_ENABLE_SLEEP_MODE
 from tfmx.qsrs.compose import GPUInfo
 from tfmx.qsrs.compose import GPU_MEMORY_UTILIZATION
 from tfmx.qsrs.compose import GPU_LAYOUT_UNIFORM
@@ -161,6 +162,22 @@ class TestComposeFileGenerator:
         assert "--skip-mm-profiling" in compose_text
         assert 'cudagraph_mode":"NONE"' in compose_text
 
+    def test_generate_single_gpu_can_enable_sleep_mode(self):
+        generator = ComposeFileGenerator(
+            gpus=[GPUInfo(index=0, compute_cap="8.9")],
+            model_name=MODEL_NAME,
+            port=SERVER_PORT,
+            project_name="qsr-test",
+            data_dir=Path("/tmp/qsr-test"),
+            enable_sleep_mode=True,
+        )
+
+        compose_text = generator.generate()
+
+        assert DEFAULT_ENABLE_SLEEP_MODE is False
+        assert "VLLM_SERVER_DEV_MODE=1" in compose_text
+        assert "--enable-sleep-mode" in compose_text
+
 
 class TestQSRComposerWarmup:
     def test_build_embedded_warmup_audio(self):
@@ -226,6 +243,39 @@ class TestQSRComposerWarmup:
             "audio_upload": ("sample.wav", b"RIFF1234WAVEfmt ", "audio/wav"),
             "request_timeout_sec": 34.0,
         }
+
+    @patch("tfmx.qsrs.compose.GPUDetector.detect")
+    def test_wake_waits_for_healthy_backends(self, mock_detect):
+        mock_detect.return_value = [GPUInfo(index=0, compute_cap="8.6")]
+        composer = compose.QSRComposer(project_name="qsr-test")
+        response = MagicMock(status_code=200)
+        response.headers = {"content-type": "application/json"}
+        response.json.return_value = {"ok": True}
+
+        with patch.object(
+            composer,
+            "_get_control_endpoints",
+            return_value=["http://localhost:27980"],
+        ):
+            with patch("tfmx.qsrs.compose.httpx.Client") as mock_client_cls:
+                mock_client = MagicMock()
+                mock_client.__enter__.return_value = mock_client
+                mock_client.__exit__.return_value = False
+                mock_client.request.return_value = response
+                mock_client_cls.return_value = mock_client
+                with patch.object(
+                    composer,
+                    "wait_for_healthy_backends",
+                    return_value=True,
+                ) as mock_wait:
+                    assert composer.wake(wait_healthy=True) is True
+
+        mock_client.request.assert_called_once_with(
+            "POST",
+            "http://localhost:27980/wake_up",
+            params=None,
+        )
+        mock_wait.assert_called_once()
 
     @patch("tfmx.qsrs.compose.QSRComposer")
     def test_run_from_args_dispatches_warmup(self, mock_composer_cls):

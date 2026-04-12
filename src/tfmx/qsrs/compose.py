@@ -68,6 +68,12 @@ DEVICE_MOUNT_MODE = "manual"
 GPU_LAYOUT_UNIFORM = "uniform"
 DEFAULT_SKIP_MM_PROFILING = False
 DEFAULT_CUDAGRAPH_MODE: str | None = None
+DEFAULT_ENABLE_SLEEP_MODE = False
+DEFAULT_SLEEP_LEVEL = 1
+DEFAULT_SLEEP_MODE = "abort"
+SLEEP_CONTROL_TIMEOUT_SEC = 5.0
+SLEEP_WAKE_TIMEOUT_SEC = 180.0
+SLEEP_WAKE_POLL_INTERVAL_SEC = 2.0
 
 CUDAGRAPH_MODE_CHOICES = (
     "NONE",
@@ -86,6 +92,7 @@ WARMUP_WAIT_TIMEOUT_SEC = 300.0
 WARMUP_POLL_INTERVAL_SEC = 1.0
 READINESS_REQUEST_TIMEOUT_SEC = 1.0
 WARMUP_REQUEST_TIMEOUT_SEC = 120.0
+SLEEP_STATE_FILE = Path.home() / ".cache" / "tfmx" / "qsr_sleep_state.json"
 
 SUPPORTED_MODELS = {
     MODEL_NAME: {
@@ -175,6 +182,84 @@ def get_model_api_aliases(model_name: str) -> list[str]:
         if alias and alias not in deduped:
             deduped.append(alias)
     return deduped
+
+
+def _normalize_backend_endpoint(endpoint: str) -> str:
+    return endpoint.rstrip("/") if endpoint else ""
+
+
+def load_backend_sleep_states() -> dict[str, bool]:
+    if not SLEEP_STATE_FILE.exists():
+        return {}
+
+    try:
+        payload = json.loads(SLEEP_STATE_FILE.read_text())
+    except Exception:
+        return {}
+
+    if not isinstance(payload, dict):
+        return {}
+
+    states: dict[str, bool] = {}
+    for endpoint, sleeping in payload.items():
+        normalized = _normalize_backend_endpoint(str(endpoint))
+        if normalized:
+            states[normalized] = bool(sleeping)
+    return states
+
+
+def _write_backend_sleep_states(states: dict[str, bool]) -> None:
+    if not states:
+        try:
+            SLEEP_STATE_FILE.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return
+
+    SLEEP_STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    SLEEP_STATE_FILE.write_text(json.dumps(states, indent=2, sort_keys=True) + "\n")
+
+
+def update_backend_sleep_states(state_updates: dict[str, bool]) -> None:
+    normalized_updates = {
+        _normalize_backend_endpoint(endpoint): bool(sleeping)
+        for endpoint, sleeping in state_updates.items()
+        if _normalize_backend_endpoint(endpoint)
+    }
+    if not normalized_updates:
+        return
+
+    states = load_backend_sleep_states()
+    states.update(normalized_updates)
+    _write_backend_sleep_states(states)
+
+
+def set_backend_sleep_states(endpoints: list[str], *, sleeping: bool) -> None:
+    update_backend_sleep_states({endpoint: sleeping for endpoint in endpoints})
+
+
+def clear_backend_sleep_states(endpoints: list[str]) -> None:
+    normalized_endpoints = {
+        _normalize_backend_endpoint(endpoint) for endpoint in endpoints if endpoint
+    }
+    if not normalized_endpoints:
+        return
+
+    states = load_backend_sleep_states()
+    changed = False
+    for endpoint in normalized_endpoints:
+        if endpoint in states:
+            del states[endpoint]
+            changed = True
+    if changed:
+        _write_backend_sleep_states(states)
+
+
+def get_backend_sleep_state(endpoint: str) -> bool | None:
+    normalized = _normalize_backend_endpoint(endpoint)
+    if not normalized:
+        return None
+    return load_backend_sleep_states().get(normalized)
 
 
 @dataclass
@@ -572,6 +657,7 @@ class ComposeFileGenerator:
         max_num_seqs: int = MAX_NUM_SEQS,
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
         skip_mm_profiling: bool = DEFAULT_SKIP_MM_PROFILING,
+        enable_sleep_mode: bool = DEFAULT_ENABLE_SLEEP_MODE,
         cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
         gpu_configs: list[GpuModelConfig] | None = None,
         network_config: QSRNetworkConfig | None = None,
@@ -597,6 +683,7 @@ class ComposeFileGenerator:
         self.max_num_seqs = max_num_seqs
         self.gpu_memory_utilization = gpu_memory_utilization
         self.skip_mm_profiling = skip_mm_profiling
+        self.enable_sleep_mode = enable_sleep_mode
         self.cudagraph_mode = cudagraph_mode.upper() if cudagraph_mode else None
         self.compilation_config = build_compilation_config(self.cudagraph_mode)
         self.gpu_configs = gpu_configs or []
@@ -683,6 +770,9 @@ class ComposeFileGenerator:
             ]
         )
 
+        if self.enable_sleep_mode:
+            lines.append("    - VLLM_SERVER_DEV_MODE=1")
+
         if self._uses_runtime_offline_cache():
             lines.extend(["    - HF_HUB_OFFLINE=1", "    - TRANSFORMERS_OFFLINE=1"])
 
@@ -748,6 +838,9 @@ class ComposeFileGenerator:
 
         if self.skip_mm_profiling:
             serve_args.append("--skip-mm-profiling")
+
+        if self.enable_sleep_mode:
+            serve_args.append("--enable-sleep-mode")
 
         if self.compilation_config:
             serve_args.extend(
@@ -825,6 +918,7 @@ class QSRComposer:
         max_num_seqs: int = MAX_NUM_SEQS,
         gpu_memory_utilization: float = GPU_MEMORY_UTILIZATION,
         skip_mm_profiling: bool = DEFAULT_SKIP_MM_PROFILING,
+        enable_sleep_mode: bool = DEFAULT_ENABLE_SLEEP_MODE,
         cudagraph_mode: str | None = DEFAULT_CUDAGRAPH_MODE,
         gpu_layout: Optional[str] = None,
         gpu_configs: list[GpuModelConfig] | None = None,
@@ -847,6 +941,7 @@ class QSRComposer:
         self.max_num_seqs = max_num_seqs
         self.gpu_memory_utilization = gpu_memory_utilization
         self.skip_mm_profiling = skip_mm_profiling
+        self.enable_sleep_mode = enable_sleep_mode
         self.cudagraph_mode = cudagraph_mode.upper() if cudagraph_mode else None
         self.gpu_layout = normalize_model_key(gpu_layout) if gpu_layout else None
 
@@ -955,6 +1050,7 @@ class QSRComposer:
             max_num_seqs=self.max_num_seqs,
             gpu_memory_utilization=self.gpu_memory_utilization,
             skip_mm_profiling=self.skip_mm_profiling,
+            enable_sleep_mode=self.enable_sleep_mode,
             cudagraph_mode=self.cudagraph_mode,
             gpu_configs=self.gpu_configs,
             network_config=self.network_config,
@@ -1005,6 +1101,51 @@ class QSRComposer:
 
     def _discover_running_backend_endpoints(self) -> list[str]:
         return [endpoint for _, endpoint in self._discover_running_backend_targets()]
+
+    def _get_control_endpoints(self) -> list[str]:
+        return (
+            self._discover_running_backend_endpoints() or self.get_backend_endpoints()
+        )
+
+    def _request_backend_control(
+        self,
+        path: str,
+        *,
+        method: str = "POST",
+        params: dict[str, object] | None = None,
+    ) -> tuple[list[tuple[str, dict | None]], list[str], list[tuple[str, str]]]:
+        endpoints = self._get_control_endpoints()
+        if not endpoints:
+            return [], [], []
+
+        successes: list[tuple[str, dict | None]] = []
+        unsupported: list[str] = []
+        failures: list[tuple[str, str]] = []
+
+        with httpx.Client(timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC)) as client:
+            for endpoint in endpoints:
+                url = f"{endpoint}{path}"
+                try:
+                    response = client.request(method, url, params=params)
+                except Exception as exc:
+                    failures.append((endpoint, str(exc)))
+                    continue
+
+                if response.status_code == 200:
+                    payload = None
+                    content_type = response.headers.get("content-type", "")
+                    if "application/json" in content_type.lower():
+                        try:
+                            payload = response.json()
+                        except ValueError:
+                            payload = None
+                    successes.append((endpoint, payload))
+                elif response.status_code == 404:
+                    unsupported.append(endpoint)
+                else:
+                    failures.append((endpoint, f"HTTP {response.status_code}"))
+
+        return successes, unsupported, failures
 
     @staticmethod
     def _build_embedded_warmup_audio() -> tuple[str, bytes, str]:
@@ -1117,12 +1258,15 @@ class QSRComposer:
         poll_interval_sec: float = 5.0,
         label: str = "[qsr]",
     ) -> bool:
-        return wait_for_healthy_docker_containers(
+        healthy = wait_for_healthy_docker_containers(
             self.get_backend_container_names(),
             timeout_sec=timeout_sec,
             poll_interval_sec=poll_interval_sec,
             label=label,
         )
+        if healthy:
+            set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
+        return healthy
 
     def wait_for_ready_backends(
         self,
@@ -1135,13 +1279,16 @@ class QSRComposer:
         target_endpoints = [
             endpoint.rstrip("/") for endpoint in (endpoints or []) if endpoint
         ] or self.get_backend_endpoints()
-        return wait_for_healthy_http_endpoints(
+        healthy = wait_for_healthy_http_endpoints(
             target_endpoints,
             timeout_sec=timeout_sec,
             poll_interval_sec=poll_interval_sec,
             request_timeout_sec=request_timeout_sec,
             label=label,
         )
+        if healthy:
+            set_backend_sleep_states(target_endpoints, sleeping=False)
+        return healthy
 
     def _run_compose_cmd(
         self,
@@ -1192,6 +1339,7 @@ class QSRComposer:
         logger.okay(
             f"[qsr] Started services on GPUs: {[gpu.index for gpu in self.gpus]}"
         )
+        set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
         self.ps()
         if skip_warmup:
             return
@@ -1204,6 +1352,7 @@ class QSRComposer:
 
     def down(self) -> None:
         if self._resolve_compose_cmd("down --remove-orphans"):
+            clear_backend_sleep_states(self.get_backend_endpoints())
             return
 
         containers = self._find_qsr_containers(include_stopped=True)
@@ -1214,6 +1363,7 @@ class QSRComposer:
         for container in containers:
             subprocess.run(f"docker rm -f {container}", shell=True, capture_output=True)
         logger.okay(f"[qsr] Removed {len(containers)} container(s)")
+        clear_backend_sleep_states(self.get_backend_endpoints())
 
     def stop(self) -> None:
         if self._resolve_compose_cmd("stop"):
@@ -1229,6 +1379,7 @@ class QSRComposer:
 
     def start(self) -> None:
         if self._resolve_compose_cmd("start"):
+            set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
             return
 
         containers = self._find_qsr_containers(include_stopped=True)
@@ -1240,9 +1391,11 @@ class QSRComposer:
         for container in stopped:
             subprocess.run(f"docker start {container}", shell=True, capture_output=True)
         logger.okay(f"[qsr] Started {len(stopped)} container(s)")
+        set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
 
     def restart(self) -> None:
         if self._resolve_compose_cmd("restart"):
+            set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
             return
 
         containers = self._find_qsr_containers(include_stopped=False)
@@ -1254,6 +1407,7 @@ class QSRComposer:
                 f"docker restart {container}", shell=True, capture_output=True
             )
         logger.okay(f"[qsr] Restarted {len(containers)} container(s)")
+        set_backend_sleep_states(self.get_backend_endpoints(), sleeping=False)
 
     def warmup(
         self,
@@ -1317,6 +1471,98 @@ class QSRComposer:
             logger.warn(f"[qsr] Warmup completed with failures: {', '.join(failures)}")
             return
         logger.okay(f"[qsr] Warmed {len(targets)} backend(s)")
+        set_backend_sleep_states([endpoint for _, endpoint in targets], sleeping=False)
+
+    def sleep(
+        self,
+        level: int = DEFAULT_SLEEP_LEVEL,
+        mode: str = DEFAULT_SLEEP_MODE,
+    ) -> bool:
+        successes, unsupported, failures = self._request_backend_control(
+            "/sleep",
+            params={"level": level, "mode": mode},
+        )
+
+        if successes:
+            set_backend_sleep_states(
+                [endpoint for endpoint, _ in successes],
+                sleeping=True,
+            )
+            logger.okay(
+                f"[qsr] Requested sleep(level={level}, mode={mode}) on {len(successes)} backend(s)"
+            )
+        elif unsupported:
+            logger.warn(
+                "[qsr] Sleep endpoints are unavailable. Redeploy with --enable-sleep-mode to use fast wake/resume."
+            )
+        else:
+            logger.warn("[qsr] Failed to contact any running backend for sleep")
+
+        for endpoint, error in failures:
+            logger.warn(f"[qsr] Sleep request failed for {endpoint}: {error}")
+        return bool(successes)
+
+    def wake(self, wait_healthy: bool = False) -> bool:
+        successes, unsupported, failures = self._request_backend_control("/wake_up")
+
+        if successes:
+            set_backend_sleep_states(
+                [endpoint for endpoint, _ in successes],
+                sleeping=False,
+            )
+            logger.okay(f"[qsr] Requested wake-up on {len(successes)} backend(s)")
+        elif unsupported:
+            logger.warn(
+                "[qsr] Wake-up endpoints are unavailable. Redeploy with --enable-sleep-mode to use fast wake/resume."
+            )
+        else:
+            logger.warn("[qsr] Failed to contact any running backend for wake-up")
+
+        for endpoint, error in failures:
+            logger.warn(f"[qsr] Wake request failed for {endpoint}: {error}")
+
+        if wait_healthy and successes:
+            healthy = self.wait_for_healthy_backends(
+                timeout_sec=SLEEP_WAKE_TIMEOUT_SEC,
+                poll_interval_sec=SLEEP_WAKE_POLL_INTERVAL_SEC,
+                label="[qsr]",
+            )
+            if healthy:
+                logger.okay("[qsr] Backends are healthy after wake-up")
+            else:
+                logger.warn(
+                    "[qsr] Wake-up requested, but healthy backends did not appear in time"
+                )
+            return healthy
+
+        return bool(successes)
+
+    def sleep_status(self) -> bool:
+        successes, unsupported, failures = self._request_backend_control(
+            "/is_sleeping",
+            method="GET",
+        )
+
+        if not successes and unsupported:
+            logger.warn(
+                "[qsr] Sleep status endpoints are unavailable. Redeploy with --enable-sleep-mode to inspect sleep state."
+            )
+            return False
+
+        if not successes and not failures:
+            logger.warn("[qsr] No running backends found for sleep status")
+            return False
+
+        for endpoint, payload in successes:
+            sleeping = bool((payload or {}).get("is_sleeping", False))
+            update_backend_sleep_states({endpoint: sleeping})
+            state = "sleeping" if sleeping else "awake"
+            logger.mesg(f"[qsr] {endpoint}: {state}")
+
+        for endpoint, error in failures:
+            logger.warn(f"[qsr] Sleep status failed for {endpoint}: {error}")
+
+        return bool(successes)
 
     def ps(self) -> None:
         if self._resolve_compose_cmd("ps"):
@@ -1386,6 +1632,9 @@ Examples:
   qsr compose up -g 0,1
   qsr compose up --gpu-layout uniform
     qsr compose warmup --gpu-layout uniform
+    qsr compose wake --wait-healthy
+    qsr compose sleep --sleep-level 1 --sleep-mode abort
+    qsr compose sleep-status
   qsr compose up --gpu-configs "0,1"
   qsr compose up --gpu-configs "0:Qwen/Qwen3-ASR-0.6B,1:Qwen/Qwen3-ASR-0.6B"
   qsr compose generate -j qsr-demo --gpu-configs "0"
@@ -1472,6 +1721,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             default=GPU_MEMORY_UTILIZATION,
         )
         target.set_defaults(skip_mm_profiling=DEFAULT_SKIP_MM_PROFILING)
+        target.set_defaults(enable_sleep_mode=DEFAULT_ENABLE_SLEEP_MODE)
         target.add_argument(
             "--skip-mm-profiling",
             dest="skip_mm_profiling",
@@ -1483,6 +1733,18 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
             dest="skip_mm_profiling",
             action="store_false",
             help="Keep vLLM multimodal memory profiling enabled during startup",
+        )
+        target.add_argument(
+            "--enable-sleep-mode",
+            dest="enable_sleep_mode",
+            action="store_true",
+            help="Enable vLLM sleep-mode endpoints so warm backends can wake faster than cold start",
+        )
+        target.add_argument(
+            "--no-enable-sleep-mode",
+            dest="enable_sleep_mode",
+            action="store_false",
+            help="Disable vLLM sleep-mode endpoints",
         )
         target.add_argument(
             "--cudagraph-mode",
@@ -1531,6 +1793,44 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser_generate = subparsers.add_parser("generate", help="Generate compose file")
     add_common_arguments(parser_generate)
     add_deployment_arguments(parser_generate)
+
+    parser_sleep = subparsers.add_parser(
+        "sleep",
+        help="Put running QSR backends into vLLM sleep mode",
+    )
+    add_common_arguments(parser_sleep)
+    add_targeting_arguments(parser_sleep)
+    parser_sleep.add_argument(
+        "--sleep-level",
+        type=int,
+        default=DEFAULT_SLEEP_LEVEL,
+        help=f"vLLM sleep level (default: {DEFAULT_SLEEP_LEVEL})",
+    )
+    parser_sleep.add_argument(
+        "--sleep-mode",
+        type=str,
+        default=DEFAULT_SLEEP_MODE,
+        help=f"vLLM sleep mode (default: {DEFAULT_SLEEP_MODE})",
+    )
+
+    parser_wake = subparsers.add_parser(
+        "wake",
+        help="Wake running QSR backends from vLLM sleep mode",
+    )
+    add_common_arguments(parser_wake)
+    add_targeting_arguments(parser_wake)
+    parser_wake.add_argument(
+        "--wait-healthy",
+        action="store_true",
+        help="Wait for backends to report healthy after wake-up",
+    )
+
+    parser_sleep_status = subparsers.add_parser(
+        "sleep-status",
+        help="Show whether running QSR backends are sleeping",
+    )
+    add_common_arguments(parser_sleep_status)
+    add_targeting_arguments(parser_sleep_status)
 
     parser_warmup = subparsers.add_parser(
         "warmup",
@@ -1603,6 +1903,11 @@ def run_from_args(args: argparse.Namespace) -> None:
             "skip_mm_profiling",
             DEFAULT_SKIP_MM_PROFILING,
         ),
+        enable_sleep_mode=getattr(
+            args,
+            "enable_sleep_mode",
+            DEFAULT_ENABLE_SLEEP_MODE,
+        ),
         cudagraph_mode=getattr(
             args,
             "cudagraph_mode",
@@ -1646,6 +1951,15 @@ def run_from_args(args: argparse.Namespace) -> None:
                 WARMUP_REQUEST_TIMEOUT_SEC,
             ),
         )
+    elif action == "sleep":
+        composer.sleep(
+            level=getattr(args, "sleep_level", DEFAULT_SLEEP_LEVEL),
+            mode=getattr(args, "sleep_mode", DEFAULT_SLEEP_MODE),
+        )
+    elif action == "wake":
+        composer.wake(wait_healthy=getattr(args, "wait_healthy", False))
+    elif action == "sleep-status":
+        composer.sleep_status()
     elif action == "down":
         composer.down()
     elif action == "stop":
