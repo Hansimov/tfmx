@@ -149,9 +149,9 @@ qsr client chat -E "$QSR_BACKEND_A_URL" --audio ./sample.wav "请转写"
 - `qsr client transcribe -E <machine> --long-audio-mode auto|force` 会把长音频拆分与调度下沉到 `qsr machine`；machine 侧同时暴露了 `POST /v1/audio/transcriptions/long` 与 `POST /audio/transcriptions/long` 两个显式入口
 - `qsr client transcribe-long` 面向单条长音频任务：先用 `ffmpeg/ffprobe` 探测时长与静音区间，再切成带少量重叠的短片段，随后按 chunk 时长从长到短排队，并根据 `qsr machine /info` 当前可调度槽位动态补充并发
 - 长音频模式不是简单等分；默认会优先在静音附近切段，并通过 `--overlap-sec` 降低边界漏字风险
-- 长音频模式默认启用更激进但受控的 slot-aware 调度：每张健康 GPU 默认最多并发 `3` 个 chunk，并且会先填满空闲实例，再利用剩余可用槽位继续补货
+- 长音频模式默认启用更激进但受控的 slot-aware 调度：每张健康 GPU 默认最多并发 `4` 个 chunk，并且会先填满空闲实例，再利用剩余可用槽位继续补货
 - client-side 长音频现在按需并行提取 chunk，不再先串行切完整个文件再开始发请求
-- 当前 `Qwen3-ASR-0.6B` backend 不支持 `verbose_json`，所以长音频模式的最终拼接依赖重叠文本去重，而不是官方时间戳段落拼接
+- 长音频模式现在会先自动尝试 `verbose_json` + `segment` 时间戳；如果当前 `Qwen3-ASR-0.6B` backend 仍然不支持，或者响应里没有 `segments`，会自动回退到重叠文本去重
 - `qsr client transcribe-long` 依赖本机可用的 `ffmpeg` 和 `ffprobe`
 - `qsr client chat` 支持多段文本和多段音频，会按顺序交错组成一个 OpenAI multimodal message
 - 默认 chat 走流式输出；若你需要完整 JSON 响应，可加 `--no-stream --json`

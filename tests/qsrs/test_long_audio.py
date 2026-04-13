@@ -1,7 +1,13 @@
 """Tests for tfmx.qsrs.long_audio."""
 
+from unittest.mock import patch
+
+import httpx
+
+from tfmx.qsrs.long_audio import AudioChunk
 from tfmx.qsrs.client import InfoResponse
 from tfmx.qsrs.long_audio import ChunkTranscriptionResult
+from tfmx.qsrs.long_audio import LongAudioTranscriber
 from tfmx.qsrs.long_audio import SilenceRegion
 from tfmx.qsrs.long_audio import count_available_healthy_slots
 from tfmx.qsrs.long_audio import count_idle_healthy_instances
@@ -149,6 +155,58 @@ class TestLongAudioMerging:
         assert merged_segments == []
         assert merged_text == "你好，世界！今天继续。"
 
+    def test_merge_transcribed_chunks_dedups_similar_boundary_sentences(self):
+        chunks = plan_audio_chunks(
+            122.0,
+            silence_regions=[],
+            target_chunk_sec=60.0,
+            min_chunk_sec=40.0,
+            max_chunk_sec=70.0,
+            overlap_sec=4.0,
+            search_window_sec=8.0,
+        )
+        first, second = chunks[0], chunks[1]
+
+        merged_text, language, merged_segments = merge_transcribed_chunks(
+            chunks,
+            [
+                ChunkTranscriptionResult(
+                    chunk_index=first.index,
+                    start_sec=first.start_sec,
+                    end_sec=first.end_sec,
+                    keep_start_sec=first.keep_start_sec,
+                    keep_end_sec=first.keep_end_sec,
+                    latency_sec=1.0,
+                    attempt=1,
+                    text="首先我必须得说一下，这个一七年巴西我去了。",
+                    language="zh",
+                    duration_sec=first.duration_sec,
+                ),
+                ChunkTranscriptionResult(
+                    chunk_index=second.index,
+                    start_sec=second.start_sec,
+                    end_sec=second.end_sec,
+                    keep_start_sec=second.keep_start_sec,
+                    keep_end_sec=second.keep_end_sec,
+                    latency_sec=1.0,
+                    attempt=1,
+                    text=(
+                        "我们聊一下。首先，我们必须得说一下这个一七年巴西，我去了。"
+                        "首先，那个舟车劳顿旅途真的很辛苦。"
+                    ),
+                    language="zh",
+                    duration_sec=second.duration_sec,
+                ),
+            ],
+        )
+
+        assert language == "zh"
+        assert merged_segments == []
+        assert merged_text == (
+            "首先我必须得说一下，这个一七年巴西我去了。"
+            "首先，那个舟车劳顿旅途真的很辛苦。"
+        )
+
     def test_count_idle_healthy_instances(self):
         info = InfoResponse.from_dict(
             {
@@ -238,3 +296,65 @@ class TestLongAudioMerging:
             )
             == 3
         )
+
+
+class TestLongAudioResponseFormat:
+    def test_resolve_chunk_request_plan_falls_back_from_verbose_json_400(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27991")
+        chunk = AudioChunk(index=0, start_sec=0.0, end_sec=10.0)
+        request = httpx.Request(
+            "POST",
+            "http://127.0.0.1:27991/v1/audio/transcriptions",
+        )
+        response = httpx.Response(400, request=request, text='{"detail":"unsupported"}')
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            side_effect=httpx.HTTPStatusError(
+                "unsupported verbose_json",
+                request=request,
+                response=response,
+            ),
+        ):
+            request_plan, probe_result = transcriber._resolve_chunk_request_plan(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+            )
+
+        assert request_plan.response_format == "json"
+        assert probe_result is None
+
+    def test_resolve_chunk_request_plan_keeps_segment_probe_result(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27992")
+        chunk = AudioChunk(index=0, start_sec=0.0, end_sec=10.0)
+        probe_result = ChunkTranscriptionResult(
+            chunk_index=0,
+            start_sec=0.0,
+            end_sec=10.0,
+            keep_start_sec=0.0,
+            keep_end_sec=10.0,
+            latency_sec=0.5,
+            attempt=1,
+            text="你好，世界。",
+            language="zh",
+            duration_sec=10.0,
+            segments=[{"start": 0.0, "end": 2.0, "text": "你好"}],
+        )
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            return_value=probe_result,
+        ):
+            request_plan, resolved_probe_result = (
+                transcriber._resolve_chunk_request_plan(
+                    "/tmp/input.wav",
+                    "/tmp/work",
+                    chunk,
+                )
+            )
+
+        assert request_plan.response_format == "verbose_json"
+        assert resolved_probe_result is probe_result

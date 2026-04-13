@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import math
+import threading
 import shutil
 import subprocess
 import tempfile
@@ -14,6 +15,8 @@ from dataclasses import dataclass, field
 from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
+
+import httpx
 
 
 if TYPE_CHECKING:
@@ -26,6 +29,16 @@ FFMPEG_REQUIRED_MESSAGE = (
 )
 _SILENCE_START_TOKEN = "silence_start:"
 _SILENCE_END_TOKEN = "silence_end:"
+_BOUNDARY_DELIMITERS = frozenset("。！？!?；;\n")
+_SIMILAR_BOUNDARY_MIN_CHARS = 12
+_SIMILAR_BOUNDARY_MIN_RATIO = 0.82
+_SIMILAR_BOUNDARY_MAX_FRAGMENTS = 2
+_SIMILAR_BOUNDARY_MAX_PREFIX_SKIP = 1
+_SIMILAR_BOUNDARY_MAX_PREFIX_SKIP_CHARS = 10
+_FUZZY_NORMALIZED_OVERLAP_MIN_CHARS = 18
+_FUZZY_NORMALIZED_OVERLAP_MIN_RATIO = 0.9
+_VERBOSE_JSON_CAPABILITY_CACHE: dict[str, bool] = {}
+_VERBOSE_JSON_CAPABILITY_LOCK = threading.Lock()
 
 
 def _require_binary(name: str) -> str:
@@ -162,6 +175,8 @@ class LongAudioTranscriptionResult:
     text: str
     language: str
     merged_segments: list[dict] = field(default_factory=list)
+    chunk_response_format: str = "json"
+    stitching_mode: str = "text_overlap"
 
     def to_dict(self) -> dict:
         total_audio_duration_sec = sum(chunk.duration_sec for chunk in self.chunks)
@@ -197,6 +212,8 @@ class LongAudioTranscriptionResult:
                 "text": self.text,
                 "language": self.language,
                 "duration": round(self.metadata.duration_sec, 3),
+                "chunk_response_format": self.chunk_response_format,
+                "stitching_mode": self.stitching_mode,
                 "segments": self.merged_segments,
                 "chunks": [result.to_dict() for result in self.chunk_results],
             },
@@ -208,6 +225,7 @@ class LongAudioTranscriptionConfig:
     model: str = ""
     language: str | None = None
     prompt: str | None = None
+    transcription_response_format: str = "auto"
     timeout_sec: float = 900.0
     target_chunk_sec: float = 60.0
     min_chunk_sec: float = 35.0
@@ -217,11 +235,25 @@ class LongAudioTranscriptionConfig:
     min_silence_sec: float = 0.35
     silence_noise_db: float = -32.0
     idle_poll_interval_sec: float = 1.0
+    machine_info_refresh_sec: float = 0.5
     max_parallel_chunks: int | None = None
-    per_instance_parallelism_cap: int | None = 3
+    per_instance_parallelism_cap: int | None = 4
     max_chunk_retries: int = 2
     keep_chunks: bool = False
     work_dir: str | None = None
+
+
+@dataclass(frozen=True)
+class ChunkRequestPlan:
+    response_format: str = "json"
+    timestamp_granularities: tuple[str, ...] = ()
+
+
+_JSON_CHUNK_REQUEST_PLAN = ChunkRequestPlan()
+_VERBOSE_JSON_CHUNK_REQUEST_PLAN = ChunkRequestPlan(
+    response_format="verbose_json",
+    timestamp_granularities=("segment",),
+)
 
 
 def probe_audio(audio_path: str) -> AudioMetadata:
@@ -481,6 +513,96 @@ def _normalize_boundary_text(text: str) -> tuple[str, list[int]]:
     return "".join(normalized_chars), index_map
 
 
+def _split_boundary_fragments(text: str) -> list[tuple[int, int, str]]:
+    fragments: list[tuple[int, int, str]] = []
+    start = 0
+    index = 0
+
+    while index < len(text):
+        if text[index] in _BOUNDARY_DELIMITERS:
+            end = index + 1
+            while end < len(text) and text[end] in _BOUNDARY_DELIMITERS:
+                end += 1
+            fragment = text[start:end].strip()
+            if fragment:
+                fragments.append((start, end, fragment))
+            start = end
+            while start < len(text) and text[start].isspace():
+                start += 1
+            index = start
+            continue
+        index += 1
+
+    tail_fragment = text[start:].strip()
+    if tail_fragment:
+        fragments.append((start, len(text), tail_fragment))
+    return fragments
+
+
+def _find_similar_fragment_overlap_cut(left_text: str, right_text: str) -> int | None:
+    left_fragments = _split_boundary_fragments(left_text)
+    right_fragments = _split_boundary_fragments(right_text)
+    if not left_fragments or not right_fragments:
+        return None
+
+    max_width = min(
+        len(left_fragments),
+        len(right_fragments),
+        _SIMILAR_BOUNDARY_MAX_FRAGMENTS,
+    )
+    for width in range(max_width, 0, -1):
+        left_candidate = "".join(
+            fragment for _start, _end, fragment in left_fragments[-width:]
+        )
+        left_normalized, _ = _normalize_boundary_text(left_candidate)
+        if len(left_normalized) < _SIMILAR_BOUNDARY_MIN_CHARS:
+            continue
+
+        max_prefix_skip = min(
+            _SIMILAR_BOUNDARY_MAX_PREFIX_SKIP,
+            len(right_fragments) - width,
+        )
+        for prefix_skip in range(0, max_prefix_skip + 1):
+            skipped_prefix = "".join(
+                fragment for _start, _end, fragment in right_fragments[:prefix_skip]
+            )
+            skipped_normalized, _ = _normalize_boundary_text(skipped_prefix)
+            if len(skipped_normalized) > _SIMILAR_BOUNDARY_MAX_PREFIX_SKIP_CHARS:
+                continue
+
+            right_candidate = "".join(
+                fragment
+                for _start, _end, fragment in right_fragments[
+                    prefix_skip : prefix_skip + width
+                ]
+            )
+            right_normalized, _ = _normalize_boundary_text(right_candidate)
+            if len(right_normalized) < _SIMILAR_BOUNDARY_MIN_CHARS:
+                continue
+
+            shorter = min(len(left_normalized), len(right_normalized))
+            longer = max(len(left_normalized), len(right_normalized))
+            if shorter / longer < 0.65:
+                continue
+
+            if (
+                left_normalized == right_normalized
+                or left_normalized.endswith(right_normalized)
+                or right_normalized.endswith(left_normalized)
+            ):
+                return right_fragments[prefix_skip + width - 1][1]
+
+            ratio = SequenceMatcher(
+                None,
+                left_normalized,
+                right_normalized,
+                autojunk=False,
+            ).ratio()
+            if ratio >= _SIMILAR_BOUNDARY_MIN_RATIO:
+                return right_fragments[prefix_skip + width - 1][1]
+    return None
+
+
 def _find_normalized_overlap_cut(
     left_text: str,
     right_text: str,
@@ -515,6 +637,30 @@ def _find_normalized_overlap_cut(
     return right_map[match.size - 1] + 1
 
 
+def _find_fuzzy_normalized_overlap_cut(
+    left_text: str,
+    right_text: str,
+    *,
+    max_chars: int,
+) -> int | None:
+    left_normalized, _left_map = _normalize_boundary_text(left_text)
+    right_normalized, right_map = _normalize_boundary_text(right_text)
+    max_overlap = min(len(left_normalized), len(right_normalized), max_chars)
+    if max_overlap < _FUZZY_NORMALIZED_OVERLAP_MIN_CHARS:
+        return None
+
+    for width in range(max_overlap, _FUZZY_NORMALIZED_OVERLAP_MIN_CHARS - 1, -1):
+        ratio = SequenceMatcher(
+            None,
+            left_normalized[-width:],
+            right_normalized[:width],
+            autojunk=False,
+        ).ratio()
+        if ratio >= _FUZZY_NORMALIZED_OVERLAP_MIN_RATIO:
+            return right_map[width - 1] + 1
+    return None
+
+
 def _strip_duplicate_boundary(left: str, right: str, *, max_chars: int = 64) -> str:
     left_text = left.rstrip()
     right_text = right.lstrip()
@@ -522,6 +668,16 @@ def _strip_duplicate_boundary(left: str, right: str, *, max_chars: int = 64) -> 
     for width in range(max_overlap, 0, -1):
         if left_text[-width:] == right_text[:width]:
             return left_text + right_text[width:]
+    fuzzy_cut = _find_fuzzy_normalized_overlap_cut(
+        left_text,
+        right_text,
+        max_chars=max_chars,
+    )
+    if fuzzy_cut is not None:
+        return left_text + right_text[fuzzy_cut:]
+    fragment_cut = _find_similar_fragment_overlap_cut(left_text, right_text)
+    if fragment_cut is not None:
+        return left_text + right_text[fragment_cut:]
     normalized_cut = _find_normalized_overlap_cut(
         left_text,
         right_text,
@@ -675,12 +831,35 @@ class LongAudioTranscriber:
         except Exception:
             return None
 
-    def _transcribe_chunk(
+    def _capability_cache_key(self) -> str:
+        return f"{self.endpoint}|{self.config.model.strip()}"
+
+    def _get_cached_verbose_json_support(self) -> bool | None:
+        with _VERBOSE_JSON_CAPABILITY_LOCK:
+            return _VERBOSE_JSON_CAPABILITY_CACHE.get(self._capability_cache_key())
+
+    def _set_cached_verbose_json_support(self, supported: bool) -> None:
+        with _VERBOSE_JSON_CAPABILITY_LOCK:
+            _VERBOSE_JSON_CAPABILITY_CACHE[self._capability_cache_key()] = supported
+
+    def _normalized_transcription_response_format(self) -> str:
+        normalized = self.config.transcription_response_format.strip().lower()
+        if normalized in {"json", "verbose_json"}:
+            return normalized
+        return "auto"
+
+    def _select_probe_chunk(self, chunks: list[AudioChunk]) -> AudioChunk | None:
+        if not chunks:
+            return None
+        return min(chunks, key=lambda chunk: (chunk.duration_sec, chunk.index))
+
+    def _transcribe_chunk_with_plan(
         self,
         audio_path: str,
         work_dir: str,
         chunk: AudioChunk,
         attempt: int,
+        request_plan: ChunkRequestPlan,
     ) -> ChunkTranscriptionResult:
         started_at = time.perf_counter()
         extract_audio_chunk(audio_path, chunk, output_dir=work_dir)
@@ -696,7 +875,12 @@ class LongAudioTranscriber:
                 model=self.config.model,
                 language=self.config.language,
                 prompt=self.config.prompt,
-                response_format="json",
+                response_format=request_plan.response_format,
+                timestamp_granularities=(
+                    list(request_plan.timestamp_granularities)
+                    if request_plan.timestamp_granularities
+                    else None
+                ),
             )
         return ChunkTranscriptionResult(
             chunk_index=chunk.index,
@@ -709,8 +893,61 @@ class LongAudioTranscriber:
             text=response.text,
             language=response.language,
             duration_sec=response.duration,
-            segments=[],
+            segments=response.segments or [],
             output_path=chunk.output_path,
+        )
+
+    def _resolve_chunk_request_plan(
+        self,
+        audio_path: str,
+        work_dir: str,
+        probe_chunk: AudioChunk | None,
+    ) -> tuple[ChunkRequestPlan, ChunkTranscriptionResult | None]:
+        requested_format = self._normalized_transcription_response_format()
+        if requested_format == "json" or probe_chunk is None:
+            return _JSON_CHUNK_REQUEST_PLAN, None
+
+        cached_support = self._get_cached_verbose_json_support()
+        if cached_support is True:
+            return _VERBOSE_JSON_CHUNK_REQUEST_PLAN, None
+        if cached_support is False:
+            return _JSON_CHUNK_REQUEST_PLAN, None
+
+        try:
+            probe_result = self._transcribe_chunk_with_plan(
+                audio_path,
+                work_dir,
+                probe_chunk,
+                1,
+                _VERBOSE_JSON_CHUNK_REQUEST_PLAN,
+            )
+        except httpx.HTTPStatusError as exc:
+            if exc.response is not None and exc.response.status_code == 400:
+                self._set_cached_verbose_json_support(False)
+                return _JSON_CHUNK_REQUEST_PLAN, None
+            raise
+
+        if probe_result.segments:
+            self._set_cached_verbose_json_support(True)
+            return _VERBOSE_JSON_CHUNK_REQUEST_PLAN, probe_result
+
+        self._set_cached_verbose_json_support(False)
+        return _JSON_CHUNK_REQUEST_PLAN, probe_result
+
+    def _transcribe_chunk(
+        self,
+        audio_path: str,
+        work_dir: str,
+        chunk: AudioChunk,
+        attempt: int,
+        request_plan: ChunkRequestPlan,
+    ) -> ChunkTranscriptionResult:
+        return self._transcribe_chunk_with_plan(
+            audio_path,
+            work_dir,
+            chunk,
+            attempt,
+            request_plan,
         )
 
     def _dispatch_capacity(self, info: "InfoResponse" | None) -> int:
@@ -736,6 +973,32 @@ class LongAudioTranscriber:
         if info is None:
             return 1
         return min(max(1, self._dispatch_capacity(info)), chunk_count)
+
+    def _executor_parallelism_limit(
+        self,
+        info: "InfoResponse" | None,
+        chunk_count: int,
+    ) -> int:
+        configured = self.config.max_parallel_chunks
+        if configured is not None and configured > 0:
+            return min(configured, chunk_count)
+        if info is None:
+            return 1
+        if (
+            self.config.per_instance_parallelism_cap is not None
+            and self.config.per_instance_parallelism_cap > 0
+        ):
+            healthy_instances = sum(
+                1
+                for instance in info.instances
+                if instance.healthy and not getattr(instance, "sleeping", False)
+            )
+            if healthy_instances > 0:
+                return min(
+                    healthy_instances * self.config.per_instance_parallelism_cap,
+                    chunk_count,
+                )
+        return min(max(1, count_available_healthy_slots(info)), chunk_count)
 
     def transcribe(self, audio: str) -> LongAudioTranscriptionResult:
         metadata = probe_audio(audio)
@@ -765,27 +1028,65 @@ class LongAudioTranscriber:
         started_at = time.perf_counter()
         try:
             info = self._machine_info()
+            latest_info = info
+            latest_info_refreshed_at = time.monotonic()
+
+            def get_latest_info(force: bool = False) -> "InfoResponse" | None:
+                nonlocal latest_info, latest_info_refreshed_at
+                refresh_interval = max(0.0, self.config.machine_info_refresh_sec)
+                now = time.monotonic()
+                if (
+                    force
+                    or latest_info is None
+                    or refresh_interval == 0.0
+                    or now - latest_info_refreshed_at >= refresh_interval
+                ):
+                    latest_info = self._machine_info()
+                    latest_info_refreshed_at = now
+                return latest_info
+
             effective_parallelism = self._effective_parallelism(info, len(chunks))
+            executor_parallelism_limit = self._executor_parallelism_limit(
+                info,
+                len(chunks),
+            )
             pending = sorted(
                 chunks, key=lambda chunk: (-chunk.duration_sec, chunk.start_sec)
             )
             running: dict[Future, tuple[AudioChunk, int]] = {}
             results: list[ChunkTranscriptionResult] = []
             attempts = {chunk.index: 0 for chunk in chunks}
+            request_plan, probe_result = self._resolve_chunk_request_plan(
+                metadata.path,
+                str(work_dir),
+                self._select_probe_chunk(chunks),
+            )
+            if probe_result is not None:
+                results.append(probe_result)
+                attempts[probe_result.chunk_index] = probe_result.attempt
+                pending = [
+                    chunk
+                    for chunk in pending
+                    if chunk.index != probe_result.chunk_index
+                ]
 
             with ThreadPoolExecutor(
-                max_workers=max(1, effective_parallelism)
+                max_workers=max(1, executor_parallelism_limit)
             ) as executor:
                 while pending or running:
-                    if pending and len(running) < effective_parallelism:
-                        latest_info = self._machine_info()
+                    current_parallelism_target = min(
+                        executor_parallelism_limit,
+                        self._effective_parallelism(get_latest_info(), len(chunks)),
+                    )
+                    if pending and len(running) < current_parallelism_target:
+                        latest_info = get_latest_info()
                         dispatch_capacity = (
                             min(
-                                effective_parallelism,
+                                current_parallelism_target,
                                 self._dispatch_capacity(latest_info),
                             )
                             if latest_info is not None
-                            else effective_parallelism
+                            else current_parallelism_target
                         )
                         allowed_new = max(
                             0,
@@ -805,6 +1106,7 @@ class LongAudioTranscriber:
                                 str(work_dir),
                                 chunk,
                                 attempts[chunk.index],
+                                request_plan,
                             )
                             running[future] = (chunk, attempts[chunk.index])
 
@@ -840,12 +1142,15 @@ class LongAudioTranscriber:
             merged_text, language, merged_segments = merge_transcribed_chunks(
                 chunks, results
             )
+            chunk_response_format = (
+                "verbose_json" if any(result.segments for result in results) else "json"
+            )
             snapshot = (
                 machine_snapshot(
-                    info,
+                    get_latest_info(),
                     per_instance_parallelism_cap=self.config.per_instance_parallelism_cap,
                 )
-                if info is not None
+                if get_latest_info() is not None
                 else None
             )
             return LongAudioTranscriptionResult(
@@ -861,6 +1166,8 @@ class LongAudioTranscriber:
                 text=merged_text,
                 language=language,
                 merged_segments=merged_segments,
+                chunk_response_format=chunk_response_format,
+                stitching_mode=("segments" if merged_segments else "text_overlap"),
             )
         finally:
             if temp_dir_cm is not None and not self.config.keep_chunks:

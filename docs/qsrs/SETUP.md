@@ -146,8 +146,8 @@ qsr client chat --audio ./sample.wav "请转写为简体中文"
 - `qsr client transcribe` 走的是 OpenAI 兼容 `/v1/audio/transcriptions`
 - `qsr client transcribe --long-audio-mode auto|force` 会直接命中 machine 侧长音频路径；对应 HTTP 接口也可直接调用 `/v1/audio/transcriptions/long`
 - `qsr client transcribe-long` 适合把单条长音频任务拆成多个短 chunk 并动态分发到多张 GPU；它依赖本机 `ffmpeg/ffprobe`，默认按静音边界切段、按需并行提取 chunk，并保留少量重叠
-- 长音频调度默认每张健康 GPU 最多并发 `3` 个 chunk；如果你想保守一些，可显式传 `--per-instance-parallelism-cap 1|2`
-- 当前 `0.6B` backend 仍不支持 `verbose_json`，所以长音频模式目前使用重叠文本去重来拼接 chunk 结果
+- 长音频调度默认每张健康 GPU 最多并发 `4` 个 chunk；如果你想保守一些，可显式传 `--per-instance-parallelism-cap 1|2|3`
+- 长音频模式现在会优先自动尝试 `verbose_json` + `segment` 时间戳；如果当前 backend（例如默认的 `0.6B` 部署）返回 `400` 或者不给 `segments`，会自动回退到现有的重叠文本去重，不会中断请求
 - `qsr client chat` 走的是 OpenAI 兼容 `/v1/chat/completions`，并把音频封装为 `audio_url` 内容块
 - 音频输入可以是本地文件路径、HTTP/HTTPS URL，或 `data:` URI
 

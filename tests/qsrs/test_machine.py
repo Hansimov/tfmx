@@ -472,6 +472,49 @@ class TestQSRMachineServer:
         assert payload["tfmx_long_audio"]["scheduling"]["max_parallel_chunks"] == 10
         config = mock_transcriber_cls.call_args.kwargs["config"]
         assert config.per_instance_parallelism_cap == 3
+        assert config.transcription_response_format == "auto"
+
+    @patch("tfmx.qsrs.machine.LongAudioTranscriber")
+    @patch("tfmx.qsrs.machine.probe_audio")
+    def test_forward_long_audio_transcription_prefers_verbose_json_when_requested(
+        self,
+        mock_probe_audio,
+        mock_transcriber_cls,
+    ):
+        mock_probe_audio.return_value = AudioMetadata(
+            path="/tmp/input.wav",
+            duration_sec=360.0,
+        )
+        transcriber = MagicMock()
+        transcriber.transcribe.return_value = LongAudioTranscriptionResult(
+            audio="/tmp/input.wav",
+            metadata=AudioMetadata(path="/tmp/input.wav", duration_sec=360.0),
+            chunks=[],
+            silence_regions=[],
+            chunk_results=[],
+            total_time_sec=12.3,
+            max_parallel_chunks=10,
+            endpoint="http://127.0.0.1:27900",
+            machine_snapshot={"healthy_instances": 5},
+            text="甲乙丙丁",
+            language="zh",
+        )
+        mock_transcriber_cls.return_value = transcriber
+        server = QSRMachineServer(instances=[])
+
+        response = asyncio.run(
+            server._forward_long_audio_transcription(
+                filename="sample.wav",
+                payload=b"RIFF1234WAVEfmt ",
+                content_type="audio/wav",
+                response_format="verbose_json",
+                long_audio_mode="force",
+            )
+        )
+
+        assert isinstance(response, JSONResponse)
+        config = mock_transcriber_cls.call_args.kwargs["config"]
+        assert config.transcription_response_format == "verbose_json"
 
     def test_audio_transcriptions_uses_machine_long_audio_mode(self):
         server = QSRMachineServer(instances=[])

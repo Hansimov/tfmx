@@ -62,7 +62,7 @@ BACKEND_STARTUP_POLL_INTERVAL_SEC = 1.0
 BACKEND_DISCOVERY_SETTLE_SEC = 2.0
 SCHEDULER_ALGORITHM = "least_active_idle"
 LONG_AUDIO_AUTO_MIN_DURATION_SEC = 120.0
-LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP = 3
+LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP = 4
 
 
 class TextContent(BaseModel):
@@ -1457,6 +1457,9 @@ class QSRMachineServer:
                     model=model,
                     language=language,
                     prompt=prompt,
+                    transcription_response_format=(
+                        "verbose_json" if response_format == "verbose_json" else "auto"
+                    ),
                     timeout_sec=max(self.timeout, 300.0),
                     target_chunk_sec=target_chunk_sec,
                     min_chunk_sec=min_chunk_sec,

@@ -1375,7 +1375,7 @@ def _add_long_audio_args(
     parser.add_argument(
         "--per-instance-parallelism-cap",
         type=int,
-        default=3,
+        default=4,
         help="Soft cap on concurrently in-flight long-audio chunks per healthy backend instance",
     )
     parser.add_argument(
