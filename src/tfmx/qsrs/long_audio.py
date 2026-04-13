@@ -53,6 +53,9 @@ _PATHOLOGICAL_REPETITION_MIN_TOKEN_COVERAGE = 0.18
 _PATHOLOGICAL_REPETITION_MIN_TOKEN_CONSECUTIVE = 8
 _PATHOLOGICAL_REPETITION_MIN_TOKEN_CONSECUTIVE_COVERAGE = 0.12
 _QUALITY_REPAIR_MAX_PASSES = 4
+_QUALITY_REPAIR_ACCEPT_MIN_NORMALIZED_CHARS = 96
+_QUALITY_REPAIR_ACCEPT_MAX_NORMALIZED_CHARS = 256
+_QUALITY_REPAIR_ACCEPT_CHARS_PER_SEC = 3.0
 _QUALITY_SPLIT_MAX_DEPTH = 3
 _QUALITY_SPLIT_MIN_CHILD_SEC = 8.0
 _QUALITY_SPLIT_OVERLAP_SEC = 1.5
@@ -583,6 +586,23 @@ def _split_word_tokens(text: str) -> list[str]:
     return tokens
 
 
+def _extract_digit_runs(text: str) -> list[str]:
+    runs: list[str] = []
+    current: list[str] = []
+
+    for char in text:
+        if char.isdigit():
+            current.append(char)
+            continue
+        if current:
+            runs.append("".join(current))
+            current = []
+
+    if current:
+        runs.append("".join(current))
+    return runs
+
+
 def _has_pathological_repetition(text: str) -> bool:
     normalized_text, _ = _normalize_boundary_text(text)
     if len(normalized_text) < _PATHOLOGICAL_REPETITION_MIN_TOTAL_CHARS:
@@ -699,17 +719,34 @@ def _has_pathological_repetition(text: str) -> bool:
 def _are_similar_repetition_fragments(left: str, right: str) -> bool:
     if not left or not right:
         return False
-    shorter = min(len(left), len(right))
-    longer = max(len(left), len(right))
+    left_normalized, _ = _normalize_boundary_text(left)
+    right_normalized, _ = _normalize_boundary_text(right)
+    shorter = min(len(left_normalized), len(right_normalized))
+    longer = max(len(left_normalized), len(right_normalized))
     if shorter / longer < 0.65:
         return False
-    if left == right or left.endswith(right) or right.endswith(left):
+    if (
+        left_normalized == right_normalized
+        or left_normalized.endswith(right_normalized)
+        or right_normalized.endswith(left_normalized)
+    ):
         return True
+    left_digit_runs = _extract_digit_runs(left_normalized)
+    right_digit_runs = _extract_digit_runs(right_normalized)
+    if (left_digit_runs or right_digit_runs) and left_digit_runs != right_digit_runs:
+        return False
+
+    left_tokens = _split_word_tokens(left_normalized)
+    right_tokens = _split_word_tokens(right_normalized)
+    if len(left_tokens) >= 2 and len(right_tokens) >= 2:
+        if Counter(left_tokens) != Counter(right_tokens):
+            return False
+
     return (
         SequenceMatcher(
             None,
-            left,
-            right,
+            left_normalized,
+            right_normalized,
             autojunk=False,
         ).ratio()
         >= _SIMILAR_BOUNDARY_MIN_RATIO
@@ -815,6 +852,35 @@ def _repair_pathological_repetition(text: str) -> str:
     repaired = _collapse_repeated_word_runs(text)
     repaired = _collapse_similar_fragment_runs(repaired)
     return repaired.strip() or text
+
+
+def _apply_pathological_repetition_repair(text: str) -> str:
+    repaired = text
+    for _ in range(_QUALITY_REPAIR_MAX_PASSES):
+        updated = _repair_pathological_repetition(repaired)
+        if updated == repaired:
+            break
+        repaired = updated
+    return repaired
+
+
+def _should_accept_repaired_chunk_text(
+    text: str,
+    *,
+    duration_sec: float,
+) -> bool:
+    normalized_text, _ = _normalize_boundary_text(text)
+    if not normalized_text:
+        return False
+
+    min_chars = max(
+        _QUALITY_REPAIR_ACCEPT_MIN_NORMALIZED_CHARS,
+        min(
+            _QUALITY_REPAIR_ACCEPT_MAX_NORMALIZED_CHARS,
+            math.ceil(max(duration_sec, 0.0) * _QUALITY_REPAIR_ACCEPT_CHARS_PER_SEC),
+        ),
+    )
+    return len(normalized_text) >= min_chars
 
 
 def _find_similar_fragment_overlap_cut(left_text: str, right_text: str) -> int | None:
@@ -1281,6 +1347,30 @@ class LongAudioTranscriber:
         if result.segments or not _has_pathological_repetition(result.text):
             return result
 
+        repaired_text = _apply_pathological_repetition_repair(result.text)
+        if (
+            repaired_text != result.text
+            and not _has_pathological_repetition(repaired_text)
+            and _should_accept_repaired_chunk_text(
+                repaired_text,
+                duration_sec=result.duration_sec or chunk.duration_sec,
+            )
+        ):
+            return ChunkTranscriptionResult(
+                chunk_index=chunk.index,
+                start_sec=chunk.start_sec,
+                end_sec=chunk.end_sec,
+                keep_start_sec=chunk.keep_start_sec,
+                keep_end_sec=chunk.keep_end_sec,
+                latency_sec=time.perf_counter() - started_at,
+                attempt=attempt,
+                text=repaired_text,
+                language=result.language,
+                duration_sec=result.duration_sec,
+                segments=result.segments,
+                output_path=result.output_path,
+            )
+
         final_text = result.text
         final_language = result.language
         final_segments = result.segments
@@ -1307,11 +1397,7 @@ class LongAudioTranscriber:
                 if not final_language:
                     final_language = result.language
 
-        for _ in range(_QUALITY_REPAIR_MAX_PASSES):
-            repaired_text = _repair_pathological_repetition(final_text)
-            if repaired_text == final_text:
-                break
-            final_text = repaired_text
+        final_text = _apply_pathological_repetition_repair(final_text)
 
         return ChunkTranscriptionResult(
             chunk_index=chunk.index,

@@ -10,6 +10,7 @@ from tfmx.qsrs.client import InfoResponse
 from tfmx.qsrs.long_audio import ChunkTranscriptionResult
 from tfmx.qsrs.long_audio import LongAudioTranscriber
 from tfmx.qsrs.long_audio import SilenceRegion
+from tfmx.qsrs.long_audio import _repair_pathological_repetition
 from tfmx.qsrs.long_audio import count_available_healthy_slots
 from tfmx.qsrs.long_audio import count_idle_healthy_instances
 from tfmx.qsrs.long_audio import count_schedulable_healthy_slots
@@ -542,3 +543,63 @@ class TestLongAudioQualityFallback:
 
         assert result.text == "ја"
         assert result.language == "sr"
+
+    def test_transcribe_chunk_accepts_substantial_repair_without_split(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
+        chunk = AudioChunk(
+            index=11,
+            start_sec=500.0,
+            end_sec=580.0,
+            keep_start_sec=500.0,
+            keep_end_sec=580.0,
+        )
+        repetitive_text = (
+            "Bridge report begins. Witness from Belgrade speaks. "
+            "Interview continues under sirens. "
+            "The camera moves toward the river crossing. "
+            "The archive footage is introduced here. "
+            + ("To bylo prilis jasne. " * 40)
+            + "The narrator returns to the bridge. "
+            "A second witness describes the convoy in detail. "
+            "Another interview covers the shelter and the evacuation road. "
+            "Final credits mention the year and the city."
+        )
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            return_value=ChunkTranscriptionResult(
+                chunk_index=chunk.index,
+                start_sec=chunk.start_sec,
+                end_sec=chunk.end_sec,
+                keep_start_sec=chunk.keep_start_sec,
+                keep_end_sec=chunk.keep_end_sec,
+                latency_sec=0.5,
+                attempt=1,
+                text=repetitive_text,
+                language="cs",
+                duration_sec=chunk.duration_sec,
+            ),
+        ) as mock_transcribe:
+            result = transcriber._transcribe_chunk(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+                1,
+                ChunkRequestPlan(),
+            )
+
+        assert mock_transcribe.call_count == 1
+        assert result.text.count("To bylo prilis jasne.") == 1
+        assert "Bridge report begins." in result.text
+        assert "Final credits mention the year and the city." in result.text
+        assert result.language == "cs"
+
+
+class TestLongAudioRepairHelpers:
+    def test_repair_pathological_repetition_preserves_distinct_numbered_sentences(self):
+        text = (
+            "Lead sentence 1. Lead sentence 2. " "Lead sentence 3. Trailing sentence 1."
+        )
+
+        assert _repair_pathological_repetition(text) == text
