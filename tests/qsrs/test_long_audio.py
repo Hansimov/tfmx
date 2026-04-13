@@ -5,12 +5,16 @@ from unittest.mock import patch
 import httpx
 
 from tfmx.qsrs.long_audio import AudioChunk
+from tfmx.qsrs.long_audio import AudioMetadata
 from tfmx.qsrs.long_audio import ChunkRequestPlan
 from tfmx.qsrs.client import InfoResponse
 from tfmx.qsrs.long_audio import ChunkTranscriptionResult
+from tfmx.qsrs.long_audio import LongAudioTranscriptionResult
 from tfmx.qsrs.long_audio import LongAudioTranscriber
+from tfmx.qsrs.long_audio import QualityFallbackTrace
 from tfmx.qsrs.long_audio import SilenceRegion
 from tfmx.qsrs.long_audio import _repair_pathological_repetition
+from tfmx.qsrs.long_audio import _targeted_edge_resplit_side
 from tfmx.qsrs.long_audio import count_available_healthy_slots
 from tfmx.qsrs.long_audio import count_idle_healthy_instances
 from tfmx.qsrs.long_audio import count_schedulable_healthy_slots
@@ -429,6 +433,11 @@ class TestLongAudioQualityFallback:
         assert result.text == "前半段。后半段。"
         assert result.language == "zh"
         assert mock_transcribe.call_count == 3
+        assert result.quality_fallback.pathological_repetition_detected is True
+        assert result.quality_fallback.split_fallback_used is True
+        assert result.quality_fallback.repair_only_accepted is False
+        assert result.quality_fallback.max_split_depth == 1
+        assert result.quality_fallback.total_transcribe_requests == 3
 
     def test_transcribe_chunk_collapses_repetition_when_split_is_exhausted(self):
         transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
@@ -467,6 +476,11 @@ class TestLongAudioQualityFallback:
 
         assert result.text == "九十年代，我们是被苏联的猎人。"
         assert result.language == "zh"
+        assert result.quality_fallback.pathological_repetition_detected is True
+        assert result.quality_fallback.split_fallback_used is False
+        assert result.quality_fallback.repair_only_accepted is False
+        assert result.quality_fallback.repair_passes_applied >= 1
+        assert result.quality_fallback.total_transcribe_requests == 1
 
     def test_transcribe_chunk_collapses_ascii_sentence_repetition(self):
         transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
@@ -594,6 +608,82 @@ class TestLongAudioQualityFallback:
         assert "Bridge report begins." in result.text
         assert "Final credits mention the year and the city." in result.text
         assert result.language == "cs"
+        assert result.quality_fallback.pathological_repetition_detected is True
+        assert result.quality_fallback.repair_only_accepted is True
+        assert result.quality_fallback.split_fallback_used is False
+        assert result.quality_fallback.total_transcribe_requests == 1
+
+    def test_transcribe_chunk_targeted_resplit_skips_intermediate_pathological_half(
+        self,
+    ):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
+        chunk = AudioChunk(
+            index=12,
+            start_sec=100.0,
+            end_sec=142.0,
+            keep_start_sec=100.0,
+            keep_end_sec=142.0,
+        )
+        repetitive_text = (
+            ("这个，" * 80) + "这个吗？是这个玩意吗？不是这个。防范皆一，啥意思？这个。"
+        ).strip()
+
+        def side_effect(
+            audio_path: str,
+            work_dir: str,
+            requested_chunk: AudioChunk,
+            attempt: int,
+            request_plan: ChunkRequestPlan,
+        ) -> ChunkTranscriptionResult:
+            del audio_path
+            del work_dir
+            del request_plan
+            if requested_chunk.start_sec == 100.0 and requested_chunk.end_sec == 142.0:
+                text = repetitive_text
+            elif requested_chunk.end_sec <= 111.7:
+                text = "这个战斗，我赢不了。优化吸附判定机制。土牛臂调整为十秒。"
+            elif requested_chunk.end_sec <= 122.0:
+                text = "双雷震，双雷震是哪个技能？这个吗？神威副爵释放时角色获得八级，啥意思？这个吗？"
+            else:
+                text = "这个吗？是这个玩意吗？不是这个。防范皆一，啥意思？这个。"
+            return ChunkTranscriptionResult(
+                chunk_index=requested_chunk.index,
+                start_sec=requested_chunk.start_sec,
+                end_sec=requested_chunk.end_sec,
+                keep_start_sec=requested_chunk.keep_start_sec,
+                keep_end_sec=requested_chunk.keep_end_sec,
+                latency_sec=0.5,
+                attempt=attempt,
+                text=text,
+                language="zh",
+                duration_sec=requested_chunk.duration_sec,
+            )
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            side_effect=side_effect,
+        ) as mock_transcribe:
+            result = transcriber._transcribe_chunk(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+                1,
+                ChunkRequestPlan(),
+            )
+
+        assert result.text == (
+            "这个战斗，我赢不了。优化吸附判定机制。土牛臂调整为十秒。"
+            "双雷震，双雷震是哪个技能？这个吗？神威副爵释放时角色获得八级，啥意思？这个吗？"
+            "是这个玩意吗？不是这个。防范皆一，啥意思？这个。"
+        )
+        assert result.language == "zh"
+        assert mock_transcribe.call_count == 4
+        assert result.quality_fallback.pathological_repetition_detected is True
+        assert result.quality_fallback.split_fallback_used is True
+        assert result.quality_fallback.split_child_count == 3
+        assert result.quality_fallback.max_split_depth == 2
+        assert result.quality_fallback.total_transcribe_requests == 4
 
 
 class TestLongAudioRepairHelpers:
@@ -603,3 +693,81 @@ class TestLongAudioRepairHelpers:
         )
 
         assert _repair_pathological_repetition(text) == text
+
+    def test_targeted_edge_resplit_side_detects_prefix_run(self):
+        text = ("这个，" * 80) + "这里开始恢复正常描述。后面还有一句。"
+
+        assert _targeted_edge_resplit_side(text) == "prefix"
+
+
+class TestLongAudioTelemetry:
+    def test_long_audio_result_includes_quality_fallback_summary(self):
+        result = LongAudioTranscriptionResult(
+            audio="/tmp/input.wav",
+            metadata=AudioMetadata(path="/tmp/input.wav", duration_sec=120.0),
+            chunks=[],
+            silence_regions=[],
+            chunk_results=[
+                ChunkTranscriptionResult(
+                    chunk_index=0,
+                    start_sec=0.0,
+                    end_sec=60.0,
+                    keep_start_sec=0.0,
+                    keep_end_sec=60.0,
+                    latency_sec=1.0,
+                    attempt=1,
+                    text="alpha",
+                    language="en",
+                    duration_sec=60.0,
+                    quality_fallback=QualityFallbackTrace(
+                        pathological_repetition_detected=True,
+                        repair_attempted=True,
+                        repair_only_accepted=True,
+                        repair_passes_applied=2,
+                        total_transcribe_requests=1,
+                    ),
+                ),
+                ChunkTranscriptionResult(
+                    chunk_index=1,
+                    start_sec=60.0,
+                    end_sec=120.0,
+                    keep_start_sec=60.0,
+                    keep_end_sec=120.0,
+                    latency_sec=1.0,
+                    attempt=1,
+                    text="beta",
+                    language="en",
+                    duration_sec=60.0,
+                    quality_fallback=QualityFallbackTrace(
+                        pathological_repetition_detected=True,
+                        repair_attempted=True,
+                        split_fallback_used=True,
+                        post_split_repair_applied=True,
+                        split_child_count=2,
+                        max_split_depth=2,
+                        repair_passes_applied=5,
+                        total_transcribe_requests=5,
+                    ),
+                ),
+            ],
+            total_time_sec=2.0,
+            max_parallel_chunks=2,
+            endpoint="http://127.0.0.1:27900",
+            machine_snapshot=None,
+            text="alpha beta",
+            language="en",
+        )
+
+        payload = result.to_dict()
+
+        assert payload["transcription"]["quality_fallback_summary"] == {
+            "chunk_count": 2,
+            "pathological_chunks": 2,
+            "repair_only_accepted_chunks": 1,
+            "split_fallback_chunks": 1,
+            "post_split_repair_chunks": 1,
+            "max_split_depth": 2,
+            "repair_passes_applied": 7,
+            "total_transcribe_requests": 6,
+            "extra_transcribe_requests": 4,
+        }

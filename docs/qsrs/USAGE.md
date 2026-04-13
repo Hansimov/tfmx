@@ -152,6 +152,7 @@ qsr client chat -E "$QSR_BACKEND_A_URL" --audio ./sample.wav "请转写"
 - 长音频模式默认启用更激进但受控的 slot-aware 调度：每张健康 GPU 默认最多并发 `4` 个 chunk，并且会先填满空闲实例，再利用剩余可用槽位继续补货
 - client-side 长音频现在按需并行提取 chunk，不再先串行切完整个文件再开始发请求
 - 长音频模式现在会先自动尝试 `verbose_json` + `segment` 时间戳；如果当前 `Qwen3-ASR-0.6B` backend 仍然不支持，或者响应里没有 `segments`，会自动回退到重叠文本去重
+- `qsr client transcribe-long --json` 的结果里会额外返回 `transcription.quality_fallback_summary`，每个 chunk 也会带 `quality_fallback` 字段，可直接看出某个慢 chunk 是否因为本地 repair、split fallback 或额外底层转写请求而变慢
 - `qsr client transcribe-long` 依赖本机可用的 `ffmpeg` 和 `ffprobe`
 - `qsr client chat` 支持多段文本和多段音频，会按顺序交错组成一个 OpenAI multimodal message
 - 默认 chat 走流式输出；若你需要完整 JSON 响应，可加 `--no-stream --json`

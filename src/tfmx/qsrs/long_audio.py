@@ -56,6 +56,9 @@ _QUALITY_REPAIR_MAX_PASSES = 4
 _QUALITY_REPAIR_ACCEPT_MIN_NORMALIZED_CHARS = 96
 _QUALITY_REPAIR_ACCEPT_MAX_NORMALIZED_CHARS = 256
 _QUALITY_REPAIR_ACCEPT_CHARS_PER_SEC = 3.0
+_TARGETED_EDGE_RESPLIT_MAX_FRAGMENT_CHARS = 8
+_TARGETED_EDGE_RESPLIT_MIN_RUN_COUNT = 32
+_TARGETED_EDGE_RESPLIT_MIN_COVERAGE = 0.45
 _QUALITY_SPLIT_MAX_DEPTH = 3
 _QUALITY_SPLIT_MIN_CHILD_SEC = 8.0
 _QUALITY_SPLIT_OVERLAP_SEC = 1.5
@@ -149,6 +152,32 @@ class AudioChunk:
         }
 
 
+@dataclass(frozen=True)
+class QualityFallbackTrace:
+    pathological_repetition_detected: bool = False
+    repair_attempted: bool = False
+    repair_only_accepted: bool = False
+    split_fallback_used: bool = False
+    post_split_repair_applied: bool = False
+    split_child_count: int = 0
+    max_split_depth: int = 0
+    repair_passes_applied: int = 0
+    total_transcribe_requests: int = 1
+
+    def to_dict(self) -> dict:
+        return {
+            "pathological_repetition_detected": self.pathological_repetition_detected,
+            "repair_attempted": self.repair_attempted,
+            "repair_only_accepted": self.repair_only_accepted,
+            "split_fallback_used": self.split_fallback_used,
+            "post_split_repair_applied": self.post_split_repair_applied,
+            "split_child_count": self.split_child_count,
+            "max_split_depth": self.max_split_depth,
+            "repair_passes_applied": self.repair_passes_applied,
+            "total_transcribe_requests": self.total_transcribe_requests,
+        }
+
+
 @dataclass
 class ChunkTranscriptionResult:
     chunk_index: int
@@ -163,6 +192,7 @@ class ChunkTranscriptionResult:
     duration_sec: float | None
     segments: list[dict] = field(default_factory=list)
     output_path: str = ""
+    quality_fallback: QualityFallbackTrace = field(default_factory=QualityFallbackTrace)
 
     def to_dict(self) -> dict:
         return {
@@ -180,6 +210,7 @@ class ChunkTranscriptionResult:
             ),
             "segments": self.segments,
             "output_path": self.output_path,
+            "quality_fallback": self.quality_fallback.to_dict(),
         }
 
 
@@ -199,6 +230,47 @@ class LongAudioTranscriptionResult:
     merged_segments: list[dict] = field(default_factory=list)
     chunk_response_format: str = "json"
     stitching_mode: str = "text_overlap"
+
+    def _quality_fallback_summary(self) -> dict:
+        if not self.chunk_results:
+            return {
+                "chunk_count": 0,
+                "pathological_chunks": 0,
+                "repair_only_accepted_chunks": 0,
+                "split_fallback_chunks": 0,
+                "post_split_repair_chunks": 0,
+                "max_split_depth": 0,
+                "repair_passes_applied": 0,
+                "total_transcribe_requests": 0,
+                "extra_transcribe_requests": 0,
+            }
+
+        traces = [result.quality_fallback for result in self.chunk_results]
+        total_transcribe_requests = sum(
+            trace.total_transcribe_requests for trace in traces
+        )
+        return {
+            "chunk_count": len(traces),
+            "pathological_chunks": sum(
+                trace.pathological_repetition_detected for trace in traces
+            ),
+            "repair_only_accepted_chunks": sum(
+                trace.repair_only_accepted for trace in traces
+            ),
+            "split_fallback_chunks": sum(trace.split_fallback_used for trace in traces),
+            "post_split_repair_chunks": sum(
+                trace.post_split_repair_applied for trace in traces
+            ),
+            "max_split_depth": max(trace.max_split_depth for trace in traces),
+            "repair_passes_applied": sum(
+                trace.repair_passes_applied for trace in traces
+            ),
+            "total_transcribe_requests": total_transcribe_requests,
+            "extra_transcribe_requests": max(
+                0,
+                total_transcribe_requests - len(traces),
+            ),
+        }
 
     def to_dict(self) -> dict:
         total_audio_duration_sec = sum(chunk.duration_sec for chunk in self.chunks)
@@ -236,6 +308,7 @@ class LongAudioTranscriptionResult:
                 "duration": round(self.metadata.duration_sec, 3),
                 "chunk_response_format": self.chunk_response_format,
                 "stitching_mode": self.stitching_mode,
+                "quality_fallback_summary": self._quality_fallback_summary(),
                 "segments": self.merged_segments,
                 "chunks": [result.to_dict() for result in self.chunk_results],
             },
@@ -855,13 +928,20 @@ def _repair_pathological_repetition(text: str) -> str:
 
 
 def _apply_pathological_repetition_repair(text: str) -> str:
+    repaired, _ = _apply_pathological_repetition_repair_with_stats(text)
+    return repaired
+
+
+def _apply_pathological_repetition_repair_with_stats(text: str) -> tuple[str, int]:
     repaired = text
+    repair_passes = 0
     for _ in range(_QUALITY_REPAIR_MAX_PASSES):
         updated = _repair_pathological_repetition(repaired)
         if updated == repaired:
             break
         repaired = updated
-    return repaired
+        repair_passes += 1
+    return repaired, repair_passes
 
 
 def _should_accept_repaired_chunk_text(
@@ -881,6 +961,53 @@ def _should_accept_repaired_chunk_text(
         ),
     )
     return len(normalized_text) >= min_chars
+
+
+def _targeted_edge_resplit_side(text: str) -> str | None:
+    normalized_text, _ = _normalize_boundary_text(text)
+    if len(normalized_text) < _PATHOLOGICAL_REPETITION_MIN_TOTAL_CHARS:
+        return None
+
+    fragments = [
+        _normalize_boundary_text(fragment)[0]
+        for _start, _end, fragment in _split_text_fragments(
+            text,
+            delimiters=_REPETITION_DELIMITERS,
+        )
+    ]
+    if not fragments:
+        return None
+
+    def edge_run(side: str) -> tuple[int, float]:
+        sequence = fragments if side == "prefix" else list(reversed(fragments))
+        fragment = sequence[0]
+        if not (
+            _PATHOLOGICAL_REPETITION_MIN_FRAGMENT_CHARS
+            <= len(fragment)
+            <= _TARGETED_EDGE_RESPLIT_MAX_FRAGMENT_CHARS
+        ):
+            return 0, 0.0
+
+        count = 0
+        for candidate in sequence:
+            if candidate != fragment:
+                break
+            count += 1
+        coverage = (count * len(fragment)) / len(normalized_text)
+        return count, coverage
+
+    best_side: str | None = None
+    best_score = (0.0, 0)
+    for side in ("prefix", "suffix"):
+        count, coverage = edge_run(side)
+        if (
+            count >= _TARGETED_EDGE_RESPLIT_MIN_RUN_COUNT
+            and coverage >= _TARGETED_EDGE_RESPLIT_MIN_COVERAGE
+            and (coverage, count) > best_score
+        ):
+            best_side = side
+            best_score = (coverage, count)
+    return best_side
 
 
 def _find_similar_fragment_overlap_cut(left_text: str, right_text: str) -> int | None:
@@ -1326,6 +1453,46 @@ class LongAudioTranscriber:
             ),
         ]
 
+    def _plan_quality_fallback_chunks(
+        self,
+        chunk: AudioChunk,
+        text: str,
+        *,
+        split_depth: int,
+    ) -> list[tuple[AudioChunk, int]]:
+        child_chunks = self._split_chunk_for_quality_fallback(chunk)
+        if len(child_chunks) < 2:
+            return []
+
+        planned_chunks: list[tuple[AudioChunk, int]] = [
+            (child_chunk, split_depth + 1) for child_chunk in child_chunks
+        ]
+        if split_depth + 2 > _QUALITY_SPLIT_MAX_DEPTH:
+            return planned_chunks
+
+        targeted_side = _targeted_edge_resplit_side(text)
+        if targeted_side is None:
+            return planned_chunks
+
+        child_index = 0 if targeted_side == "prefix" else 1
+        resplit_children = self._split_chunk_for_quality_fallback(
+            child_chunks[child_index]
+        )
+        if len(resplit_children) < 2:
+            return planned_chunks
+
+        if targeted_side == "prefix":
+            return [
+                (resplit_children[0], split_depth + 2),
+                (resplit_children[1], split_depth + 2),
+                (child_chunks[1], split_depth + 1),
+            ]
+        return [
+            (child_chunks[0], split_depth + 1),
+            (resplit_children[0], split_depth + 2),
+            (resplit_children[1], split_depth + 2),
+        ]
+
     def _transcribe_chunk_with_quality_fallback(
         self,
         audio_path: str,
@@ -1344,10 +1511,13 @@ class LongAudioTranscriber:
             attempt,
             request_plan,
         )
-        if result.segments or not _has_pathological_repetition(result.text):
+        pathological_repetition_detected = _has_pathological_repetition(result.text)
+        if result.segments or not pathological_repetition_detected:
             return result
 
-        repaired_text = _apply_pathological_repetition_repair(result.text)
+        repaired_text, direct_repair_passes = (
+            _apply_pathological_repetition_repair_with_stats(result.text)
+        )
         if (
             repaired_text != result.text
             and not _has_pathological_repetition(repaired_text)
@@ -1369,14 +1539,40 @@ class LongAudioTranscriber:
                 duration_sec=result.duration_sec,
                 segments=result.segments,
                 output_path=result.output_path,
+                quality_fallback=QualityFallbackTrace(
+                    pathological_repetition_detected=pathological_repetition_detected,
+                    repair_attempted=True,
+                    repair_only_accepted=True,
+                    split_fallback_used=False,
+                    post_split_repair_applied=False,
+                    split_child_count=0,
+                    max_split_depth=split_depth,
+                    repair_passes_applied=direct_repair_passes,
+                    total_transcribe_requests=1,
+                ),
             )
 
         final_text = result.text
         final_language = result.language
         final_segments = result.segments
+        split_fallback_used = False
+        split_child_count = 0
+        max_split_depth = split_depth
+        total_transcribe_requests = 1
+        repair_passes_applied = direct_repair_passes
+        post_split_repair_applied = False
         if split_depth < _QUALITY_SPLIT_MAX_DEPTH:
-            child_chunks = self._split_chunk_for_quality_fallback(chunk)
-            if len(child_chunks) >= 2:
+            planned_chunks = self._plan_quality_fallback_chunks(
+                chunk,
+                result.text,
+                split_depth=split_depth,
+            )
+            if planned_chunks:
+                split_fallback_used = True
+                split_child_count = len(planned_chunks)
+                fallback_chunks = [
+                    child_chunk for child_chunk, _depth in planned_chunks
+                ]
                 child_results = [
                     self._transcribe_chunk_with_quality_fallback(
                         audio_path,
@@ -1384,20 +1580,42 @@ class LongAudioTranscriber:
                         child_chunk,
                         attempt,
                         request_plan,
-                        split_depth=split_depth + 1,
+                        split_depth=child_depth,
                     )
-                    for child_chunk in child_chunks
+                    for child_chunk, child_depth in planned_chunks
                 ]
+                total_transcribe_requests += sum(
+                    child_result.quality_fallback.total_transcribe_requests
+                    for child_result in child_results
+                )
+                repair_passes_applied += sum(
+                    child_result.quality_fallback.repair_passes_applied
+                    for child_result in child_results
+                )
+                max_split_depth = max(
+                    split_depth + 1,
+                    max(child_depth for _child_chunk, child_depth in planned_chunks),
+                    max(
+                        child_result.quality_fallback.max_split_depth
+                        for child_result in child_results
+                    ),
+                )
                 final_text, final_language, final_segments = merge_transcribed_chunks(
-                    child_chunks,
+                    fallback_chunks,
                     child_results,
                 )
                 if not final_text:
                     final_text = result.text
                 if not final_language:
                     final_language = result.language
-
-        final_text = _apply_pathological_repetition_repair(final_text)
+        if split_fallback_used:
+            final_text, post_split_repair_passes = (
+                _apply_pathological_repetition_repair_with_stats(final_text)
+            )
+            repair_passes_applied += post_split_repair_passes
+            post_split_repair_applied = post_split_repair_passes > 0
+        else:
+            final_text = repaired_text
 
         return ChunkTranscriptionResult(
             chunk_index=chunk.index,
@@ -1412,6 +1630,17 @@ class LongAudioTranscriber:
             duration_sec=result.duration_sec,
             segments=final_segments,
             output_path=result.output_path,
+            quality_fallback=QualityFallbackTrace(
+                pathological_repetition_detected=pathological_repetition_detected,
+                repair_attempted=True,
+                repair_only_accepted=False,
+                split_fallback_used=split_fallback_used,
+                post_split_repair_applied=post_split_repair_applied,
+                split_child_count=split_child_count,
+                max_split_depth=max_split_depth,
+                repair_passes_applied=repair_passes_applied,
+                total_transcribe_requests=total_transcribe_requests,
+            ),
         )
 
     def _dispatch_capacity(self, info: "InfoResponse" | None) -> int:
