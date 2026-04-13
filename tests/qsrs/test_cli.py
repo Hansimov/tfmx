@@ -132,6 +132,27 @@ class TestQsrCliParser:
         assert args.audio == ["./sample.wav"]
         assert args.response_format == "text"
 
+    def test_client_parse_transcribe_long(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "client",
+                "transcribe-long",
+                "./meeting.mp3",
+                "--target-chunk-sec",
+                "75",
+                "--overlap-sec",
+                "5",
+                "--json",
+            ]
+        )
+        assert args.command == "client"
+        assert args.client_action == "transcribe-long"
+        assert args.audio == "./meeting.mp3"
+        assert args.target_chunk_sec == 75.0
+        assert args.overlap_sec == 5.0
+        assert args.json is True
+
     def test_benchmark_parse(self):
         parser = build_parser()
         args = parser.parse_args(

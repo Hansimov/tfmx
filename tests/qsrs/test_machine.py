@@ -315,7 +315,7 @@ class TestQSRMachineServer:
         server._probe_instance_http_health = AsyncMock(return_value=True)
         server._mark_instance_unhealthy = MagicMock()
 
-        asyncio.run(
+        preserved = asyncio.run(
             server._handle_retryable_instance_error(
                 instance,
                 OSError(9, "Bad file descriptor"),
@@ -323,6 +323,7 @@ class TestQSRMachineServer:
             )
         )
 
+        assert preserved is True
         server._probe_instance_http_health.assert_awaited_once_with(instance)
         server._mark_instance_unhealthy.assert_not_called()
 
@@ -339,7 +340,7 @@ class TestQSRMachineServer:
         server._probe_instance_http_health = AsyncMock(return_value=True)
         server._mark_instance_unhealthy = MagicMock()
 
-        asyncio.run(
+        preserved = asyncio.run(
             server._handle_retryable_upstream_status(
                 instance,
                 status_code=500,
@@ -348,9 +349,48 @@ class TestQSRMachineServer:
             )
         )
 
+        assert preserved is True
         server._request_instance_maintenance.assert_awaited_once_with(
             instance,
             "/reset_mm_cache",
         )
         server._probe_instance_http_health.assert_awaited_once_with(instance)
         server._mark_instance_unhealthy.assert_not_called()
+
+    def test_forward_transcription_retries_preserved_backend_once(self):
+        instance = QSRInstance(
+            container_name="qsr-multi--gpu0",
+            host="localhost",
+            port=27980,
+            gpu_id=0,
+            healthy=True,
+            model_name="0.6b",
+        )
+        server = QSRMachineServer(instances=[instance])
+        server._acquire_instance = AsyncMock(side_effect=[instance, instance])
+        server._release_instance = AsyncMock()
+        server._probe_instance_http_health = AsyncMock(return_value=True)
+        server._reset_transcription_client = MagicMock()
+        server._post_transcription_sync = MagicMock(
+            side_effect=[
+                OSError(9, "Bad file descriptor"),
+                (200, {"content-type": "application/json"}, b'{"text":"ok"}'),
+            ]
+        )
+
+        response = asyncio.run(
+            server._forward_transcription(
+                filename="sample.wav",
+                payload=b"RIFF1234WAVEfmt ",
+                content_type="audio/wav",
+                response_format="json",
+            )
+        )
+
+        assert isinstance(response, JSONResponse)
+        assert response.body == b'{"text":"ok"}'
+        assert server._acquire_instance.await_count == 2
+        server._probe_instance_http_health.assert_awaited_once_with(instance)
+        server._reset_transcription_client.assert_called_once_with(
+            instance.transcription_url
+        )

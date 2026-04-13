@@ -26,6 +26,13 @@ from .clients_core import ClientsHealthResponse
 from .clients_core import MachineScheduler
 from .clients_core import MachineState
 from .clients_stats import QSRClientsWithStats
+from .long_audio import AudioChunk
+from .long_audio import AudioMetadata
+from .long_audio import ChunkTranscriptionResult
+from .long_audio import LongAudioTranscriber
+from .long_audio import LongAudioTranscriptionConfig
+from .long_audio import LongAudioTranscriptionResult
+from .long_audio import SilenceRegion
 from .compose import ComposeFileGenerator
 from .compose import DockerImageManager
 from .compose import GPUDetector

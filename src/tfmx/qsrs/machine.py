@@ -962,6 +962,7 @@ class QSRMachineServer:
                 httpx.TransportError,
                 httpx.TimeoutException,
                 asyncio.TimeoutError,
+                OSError,
             ),
         )
 
@@ -1044,7 +1045,7 @@ class QSRMachineServer:
         exc: Exception,
         *,
         reset_transcription_client: bool = False,
-    ) -> None:
+    ) -> bool:
         instance.last_error = str(exc)
         if reset_transcription_client:
             self._reset_transcription_client(instance.transcription_url)
@@ -1052,8 +1053,9 @@ class QSRMachineServer:
             logger.note(
                 f"[qsr_machine] Preserving healthy backend after transient transport error: {instance.container_name}"
             )
-            return
+            return True
         self._mark_instance_unhealthy(instance, exc)
+        return False
 
     async def _handle_retryable_upstream_status(
         self,
@@ -1062,7 +1064,7 @@ class QSRMachineServer:
         status_code: int,
         detail: object,
         reset_mm_cache: bool = False,
-    ) -> None:
+    ) -> bool:
         instance.last_error = str(detail)
         if reset_mm_cache:
             await self._request_instance_maintenance(instance, "/reset_mm_cache")
@@ -1070,8 +1072,9 @@ class QSRMachineServer:
             logger.note(
                 f"[qsr_machine] Preserving healthy backend after upstream HTTP {status_code}: {instance.container_name}"
             )
-            return
+            return True
         self._mark_instance_unhealthy(instance, detail)
+        return False
 
     def _post_transcription_sync(
         self,
@@ -1088,6 +1091,7 @@ class QSRMachineServer:
         requested_model_field: str = "",
     ) -> ChatCompletionResponse:
         excluded_instances: set[str] = set()
+        preserved_retry_counts: dict[str, int] = {}
         last_exc: HTTPException | None = None
 
         while True:
@@ -1105,14 +1109,22 @@ class QSRMachineServer:
                 if response.status_code >= 400:
                     detail = await self._read_error_detail(response)
                     if self._is_retryable_upstream_status(response.status_code):
-                        excluded_instances.add(instance.container_name)
                         self.stats.total_failovers += 1
-                        await self._handle_retryable_upstream_status(
+                        preserved = await self._handle_retryable_upstream_status(
                             instance,
                             status_code=response.status_code,
                             detail=detail,
                             reset_mm_cache=response.status_code == 500,
                         )
+                        retry_count = preserved_retry_counts.get(
+                            instance.container_name, 0
+                        )
+                        if preserved and retry_count < 1:
+                            preserved_retry_counts[instance.container_name] = (
+                                retry_count + 1
+                            )
+                        else:
+                            excluded_instances.add(instance.container_name)
                         last_exc = HTTPException(
                             status_code=response.status_code,
                             detail=detail,
@@ -1131,9 +1143,18 @@ class QSRMachineServer:
                 raise
             except Exception as exc:
                 if self._is_retryable_upstream_exception(exc):
-                    excluded_instances.add(instance.container_name)
                     self.stats.total_failovers += 1
-                    await self._handle_retryable_instance_error(instance, exc)
+                    preserved = await self._handle_retryable_instance_error(
+                        instance,
+                        exc,
+                    )
+                    retry_count = preserved_retry_counts.get(instance.container_name, 0)
+                    if preserved and retry_count < 1:
+                        preserved_retry_counts[instance.container_name] = (
+                            retry_count + 1
+                        )
+                    else:
+                        excluded_instances.add(instance.container_name)
                     last_exc = HTTPException(status_code=502, detail=str(exc))
                     continue
                 self.stats.total_errors += 1
@@ -1167,6 +1188,7 @@ class QSRMachineServer:
     ) -> StreamingResponse:
         async def stream_generator():
             excluded_instances: set[str] = set()
+            preserved_retry_counts: dict[str, int] = {}
             while True:
                 try:
                     instance = await self._acquire_instance(
@@ -1191,14 +1213,24 @@ class QSRMachineServer:
                         if response.status_code >= 400:
                             detail = await self._read_error_detail(response)
                             if self._is_retryable_upstream_status(response.status_code):
-                                excluded_instances.add(instance.container_name)
                                 self.stats.total_failovers += 1
-                                await self._handle_retryable_upstream_status(
-                                    instance,
-                                    status_code=response.status_code,
-                                    detail=detail,
-                                    reset_mm_cache=response.status_code == 500,
+                                preserved = (
+                                    await self._handle_retryable_upstream_status(
+                                        instance,
+                                        status_code=response.status_code,
+                                        detail=detail,
+                                        reset_mm_cache=response.status_code == 500,
+                                    )
                                 )
+                                retry_count = preserved_retry_counts.get(
+                                    instance.container_name, 0
+                                )
+                                if preserved and retry_count < 1:
+                                    preserved_retry_counts[instance.container_name] = (
+                                        retry_count + 1
+                                    )
+                                else:
+                                    excluded_instances.add(instance.container_name)
                                 continue
                             self.stats.total_errors += 1
                             yield self._build_stream_error_chunk(
@@ -1216,9 +1248,20 @@ class QSRMachineServer:
                         return
                 except Exception as exc:
                     if self._is_retryable_upstream_exception(exc):
-                        excluded_instances.add(instance.container_name)
                         self.stats.total_failovers += 1
-                        await self._handle_retryable_instance_error(instance, exc)
+                        preserved = await self._handle_retryable_instance_error(
+                            instance,
+                            exc,
+                        )
+                        retry_count = preserved_retry_counts.get(
+                            instance.container_name, 0
+                        )
+                        if preserved and retry_count < 1:
+                            preserved_retry_counts[instance.container_name] = (
+                                retry_count + 1
+                            )
+                        else:
+                            excluded_instances.add(instance.container_name)
                         continue
                     self.stats.total_errors += 1
                     yield self._build_stream_error_chunk(
@@ -1247,6 +1290,7 @@ class QSRMachineServer:
     ) -> Response:
         requested_model_field = self._resolve_requested_model_field(model)
         excluded_instances: set[str] = set()
+        preserved_retry_counts: dict[str, int] = {}
 
         while True:
             instance = await self._acquire_instance(
@@ -1280,14 +1324,22 @@ class QSRMachineServer:
                 if response.status_code >= 400:
                     detail = await self._read_error_detail(response)
                     if self._is_retryable_upstream_status(response.status_code):
-                        excluded_instances.add(instance.container_name)
                         self.stats.total_failovers += 1
-                        await self._handle_retryable_upstream_status(
+                        preserved = await self._handle_retryable_upstream_status(
                             instance,
                             status_code=response.status_code,
                             detail=detail,
                             reset_mm_cache=response.status_code == 500,
                         )
+                        retry_count = preserved_retry_counts.get(
+                            instance.container_name, 0
+                        )
+                        if preserved and retry_count < 1:
+                            preserved_retry_counts[instance.container_name] = (
+                                retry_count + 1
+                            )
+                        else:
+                            excluded_instances.add(instance.container_name)
                         continue
                     self.stats.total_errors += 1
                     raise HTTPException(status_code=response.status_code, detail=detail)
@@ -1303,13 +1355,19 @@ class QSRMachineServer:
                 raise
             except Exception as exc:
                 if self._is_retryable_upstream_exception(exc):
-                    excluded_instances.add(instance.container_name)
                     self.stats.total_failovers += 1
-                    await self._handle_retryable_instance_error(
+                    preserved = await self._handle_retryable_instance_error(
                         instance,
                         exc,
                         reset_transcription_client=True,
                     )
+                    retry_count = preserved_retry_counts.get(instance.container_name, 0)
+                    if preserved and retry_count < 1:
+                        preserved_retry_counts[instance.container_name] = (
+                            retry_count + 1
+                        )
+                    else:
+                        excluded_instances.add(instance.container_name)
                     continue
                 self.stats.total_errors += 1
                 raise HTTPException(status_code=502, detail=str(exc)) from exc

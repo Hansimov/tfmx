@@ -5,6 +5,7 @@ docker_data/
 data/
 configs/
 results/
+audio_inputs/
 weights/
 __pycache__
 *.chats

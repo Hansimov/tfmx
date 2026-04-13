@@ -50,6 +50,7 @@ bash runs/qsrs/06_soak_mixed.sh
 - `98_sleep_backends.sh` stops `qsr machine` and requests backend sleep so the next `02_start_machine.sh` can wake them quickly.
 - `06_soak_mixed.sh` runs a mixed chat/transcribe soak against the machine endpoint and writes a JSON summary under `runs/qsrs/results/`.
 - `python debugs/qsrs/profile_startup.py qsr-uniform--gpu0 ...` parses backend docker logs into internal cold-start phases such as model load, torch.compile, KV cache setup, graph capture, and first health.
+- `qsr client transcribe-long -E http://127.0.0.1:27900 ./long.mp3 --json` is the current long-audio path for turning one long file into many silence-aware chunk requests and spreading them across idle GPUs.
 - Default sample audios come from the public Qwen3-ASR repo; override them with `QSR_SMOKE_AUDIO`, `QSR_BENCH_AUDIO`, `QSR_SCHED_AUDIO_A`, or `QSR_SCHED_AUDIO_B` if needed.
 - `06_soak_mixed.sh` accepts `QSR_SOAK_AUDIO_A`, `QSR_SOAK_AUDIO_B`, `QSR_SOAK_TRANSCRIBE_SAMPLES`, `QSR_SOAK_CHAT_SAMPLES`, `QSR_SOAK_MAX_WORKERS`, and `QSR_SOAK_MAX_TOKENS`.
 - `qsr machine` daemon logs live under `~/.cache/tfmx/qsr_machine.log`.

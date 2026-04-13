@@ -18,10 +18,12 @@ from typing import Callable, Optional
 from urllib.parse import urlsplit, urlunsplit
 
 from .compose import MACHINE_PORT as PORT, MAX_MODEL_LEN
+from .long_audio import LongAudioTranscriber, LongAudioTranscriptionConfig
 
 
 HOST = "localhost"
 DEFAULT_MAX_TOKENS = 1024
+DEFAULT_REQUEST_TIMEOUT_SEC = 120.0
 _MAX_TOKENS_LIMIT_PATTERNS = (
     re.compile(r"max_total_tokens\s*=\s*(\d+)", re.IGNORECASE),
     re.compile(r"max_model_len(?:=max_total_tokens)?\s*=\s*(\d+)", re.IGNORECASE),
@@ -234,6 +236,7 @@ class InstanceInfo:
     endpoint: str
     gpu_id: Optional[int]
     healthy: bool
+    sleeping: bool = False
     model_name: str = ""
     model_label: str = ""
     active_requests: int = 0
@@ -251,6 +254,7 @@ class InstanceInfo:
             endpoint=data.get("endpoint", ""),
             gpu_id=data.get("gpu_id"),
             healthy=data.get("healthy", False),
+            sleeping=data.get("sleeping", False),
             model_name=data.get("model_name", ""),
             model_label=data.get("model_label", ""),
             active_requests=data.get("active_requests", 0),
@@ -768,6 +772,7 @@ class QSRClient:
         host: str = HOST,
         port: int = PORT,
         verbose: bool = False,
+        timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC,
     ):
         raw_endpoint = endpoint.rstrip("/") if endpoint else f"http://{host}:{port}"
         self.endpoint = _normalize_service_endpoint_root(raw_endpoint)
@@ -786,7 +791,8 @@ class QSRClient:
         self.health_endpoint = _join_endpoint_route(self.endpoint, "/health")
         self.info_endpoint = _join_endpoint_route(self.endpoint, "/info")
         self.verbose = verbose
-        self.client = httpx.Client(timeout=httpx.Timeout(120.0))
+        self.timeout_sec = float(timeout_sec)
+        self.client = httpx.Client(timeout=httpx.Timeout(self.timeout_sec))
         self._cached_models: list[str] | None = None
         self._cached_default_model: str = ""
 
@@ -1095,6 +1101,7 @@ class AsyncQSRClient:
         host: str = HOST,
         port: int = PORT,
         verbose: bool = False,
+        timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC,
     ):
         raw_endpoint = endpoint.rstrip("/") if endpoint else f"http://{host}:{port}"
         self.endpoint = _normalize_service_endpoint_root(raw_endpoint)
@@ -1106,7 +1113,8 @@ class AsyncQSRClient:
         self.models_endpoint = _join_endpoint_route(self.endpoint, "/v1/models")
         self.models_alias_endpoint = _join_endpoint_route(self.endpoint, "/models")
         self.verbose = verbose
-        self.client = httpx.AsyncClient(timeout=httpx.Timeout(120.0))
+        self.timeout_sec = float(timeout_sec)
+        self.client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout_sec))
         self._cached_default_model: str = ""
         self._model_resolve_lock: asyncio.Lock | None = None
 
@@ -1267,6 +1275,7 @@ Examples:
   qsr client models
   qsr client info
   qsr client transcribe ./sample.wav
+    qsr client transcribe-long ./meeting.mp3 --json
   qsr client transcribe https://example.com/sample.wav --response-format text
   qsr client chat --audio ./sample.wav "请转写为简体中文"
   qsr client chat --audio ./sample.wav --no-stream --json
@@ -1283,6 +1292,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-E", "--endpoint", type=str, default=None)
     common.add_argument("-m", "--model", type=str, default="")
+    common.add_argument(
+        "--timeout-sec",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_SEC,
+        help="HTTP timeout in seconds for chat/transcribe/model requests",
+    )
     common.add_argument("-v", "--verbose", action="store_true")
 
     for action in ("health", "models", "info"):
@@ -1321,9 +1336,95 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     transcribe_parser.add_argument("--timestamp-granularities", nargs="*", default=None)
     transcribe_parser.add_argument("--json", action="store_true")
 
+    transcribe_long_parser = subparsers.add_parser(
+        "transcribe-long",
+        parents=[common],
+        help="Split a long audio file into silence-aware chunks and schedule them across idle GPUs",
+    )
+    transcribe_long_parser.add_argument("audio", help="Long audio file path")
+    transcribe_long_parser.add_argument("--language", type=str, default=None)
+    transcribe_long_parser.add_argument("--prompt", type=str, default=None)
+    transcribe_long_parser.add_argument(
+        "--target-chunk-sec",
+        type=float,
+        default=60.0,
+        help="Target chunk length before silence-aware adjustment",
+    )
+    transcribe_long_parser.add_argument(
+        "--min-chunk-sec",
+        type=float,
+        default=35.0,
+        help="Minimum chunk length",
+    )
+    transcribe_long_parser.add_argument(
+        "--max-chunk-sec",
+        type=float,
+        default=90.0,
+        help="Maximum chunk length before forcing a cut",
+    )
+    transcribe_long_parser.add_argument(
+        "--overlap-sec",
+        type=float,
+        default=4.0,
+        help="Chunk overlap in seconds to reduce transcript loss at boundaries",
+    )
+    transcribe_long_parser.add_argument(
+        "--search-window-sec",
+        type=float,
+        default=12.0,
+        help="Silence search window around the target boundary",
+    )
+    transcribe_long_parser.add_argument(
+        "--min-silence-sec",
+        type=float,
+        default=0.35,
+        help="Minimum silence duration used to propose chunk boundaries",
+    )
+    transcribe_long_parser.add_argument(
+        "--silence-noise-db",
+        type=float,
+        default=-32.0,
+        help="Silence threshold in dB for ffmpeg silencedetect",
+    )
+    transcribe_long_parser.add_argument(
+        "--idle-poll-interval-sec",
+        type=float,
+        default=1.0,
+        help="Polling interval when waiting for idle GPU instances",
+    )
+    transcribe_long_parser.add_argument(
+        "--max-parallel-chunks",
+        type=int,
+        default=None,
+        help="Optional cap on parallel chunk requests; defaults to healthy instance count",
+    )
+    transcribe_long_parser.add_argument(
+        "--max-chunk-retries",
+        type=int,
+        default=2,
+        help="How many times to retry a failed chunk before aborting",
+    )
+    transcribe_long_parser.add_argument(
+        "--work-dir",
+        type=str,
+        default=None,
+        help="Directory to store extracted chunk files",
+    )
+    transcribe_long_parser.add_argument(
+        "--keep-chunks",
+        action="store_true",
+        help="Keep extracted chunk files after the job completes",
+    )
+    transcribe_long_parser.add_argument("-o", "--output", type=str, default=None)
+    transcribe_long_parser.add_argument("--json", action="store_true")
+
 
 def run_from_args(args: argparse.Namespace) -> None:
-    with QSRClient(endpoint=args.endpoint, verbose=args.verbose) as client:
+    with QSRClient(
+        endpoint=args.endpoint,
+        verbose=args.verbose,
+        timeout_sec=getattr(args, "timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC),
+    ) as client:
         if args.client_action == "health":
             health = client.health()
             print(
@@ -1433,6 +1534,42 @@ def run_from_args(args: argparse.Namespace) -> None:
                     print(_dump_json(result.to_dict()))
                 else:
                     print(result.text)
+            return
+
+        if args.client_action == "transcribe-long":
+            transcriber = LongAudioTranscriber(
+                endpoint=client.endpoint,
+                config=LongAudioTranscriptionConfig(
+                    model=args.model,
+                    language=args.language,
+                    prompt=args.prompt,
+                    timeout_sec=getattr(
+                        args, "timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC
+                    ),
+                    target_chunk_sec=args.target_chunk_sec,
+                    min_chunk_sec=args.min_chunk_sec,
+                    max_chunk_sec=args.max_chunk_sec,
+                    overlap_sec=args.overlap_sec,
+                    search_window_sec=args.search_window_sec,
+                    min_silence_sec=args.min_silence_sec,
+                    silence_noise_db=args.silence_noise_db,
+                    idle_poll_interval_sec=args.idle_poll_interval_sec,
+                    max_parallel_chunks=args.max_parallel_chunks,
+                    max_chunk_retries=args.max_chunk_retries,
+                    keep_chunks=args.keep_chunks,
+                    work_dir=args.work_dir,
+                ),
+            )
+            result = transcriber.transcribe(args.audio)
+            payload = result.to_dict()
+            if args.output:
+                output_path = Path(args.output)
+                output_path.parent.mkdir(parents=True, exist_ok=True)
+                output_path.write_text(_dump_json(payload) + "\n")
+            if args.json:
+                print(_dump_json(payload))
+            else:
+                print(result.text)
             return
 
         raise ValueError(f"Unknown client action: {args.client_action}")

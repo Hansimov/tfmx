@@ -9,7 +9,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from tclogger import logger
 
-from .client import build_audio_messages
+from .client import DEFAULT_REQUEST_TIMEOUT_SEC, build_audio_messages
 from .clients_stats import QSRClientsWithStats
 
 
@@ -134,6 +134,7 @@ class QSRBenchmark:
         top_p: float = 1.0,
         measure_ttft: bool = True,
         verbose: bool = False,
+        timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC,
     ):
         self.endpoints = endpoints
         self.mode = mode
@@ -142,7 +143,12 @@ class QSRBenchmark:
         self.top_p = top_p
         self.measure_ttft = measure_ttft
         self.verbose = verbose
-        self.clients = QSRClientsWithStats(endpoints=endpoints, verbose=verbose)
+        self.timeout_sec = float(timeout_sec)
+        self.clients = QSRClientsWithStats(
+            endpoints=endpoints,
+            verbose=verbose,
+            timeout_sec=self.timeout_sec,
+        )
 
     def close(self) -> None:
         self.clients.close()
@@ -298,6 +304,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     subparsers = parser.add_subparsers(dest="benchmark_action", required=True)
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("-E", "--endpoints", nargs="+", required=False, default=[])
+    common.add_argument(
+        "--timeout-sec",
+        type=float,
+        default=DEFAULT_REQUEST_TIMEOUT_SEC,
+        help="HTTP timeout in seconds for per-request benchmark calls",
+    )
     common.add_argument("-v", "--verbose", action="store_true")
 
     health_parser = subparsers.add_parser(
@@ -343,6 +355,7 @@ def run_from_args(args: argparse.Namespace) -> None:
         top_p=getattr(args, "top_p", 1.0),
         measure_ttft=not getattr(args, "no_ttft", False),
         verbose=getattr(args, "verbose", False),
+        timeout_sec=getattr(args, "timeout_sec", DEFAULT_REQUEST_TIMEOUT_SEC),
     ) as benchmark:
         if args.benchmark_action == "health":
             benchmark.check_health()

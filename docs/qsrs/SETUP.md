@@ -136,12 +136,15 @@ qsr client models
 qsr client info
 qsr client transcribe ./sample.wav
 qsr client transcribe https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav --response-format text
+qsr client transcribe-long ./meeting.mp3 --target-chunk-sec 75 --max-parallel-chunks 5 --json
 qsr client chat --audio ./sample.wav "请转写为简体中文"
 ```
 
 说明：
 
 - `qsr client transcribe` 走的是 OpenAI 兼容 `/v1/audio/transcriptions`
+- `qsr client transcribe-long` 适合把单条长音频任务拆成多个短 chunk 并动态分发到多张空闲 GPU；它依赖本机 `ffmpeg/ffprobe`，默认按静音边界切段并保留少量重叠
+- 当前 `0.6B` backend 仍不支持 `verbose_json`，所以长音频模式目前使用重叠文本去重来拼接 chunk 结果
 - `qsr client chat` 走的是 OpenAI 兼容 `/v1/chat/completions`，并把音频封装为 `audio_url` 内容块
 - 音频输入可以是本地文件路径、HTTP/HTTPS URL，或 `data:` URI
 

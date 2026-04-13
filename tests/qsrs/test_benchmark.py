@@ -26,6 +26,15 @@ class TestQSRBenchmark:
         mock_clients.assert_called_once()
 
     @patch("tfmx.qsrs.benchmark.QSRClientsWithStats")
+    def test_init_passes_timeout(self, mock_clients):
+        QSRBenchmark(endpoints=["http://localhost:27900"], timeout_sec=360.0)
+        mock_clients.assert_called_once_with(
+            endpoints=["http://localhost:27900"],
+            verbose=False,
+            timeout_sec=360.0,
+        )
+
+    @patch("tfmx.qsrs.benchmark.QSRClientsWithStats")
     def test_check_health(self, mock_clients):
         client = MagicMock()
         client.health.return_value = MagicMock(

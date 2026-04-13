@@ -11,9 +11,14 @@ def _log(message: str, file=sys.stderr, **kwargs) -> None:
 
 
 class QSRClientsWithStats(_QSRClientsBase):
-    def __init__(self, endpoints: list[str], verbose: bool = True):
+    def __init__(
+        self,
+        endpoints: list[str],
+        verbose: bool = True,
+        timeout_sec: float = 120.0,
+    ):
         self._verbose = verbose
-        super().__init__(endpoints)
+        super().__init__(endpoints, timeout_sec=timeout_sec)
         self._pipeline = _QSRClientsPipeline(
             machine_scheduler=self.machine_scheduler,
             on_progress=self._on_progress,

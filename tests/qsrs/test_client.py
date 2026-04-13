@@ -103,6 +103,7 @@ class TestInfoResponse:
                         "name": "qsr--gpu0",
                         "endpoint": "http://localhost:27980",
                         "healthy": True,
+                        "sleeping": False,
                         "active_requests": 1,
                         "available_slots": 7,
                         "scheduler": {
@@ -123,6 +124,7 @@ class TestInfoResponse:
         assert info.port == 27900
         assert len(info.instances) == 1
         assert info.available_models == ["qwen3-asr-0.6b"]
+        assert info.instances[0].sleeping is False
         assert info.instances[0].scheduler.score == 0.42
         assert info.stats.total_wait_events == 2
 
@@ -133,6 +135,11 @@ class TestQSRClient:
         assert client.endpoint == "http://myhost:29999"
         assert client.chat_endpoint == "http://myhost:29999/v1/chat/completions"
         assert client.models_endpoint == "http://myhost:29999/v1/models"
+        client.close()
+
+    def test_custom_timeout_configures_http_client(self):
+        client = QSRClient(endpoint="http://localhost:27900", timeout_sec=360.0)
+        assert float(client.client.timeout.read) == 360.0
         client.close()
 
     def test_models_fallback_to_alias_endpoint(self):

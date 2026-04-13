@@ -8,6 +8,7 @@ from dataclasses import dataclass, field
 from typing import Callable, Optional
 
 from .client import AsyncQSRClient, ChatResponse, DEFAULT_MAX_TOKENS, QSRClient
+from .client import DEFAULT_REQUEST_TIMEOUT_SEC
 from .client import StreamChatResult, TranscriptionResponse, build_text_messages
 from .compose import MAX_NUM_SEQS
 from .performance import ExplorationConfig
@@ -340,14 +341,28 @@ class _QSRClientsPipeline:
 
 
 class _QSRClientsBase(ABC):
-    def __init__(self, endpoints: list[str]):
+    def __init__(
+        self,
+        endpoints: list[str],
+        timeout_sec: float = DEFAULT_REQUEST_TIMEOUT_SEC,
+    ):
         self.endpoints = [endpoint.rstrip("/") for endpoint in endpoints]
+        self.timeout_sec = float(timeout_sec)
         verbose = getattr(self, "_verbose", False)
         self.clients = [
-            QSRClient(endpoint=endpoint, verbose=verbose) for endpoint in self.endpoints
+            QSRClient(
+                endpoint=endpoint,
+                verbose=verbose,
+                timeout_sec=self.timeout_sec,
+            )
+            for endpoint in self.endpoints
         ]
         self.async_clients = [
-            AsyncQSRClient(endpoint=endpoint, verbose=verbose)
+            AsyncQSRClient(
+                endpoint=endpoint,
+                verbose=verbose,
+                timeout_sec=self.timeout_sec,
+            )
             for endpoint in self.endpoints
         ]
         self.machines = [
