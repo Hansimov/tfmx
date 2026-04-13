@@ -699,6 +699,21 @@ class TestLongAudioRepairHelpers:
 
         assert _targeted_edge_resplit_side(text) == "prefix"
 
+    def test_targeted_edge_resplit_side_detects_suffix_run_after_short_prefix(self):
+        prefix = "甲。乙。丙。丁。戊。己。庚。辛。壬。癸。子。丑。寅。卯。辰。巳。"
+        text = prefix + ("哦，" * 80) + "最后收个尾。"
+
+        assert _targeted_edge_resplit_side(text) == "suffix"
+
+    def test_targeted_edge_resplit_side_skips_suffix_run_after_tiny_prefix(self):
+        text = (
+            "前面这里有几句正常描述。然后大家还在继续聊。"
+            + ("哦，" * 80)
+            + "最后收个尾。"
+        )
+
+        assert _targeted_edge_resplit_side(text) is None
+
 
 class TestLongAudioTelemetry:
     def test_long_audio_result_includes_quality_fallback_summary(self):

@@ -57,6 +57,8 @@ _QUALITY_REPAIR_ACCEPT_MIN_NORMALIZED_CHARS = 96
 _QUALITY_REPAIR_ACCEPT_MAX_NORMALIZED_CHARS = 256
 _QUALITY_REPAIR_ACCEPT_CHARS_PER_SEC = 3.0
 _TARGETED_EDGE_RESPLIT_MAX_FRAGMENT_CHARS = 8
+_TARGETED_EDGE_RESPLIT_MAX_EDGE_SKIP_FRAGMENTS = 32
+_TARGETED_EDGE_RESPLIT_MIN_PREFIX_FRAGMENTS_FOR_SUFFIX = 16
 _TARGETED_EDGE_RESPLIT_MIN_RUN_COUNT = 32
 _TARGETED_EDGE_RESPLIT_MIN_COVERAGE = 0.45
 _QUALITY_SPLIT_MAX_DEPTH = 3
@@ -978,35 +980,53 @@ def _targeted_edge_resplit_side(text: str) -> str | None:
     if not fragments:
         return None
 
-    def edge_run(side: str) -> tuple[int, float]:
-        sequence = fragments if side == "prefix" else list(reversed(fragments))
-        fragment = sequence[0]
+    best_side: str | None = None
+    best_score = (0.0, 0, 0)
+    current_fragment = fragments[0]
+    current_start = 0
+    current_run = 1
+
+    def consider_run(fragment: str, start_index: int, run_count: int) -> None:
+        nonlocal best_side, best_score
         if not (
             _PATHOLOGICAL_REPETITION_MIN_FRAGMENT_CHARS
             <= len(fragment)
             <= _TARGETED_EDGE_RESPLIT_MAX_FRAGMENT_CHARS
         ):
-            return 0, 0.0
+            return
 
-        count = 0
-        for candidate in sequence:
-            if candidate != fragment:
-                break
-            count += 1
-        coverage = (count * len(fragment)) / len(normalized_text)
-        return count, coverage
-
-    best_side: str | None = None
-    best_score = (0.0, 0)
-    for side in ("prefix", "suffix"):
-        count, coverage = edge_run(side)
+        coverage = (run_count * len(fragment)) / len(normalized_text)
         if (
-            count >= _TARGETED_EDGE_RESPLIT_MIN_RUN_COUNT
-            and coverage >= _TARGETED_EDGE_RESPLIT_MIN_COVERAGE
-            and (coverage, count) > best_score
+            run_count < _TARGETED_EDGE_RESPLIT_MIN_RUN_COUNT
+            or coverage < _TARGETED_EDGE_RESPLIT_MIN_COVERAGE
         ):
-            best_side = side
-            best_score = (coverage, count)
+            return
+
+        suffix_skip = len(fragments) - (start_index + run_count)
+        candidate_sides: list[tuple[str, int]] = []
+        if start_index == 0:
+            candidate_sides.append(("prefix", start_index))
+        if (
+            suffix_skip <= _TARGETED_EDGE_RESPLIT_MAX_EDGE_SKIP_FRAGMENTS
+            and start_index >= _TARGETED_EDGE_RESPLIT_MIN_PREFIX_FRAGMENTS_FOR_SUFFIX
+        ):
+            candidate_sides.append(("suffix", suffix_skip))
+
+        for side, edge_skip in candidate_sides:
+            score = (coverage, run_count, -edge_skip)
+            if score > best_score:
+                best_side = side
+                best_score = score
+
+    for index in range(1, len(fragments) + 1):
+        if index < len(fragments) and fragments[index] == current_fragment:
+            current_run += 1
+            continue
+        consider_run(current_fragment, current_start, current_run)
+        if index < len(fragments):
+            current_fragment = fragments[index]
+            current_start = index
+            current_run = 1
     return best_side
 
 
