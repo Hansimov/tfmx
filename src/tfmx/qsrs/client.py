@@ -736,6 +736,7 @@ def _build_transcription_multipart_fields(
     response_format: str = "json",
     temperature: float | None = None,
     timestamp_granularities: list[str] | None = None,
+    extra_fields: dict[str, object] | None = None,
 ) -> list[tuple[str, object]]:
     files: list[tuple[str, object]] = []
 
@@ -756,6 +757,12 @@ def _build_transcription_multipart_fields(
         add_field("temperature", temperature)
     for item in timestamp_granularities or []:
         add_field("timestamp_granularities[]", item)
+    for key, value in (extra_fields or {}).items():
+        if isinstance(value, list):
+            for item in value:
+                add_field(key, item)
+            continue
+        add_field(key, value)
 
     files.append(("file", (filename, payload, mime_type)))
     return files
@@ -1067,6 +1074,7 @@ class QSRClient:
         response_format: str = "json",
         temperature: float | None = None,
         timestamp_granularities: list[str] | None = None,
+        extra_form_fields: dict[str, object] | None = None,
     ) -> TranscriptionResponse:
         resolved_model = self._resolve_model(model)
         filename, payload, mime_type = _load_audio_upload(audio)
@@ -1082,6 +1090,7 @@ class QSRClient:
                 response_format=response_format,
                 temperature=temperature,
                 timestamp_granularities=timestamp_granularities,
+                extra_fields=extra_form_fields,
             ),
         )
         response.raise_for_status()
@@ -1243,6 +1252,7 @@ class AsyncQSRClient:
         response_format: str = "json",
         temperature: float | None = None,
         timestamp_granularities: list[str] | None = None,
+        extra_form_fields: dict[str, object] | None = None,
     ) -> TranscriptionResponse:
         resolved_model = await self._resolve_model(model)
         filename, payload, mime_type = await asyncio.to_thread(
@@ -1260,6 +1270,7 @@ class AsyncQSRClient:
                 response_format=response_format,
                 temperature=temperature,
                 timestamp_granularities=timestamp_granularities,
+                extra_fields=extra_form_fields,
             ),
         )
         response.raise_for_status()
@@ -1275,11 +1286,145 @@ Examples:
   qsr client models
   qsr client info
   qsr client transcribe ./sample.wav
+  qsr client transcribe ./meeting.mp3 --long-audio-mode auto --json
     qsr client transcribe-long ./meeting.mp3 --json
   qsr client transcribe https://example.com/sample.wav --response-format text
   qsr client chat --audio ./sample.wav "请转写为简体中文"
   qsr client chat --audio ./sample.wav --no-stream --json
 """
+
+
+def _add_long_audio_args(
+    parser: argparse.ArgumentParser,
+    *,
+    include_mode: bool,
+    include_output: bool,
+    include_work_dir: bool,
+) -> None:
+    if include_mode:
+        parser.add_argument(
+            "--long-audio-mode",
+            choices=["off", "auto", "force"],
+            default="off",
+            help=(
+                "Offload silence-aware long-audio chunking to qsr machine; "
+                "requires a machine endpoint"
+            ),
+        )
+        parser.add_argument(
+            "--long-audio-min-duration-sec",
+            type=float,
+            default=120.0,
+            help="Minimum duration for --long-audio-mode auto before chunking is enabled",
+        )
+
+    parser.add_argument(
+        "--target-chunk-sec",
+        type=float,
+        default=60.0,
+        help="Target chunk length before silence-aware adjustment",
+    )
+    parser.add_argument(
+        "--min-chunk-sec",
+        type=float,
+        default=35.0,
+        help="Minimum chunk length",
+    )
+    parser.add_argument(
+        "--max-chunk-sec",
+        type=float,
+        default=90.0,
+        help="Maximum chunk length before forcing a cut",
+    )
+    parser.add_argument(
+        "--overlap-sec",
+        type=float,
+        default=4.0,
+        help="Chunk overlap in seconds to reduce transcript loss at boundaries",
+    )
+    parser.add_argument(
+        "--search-window-sec",
+        type=float,
+        default=12.0,
+        help="Silence search window around the target boundary",
+    )
+    parser.add_argument(
+        "--min-silence-sec",
+        type=float,
+        default=0.35,
+        help="Minimum silence duration used to propose chunk boundaries",
+    )
+    parser.add_argument(
+        "--silence-noise-db",
+        type=float,
+        default=-32.0,
+        help="Silence threshold in dB for ffmpeg silencedetect",
+    )
+    parser.add_argument(
+        "--idle-poll-interval-sec",
+        type=float,
+        default=1.0,
+        help="Polling interval while refreshing long-audio dispatch capacity",
+    )
+    parser.add_argument(
+        "--max-parallel-chunks",
+        type=int,
+        default=None,
+        help="Optional cap on total in-flight long-audio chunk requests",
+    )
+    parser.add_argument(
+        "--per-instance-parallelism-cap",
+        type=int,
+        default=3,
+        help="Soft cap on concurrently in-flight long-audio chunks per healthy backend instance",
+    )
+    parser.add_argument(
+        "--max-chunk-retries",
+        type=int,
+        default=2,
+        help="How many times to retry a failed chunk before aborting",
+    )
+
+    if include_work_dir:
+        parser.add_argument(
+            "--work-dir",
+            type=str,
+            default=None,
+            help="Directory to store extracted chunk files",
+        )
+        parser.add_argument(
+            "--keep-chunks",
+            action="store_true",
+            help="Keep extracted chunk files after the job completes",
+        )
+
+    if include_output:
+        parser.add_argument("-o", "--output", type=str, default=None)
+
+
+def _build_machine_long_audio_fields(
+    args: argparse.Namespace,
+) -> dict[str, object] | None:
+    mode = getattr(args, "long_audio_mode", "off")
+    if mode == "off":
+        return None
+    return {
+        "long_audio_mode": mode,
+        "long_audio_min_duration_sec": getattr(
+            args, "long_audio_min_duration_sec", 120.0
+        ),
+        "target_chunk_sec": args.target_chunk_sec,
+        "min_chunk_sec": args.min_chunk_sec,
+        "max_chunk_sec": args.max_chunk_sec,
+        "overlap_sec": args.overlap_sec,
+        "search_window_sec": args.search_window_sec,
+        "min_silence_sec": args.min_silence_sec,
+        "silence_noise_db": args.silence_noise_db,
+        "idle_poll_interval_sec": args.idle_poll_interval_sec,
+        "max_parallel_chunks": args.max_parallel_chunks,
+        "per_instance_parallelism_cap": args.per_instance_parallelism_cap,
+        "max_chunk_retries": args.max_chunk_retries,
+    }
 
 
 def configure_parser(parser: argparse.ArgumentParser) -> None:
@@ -1334,88 +1479,28 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     )
     transcribe_parser.add_argument("--temperature", type=float, default=None)
     transcribe_parser.add_argument("--timestamp-granularities", nargs="*", default=None)
+    _add_long_audio_args(
+        transcribe_parser,
+        include_mode=True,
+        include_output=False,
+        include_work_dir=False,
+    )
     transcribe_parser.add_argument("--json", action="store_true")
 
     transcribe_long_parser = subparsers.add_parser(
         "transcribe-long",
         parents=[common],
-        help="Split a long audio file into silence-aware chunks and schedule them across idle GPUs",
+        help="Split a long audio file into silence-aware chunks and schedule them across machine capacity",
     )
     transcribe_long_parser.add_argument("audio", help="Long audio file path")
     transcribe_long_parser.add_argument("--language", type=str, default=None)
     transcribe_long_parser.add_argument("--prompt", type=str, default=None)
-    transcribe_long_parser.add_argument(
-        "--target-chunk-sec",
-        type=float,
-        default=60.0,
-        help="Target chunk length before silence-aware adjustment",
+    _add_long_audio_args(
+        transcribe_long_parser,
+        include_mode=False,
+        include_output=True,
+        include_work_dir=True,
     )
-    transcribe_long_parser.add_argument(
-        "--min-chunk-sec",
-        type=float,
-        default=35.0,
-        help="Minimum chunk length",
-    )
-    transcribe_long_parser.add_argument(
-        "--max-chunk-sec",
-        type=float,
-        default=90.0,
-        help="Maximum chunk length before forcing a cut",
-    )
-    transcribe_long_parser.add_argument(
-        "--overlap-sec",
-        type=float,
-        default=4.0,
-        help="Chunk overlap in seconds to reduce transcript loss at boundaries",
-    )
-    transcribe_long_parser.add_argument(
-        "--search-window-sec",
-        type=float,
-        default=12.0,
-        help="Silence search window around the target boundary",
-    )
-    transcribe_long_parser.add_argument(
-        "--min-silence-sec",
-        type=float,
-        default=0.35,
-        help="Minimum silence duration used to propose chunk boundaries",
-    )
-    transcribe_long_parser.add_argument(
-        "--silence-noise-db",
-        type=float,
-        default=-32.0,
-        help="Silence threshold in dB for ffmpeg silencedetect",
-    )
-    transcribe_long_parser.add_argument(
-        "--idle-poll-interval-sec",
-        type=float,
-        default=1.0,
-        help="Polling interval when waiting for idle GPU instances",
-    )
-    transcribe_long_parser.add_argument(
-        "--max-parallel-chunks",
-        type=int,
-        default=None,
-        help="Optional cap on parallel chunk requests; defaults to healthy instance count",
-    )
-    transcribe_long_parser.add_argument(
-        "--max-chunk-retries",
-        type=int,
-        default=2,
-        help="How many times to retry a failed chunk before aborting",
-    )
-    transcribe_long_parser.add_argument(
-        "--work-dir",
-        type=str,
-        default=None,
-        help="Directory to store extracted chunk files",
-    )
-    transcribe_long_parser.add_argument(
-        "--keep-chunks",
-        action="store_true",
-        help="Keep extracted chunk files after the job completes",
-    )
-    transcribe_long_parser.add_argument("-o", "--output", type=str, default=None)
     transcribe_long_parser.add_argument("--json", action="store_true")
 
 
@@ -1517,6 +1602,15 @@ def run_from_args(args: argparse.Namespace) -> None:
             return
 
         if args.client_action == "transcribe":
+            extra_form_fields = _build_machine_long_audio_fields(args)
+            if extra_form_fields is not None:
+                try:
+                    client.info()
+                except Exception as exc:
+                    raise ValueError(
+                        "Machine-side long-audio mode requires a qsr machine endpoint; "
+                        "use qsr client transcribe-long for direct backend URLs"
+                    ) from exc
             multiple = len(args.audio) > 1
             for index, audio in enumerate(args.audio):
                 result = client.transcribe(
@@ -1527,6 +1621,7 @@ def run_from_args(args: argparse.Namespace) -> None:
                     response_format=args.response_format,
                     temperature=args.temperature,
                     timestamp_granularities=args.timestamp_granularities,
+                    extra_form_fields=extra_form_fields,
                 )
                 if multiple:
                     print(f"===== [{index + 1}/{len(args.audio)}] {audio} =====")
@@ -1555,6 +1650,7 @@ def run_from_args(args: argparse.Namespace) -> None:
                     silence_noise_db=args.silence_noise_db,
                     idle_poll_interval_sec=args.idle_poll_interval_sec,
                     max_parallel_chunks=args.max_parallel_chunks,
+                    per_instance_parallelism_cap=args.per_instance_parallelism_cap,
                     max_chunk_retries=args.max_chunk_retries,
                     keep_chunks=args.keep_chunks,
                     work_dir=args.work_dir,

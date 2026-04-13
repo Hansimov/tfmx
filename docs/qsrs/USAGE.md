@@ -124,6 +124,7 @@ qsr client health
 qsr client models
 qsr client info
 qsr client transcribe ./sample.wav
+qsr client transcribe ./meeting.mp3 --long-audio-mode auto --json
 qsr client transcribe ./sample.wav --response-format text
 qsr client transcribe-long ./meeting.mp3 --json
 qsr client chat --audio ./sample.wav "请转写为简体中文"
@@ -137,16 +138,19 @@ qsr client health -E "$QSR_MACHINE_URL"
 qsr client info -E "$QSR_MACHINE_URL"
 qsr client models -E "$QSR_BACKEND_A_URL"
 qsr client transcribe -E "$QSR_BACKEND_A_URL" ./sample.wav
-qsr client transcribe-long -E "$QSR_MACHINE_URL" ./meeting.mp3 --target-chunk-sec 75 --max-parallel-chunks 5 --json
+qsr client transcribe -E "$QSR_MACHINE_URL" ./meeting.mp3 --long-audio-mode force --target-chunk-sec 75 --json
+qsr client transcribe-long -E "$QSR_MACHINE_URL" ./meeting.mp3 --target-chunk-sec 75 --json
 qsr client chat -E "$QSR_BACKEND_A_URL" --audio ./sample.wav "请转写"
 ```
 
 ### 客户端说明
 
 - `qsr client transcribe` 支持本地文件、URL、`data:` URI
-- `qsr client transcribe-long` 面向单条长音频任务：先用 `ffmpeg/ffprobe` 探测时长与静音区间，再切成带少量重叠的短片段，随后按 chunk 时长从长到短排队，并根据 `qsr machine /info` 当前空闲实例数动态补充并发，尽量只占用空闲 GPU
+- `qsr client transcribe -E <machine> --long-audio-mode auto|force` 会把长音频拆分与调度下沉到 `qsr machine`；machine 侧同时暴露了 `POST /v1/audio/transcriptions/long` 与 `POST /audio/transcriptions/long` 两个显式入口
+- `qsr client transcribe-long` 面向单条长音频任务：先用 `ffmpeg/ffprobe` 探测时长与静音区间，再切成带少量重叠的短片段，随后按 chunk 时长从长到短排队，并根据 `qsr machine /info` 当前可调度槽位动态补充并发
 - 长音频模式不是简单等分；默认会优先在静音附近切段，并通过 `--overlap-sec` 降低边界漏字风险
-- 长音频模式默认把每个 chunk 发给 `qsr machine`，由 machine 继续做实例级路由；如果当前有 GPU 已在忙，它会等空闲实例出现后再补任务，而不是死板占满所有实例
+- 长音频模式默认启用更激进但受控的 slot-aware 调度：每张健康 GPU 默认最多并发 `3` 个 chunk，并且会先填满空闲实例，再利用剩余可用槽位继续补货
+- client-side 长音频现在按需并行提取 chunk，不再先串行切完整个文件再开始发请求
 - 当前 `Qwen3-ASR-0.6B` backend 不支持 `verbose_json`，所以长音频模式的最终拼接依赖重叠文本去重，而不是官方时间戳段落拼接
 - `qsr client transcribe-long` 依赖本机可用的 `ffmpeg` 和 `ffprobe`
 - `qsr client chat` 支持多段文本和多段音频，会按顺序交错组成一个 OpenAI multimodal message

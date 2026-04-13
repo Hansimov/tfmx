@@ -241,6 +241,10 @@ class TestQSRClient:
             audio=str(audio_path),
             response_format="json",
             timestamp_granularities=["segment", "word"],
+            extra_form_fields={
+                "long_audio_mode": "force",
+                "per_instance_parallelism_cap": 3,
+            },
         )
 
         assert response.text == "ok"
@@ -248,6 +252,9 @@ class TestQSRClient:
         assert b'name="model"' in captured["body"]
         assert b"qwen3-asr-0.6b" in captured["body"]
         assert b'name="timestamp_granularities[]"' in captured["body"]
+        assert b'name="long_audio_mode"' in captured["body"]
+        assert b"force" in captured["body"]
+        assert b'name="per_instance_parallelism_cap"' in captured["body"]
         assert b'filename="sample.wav"' in captured["body"]
         client.close()
 

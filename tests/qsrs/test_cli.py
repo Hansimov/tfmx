@@ -132,6 +132,26 @@ class TestQsrCliParser:
         assert args.audio == ["./sample.wav"]
         assert args.response_format == "text"
 
+    def test_client_parse_transcribe_machine_long_audio(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "client",
+                "transcribe",
+                "./meeting.mp3",
+                "--long-audio-mode",
+                "auto",
+                "--per-instance-parallelism-cap",
+                "3",
+                "--json",
+            ]
+        )
+        assert args.command == "client"
+        assert args.client_action == "transcribe"
+        assert args.long_audio_mode == "auto"
+        assert args.per_instance_parallelism_cap == 3
+        assert args.json is True
+
     def test_client_parse_transcribe_long(self):
         parser = build_parser()
         args = parser.parse_args(

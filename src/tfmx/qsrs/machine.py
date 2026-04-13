@@ -7,6 +7,7 @@ import re
 import signal
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -44,6 +45,7 @@ from .compose import SLEEP_CONTROL_TIMEOUT_SEC, SLEEP_WAKE_POLL_INTERVAL_SEC
 from .compose import load_backend_sleep_states, set_backend_sleep_states
 from .compose import get_display_shortcut, get_model_api_aliases
 from .compose import get_model_shortcut, normalize_model_key, parse_gpu_configs
+from .long_audio import LongAudioTranscriber, LongAudioTranscriptionConfig, probe_audio
 from .router import InstanceDescriptor, QSRRouter
 
 
@@ -59,6 +61,8 @@ BACKEND_STARTUP_TIMEOUT_SEC = 300.0
 BACKEND_STARTUP_POLL_INTERVAL_SEC = 1.0
 BACKEND_DISCOVERY_SETTLE_SEC = 2.0
 SCHEDULER_ALGORITHM = "least_active_idle"
+LONG_AUDIO_AUTO_MIN_DURATION_SEC = 120.0
+LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP = 3
 
 
 class TextContent(BaseModel):
@@ -1374,6 +1378,119 @@ class QSRMachineServer:
             finally:
                 await self._release_instance(instance)
 
+    @staticmethod
+    def _normalize_long_audio_mode(long_audio_mode: str | None) -> str:
+        normalized = (long_audio_mode or "off").strip().lower()
+        if normalized in {"", "off", "false", "0", "none"}:
+            return "off"
+        if normalized == "auto":
+            return "auto"
+        if normalized in {"force", "on", "true", "chunked"}:
+            return "force"
+        raise HTTPException(
+            status_code=400,
+            detail=("long_audio_mode must be one of: off, auto, force"),
+        )
+
+    def _local_machine_endpoint(self) -> str:
+        return f"http://127.0.0.1:{self.port}"
+
+    async def _forward_long_audio_transcription(
+        self,
+        *,
+        filename: str,
+        payload: bytes,
+        content_type: str,
+        model: str = "",
+        language: str | None = None,
+        prompt: str | None = None,
+        response_format: str = "json",
+        long_audio_mode: str = "auto",
+        long_audio_min_duration_sec: float = LONG_AUDIO_AUTO_MIN_DURATION_SEC,
+        target_chunk_sec: float = 60.0,
+        min_chunk_sec: float = 35.0,
+        max_chunk_sec: float = 90.0,
+        overlap_sec: float = 4.0,
+        search_window_sec: float = 12.0,
+        min_silence_sec: float = 0.35,
+        silence_noise_db: float = -32.0,
+        idle_poll_interval_sec: float = 1.0,
+        max_parallel_chunks: int | None = None,
+        per_instance_parallelism_cap: (
+            int | None
+        ) = LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP,
+        max_chunk_retries: int = 2,
+    ) -> Response | None:
+        mode = self._normalize_long_audio_mode(long_audio_mode)
+        if mode == "off":
+            return None
+        if response_format not in {"json", "verbose_json", "text"}:
+            raise HTTPException(
+                status_code=400,
+                detail=(
+                    "Machine long-audio mode currently supports response_format json, verbose_json, or text"
+                ),
+            )
+
+        suffix = Path(filename or "audio.wav").suffix or ".wav"
+        with tempfile.TemporaryDirectory(
+            prefix="qsr-machine-long-audio-"
+        ) as temp_dir_name:
+            temp_dir = Path(temp_dir_name)
+            input_path = temp_dir / f"input{suffix}"
+            input_path.write_bytes(payload)
+
+            try:
+                metadata = await asyncio.to_thread(probe_audio, str(input_path))
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Failed to inspect long-audio input: {exc}",
+                ) from exc
+
+            if mode == "auto" and metadata.duration_sec < long_audio_min_duration_sec:
+                return None
+
+            transcriber = LongAudioTranscriber(
+                endpoint=self._local_machine_endpoint(),
+                config=LongAudioTranscriptionConfig(
+                    model=model,
+                    language=language,
+                    prompt=prompt,
+                    timeout_sec=max(self.timeout, 300.0),
+                    target_chunk_sec=target_chunk_sec,
+                    min_chunk_sec=min_chunk_sec,
+                    max_chunk_sec=max_chunk_sec,
+                    overlap_sec=overlap_sec,
+                    search_window_sec=search_window_sec,
+                    min_silence_sec=min_silence_sec,
+                    silence_noise_db=silence_noise_db,
+                    idle_poll_interval_sec=idle_poll_interval_sec,
+                    max_parallel_chunks=max_parallel_chunks,
+                    per_instance_parallelism_cap=per_instance_parallelism_cap,
+                    max_chunk_retries=max_chunk_retries,
+                    keep_chunks=False,
+                    work_dir=str(temp_dir / "chunks"),
+                ),
+            )
+            result = await asyncio.to_thread(transcriber.transcribe, str(input_path))
+
+        if response_format == "text":
+            return Response(
+                content=result.text,
+                media_type="text/plain; charset=utf-8",
+            )
+
+        return JSONResponse(
+            content={
+                "text": result.text,
+                "language": result.language,
+                "duration": round(result.metadata.duration_sec, 3),
+                "segments": result.merged_segments,
+                "tfmx_long_audio": result.to_dict(),
+            }
+        )
+
     async def health(self) -> HealthResponse:
         healthy_instances = self.get_healthy_instances()
         payload = HealthResponse(
@@ -1488,8 +1605,49 @@ class QSRMachineServer:
         response_format: str = Form(default="json"),
         temperature: float | None = Form(default=None),
         timestamp_granularities: list[str] | None = Form(default=None),
+        long_audio_mode: str = Form(default="off"),
+        long_audio_min_duration_sec: float = Form(
+            default=LONG_AUDIO_AUTO_MIN_DURATION_SEC
+        ),
+        target_chunk_sec: float = Form(default=60.0),
+        min_chunk_sec: float = Form(default=35.0),
+        max_chunk_sec: float = Form(default=90.0),
+        overlap_sec: float = Form(default=4.0),
+        search_window_sec: float = Form(default=12.0),
+        min_silence_sec: float = Form(default=0.35),
+        silence_noise_db: float = Form(default=-32.0),
+        idle_poll_interval_sec: float = Form(default=1.0),
+        max_parallel_chunks: int | None = Form(default=None),
+        per_instance_parallelism_cap: int | None = Form(
+            default=LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP
+        ),
+        max_chunk_retries: int = Form(default=2),
     ) -> Response:
         payload = await file.read()
+        long_audio_response = await self._forward_long_audio_transcription(
+            filename=file.filename or "audio.wav",
+            payload=payload,
+            content_type=file.content_type or "audio/wav",
+            model=model,
+            language=language,
+            prompt=prompt,
+            response_format=response_format,
+            long_audio_mode=long_audio_mode,
+            long_audio_min_duration_sec=long_audio_min_duration_sec,
+            target_chunk_sec=target_chunk_sec,
+            min_chunk_sec=min_chunk_sec,
+            max_chunk_sec=max_chunk_sec,
+            overlap_sec=overlap_sec,
+            search_window_sec=search_window_sec,
+            min_silence_sec=min_silence_sec,
+            silence_noise_db=silence_noise_db,
+            idle_poll_interval_sec=idle_poll_interval_sec,
+            max_parallel_chunks=max_parallel_chunks,
+            per_instance_parallelism_cap=per_instance_parallelism_cap,
+            max_chunk_retries=max_chunk_retries,
+        )
+        if long_audio_response is not None:
+            return long_audio_response
         return await self._forward_transcription(
             filename=file.filename or "audio.wav",
             payload=payload,
@@ -1562,7 +1720,9 @@ class QSRMachineServer:
                 "- POST /v1/chat/completions: OpenAI-compatible chat API\n"
                 "- POST /chat/completions: OpenAI-compatible chat API alias\n"
                 "- POST /v1/audio/transcriptions: OpenAI-compatible transcription API\n"
+                "- POST /v1/audio/transcriptions/long: machine-native long-audio chunking API\n"
                 "- POST /audio/transcriptions: OpenAI-compatible transcription API alias\n"
+                "- POST /audio/transcriptions/long: machine-native long-audio chunking API alias\n"
                 "- GET /v1/models: list available models\n"
                 "- GET /models: list available models alias\n"
                 "- GET /health: instance health summary\n"
@@ -1657,6 +1817,23 @@ class QSRMachineServer:
             response_format: str = Form(default="json"),
             temperature: float | None = Form(default=None),
             timestamp_granularities: list[str] | None = Form(default=None),
+            long_audio_mode: str = Form(default="off"),
+            long_audio_min_duration_sec: float = Form(
+                default=LONG_AUDIO_AUTO_MIN_DURATION_SEC
+            ),
+            target_chunk_sec: float = Form(default=60.0),
+            min_chunk_sec: float = Form(default=35.0),
+            max_chunk_sec: float = Form(default=90.0),
+            overlap_sec: float = Form(default=4.0),
+            search_window_sec: float = Form(default=12.0),
+            min_silence_sec: float = Form(default=0.35),
+            silence_noise_db: float = Form(default=-32.0),
+            idle_poll_interval_sec: float = Form(default=1.0),
+            max_parallel_chunks: int | None = Form(default=None),
+            per_instance_parallelism_cap: int | None = Form(
+                default=LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP
+            ),
+            max_chunk_retries: int = Form(default=2),
         ):
             return await self.audio_transcriptions(
                 file=file,
@@ -1666,6 +1843,68 @@ class QSRMachineServer:
                 response_format=response_format,
                 temperature=temperature,
                 timestamp_granularities=timestamp_granularities,
+                long_audio_mode=long_audio_mode,
+                long_audio_min_duration_sec=long_audio_min_duration_sec,
+                target_chunk_sec=target_chunk_sec,
+                min_chunk_sec=min_chunk_sec,
+                max_chunk_sec=max_chunk_sec,
+                overlap_sec=overlap_sec,
+                search_window_sec=search_window_sec,
+                min_silence_sec=min_silence_sec,
+                silence_noise_db=silence_noise_db,
+                idle_poll_interval_sec=idle_poll_interval_sec,
+                max_parallel_chunks=max_parallel_chunks,
+                per_instance_parallelism_cap=per_instance_parallelism_cap,
+                max_chunk_retries=max_chunk_retries,
+            )
+
+        @app.post("/v1/audio/transcriptions/long")
+        async def audio_transcriptions_long_route(
+            file: UploadFile = File(...),
+            model: str = Form(default=""),
+            language: str | None = Form(default=None),
+            prompt: str | None = Form(default=None),
+            response_format: str = Form(default="json"),
+            temperature: float | None = Form(default=None),
+            timestamp_granularities: list[str] | None = Form(default=None),
+            long_audio_min_duration_sec: float = Form(
+                default=LONG_AUDIO_AUTO_MIN_DURATION_SEC
+            ),
+            target_chunk_sec: float = Form(default=60.0),
+            min_chunk_sec: float = Form(default=35.0),
+            max_chunk_sec: float = Form(default=90.0),
+            overlap_sec: float = Form(default=4.0),
+            search_window_sec: float = Form(default=12.0),
+            min_silence_sec: float = Form(default=0.35),
+            silence_noise_db: float = Form(default=-32.0),
+            idle_poll_interval_sec: float = Form(default=1.0),
+            max_parallel_chunks: int | None = Form(default=None),
+            per_instance_parallelism_cap: int | None = Form(
+                default=LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP
+            ),
+            max_chunk_retries: int = Form(default=2),
+        ):
+            return await self.audio_transcriptions(
+                file=file,
+                model=model,
+                language=language,
+                prompt=prompt,
+                response_format=response_format,
+                temperature=temperature,
+                timestamp_granularities=timestamp_granularities,
+                long_audio_mode="force",
+                long_audio_min_duration_sec=long_audio_min_duration_sec,
+                target_chunk_sec=target_chunk_sec,
+                min_chunk_sec=min_chunk_sec,
+                max_chunk_sec=max_chunk_sec,
+                overlap_sec=overlap_sec,
+                search_window_sec=search_window_sec,
+                min_silence_sec=min_silence_sec,
+                silence_noise_db=silence_noise_db,
+                idle_poll_interval_sec=idle_poll_interval_sec,
+                max_parallel_chunks=max_parallel_chunks,
+                per_instance_parallelism_cap=per_instance_parallelism_cap,
+                max_chunk_retries=max_chunk_retries,
             )
 
         @app.post("/audio/transcriptions")
@@ -1677,6 +1916,23 @@ class QSRMachineServer:
             response_format: str = Form(default="json"),
             temperature: float | None = Form(default=None),
             timestamp_granularities: list[str] | None = Form(default=None),
+            long_audio_mode: str = Form(default="off"),
+            long_audio_min_duration_sec: float = Form(
+                default=LONG_AUDIO_AUTO_MIN_DURATION_SEC
+            ),
+            target_chunk_sec: float = Form(default=60.0),
+            min_chunk_sec: float = Form(default=35.0),
+            max_chunk_sec: float = Form(default=90.0),
+            overlap_sec: float = Form(default=4.0),
+            search_window_sec: float = Form(default=12.0),
+            min_silence_sec: float = Form(default=0.35),
+            silence_noise_db: float = Form(default=-32.0),
+            idle_poll_interval_sec: float = Form(default=1.0),
+            max_parallel_chunks: int | None = Form(default=None),
+            per_instance_parallelism_cap: int | None = Form(
+                default=LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP
+            ),
+            max_chunk_retries: int = Form(default=2),
         ):
             return await self.audio_transcriptions(
                 file=file,
@@ -1686,6 +1942,68 @@ class QSRMachineServer:
                 response_format=response_format,
                 temperature=temperature,
                 timestamp_granularities=timestamp_granularities,
+                long_audio_mode=long_audio_mode,
+                long_audio_min_duration_sec=long_audio_min_duration_sec,
+                target_chunk_sec=target_chunk_sec,
+                min_chunk_sec=min_chunk_sec,
+                max_chunk_sec=max_chunk_sec,
+                overlap_sec=overlap_sec,
+                search_window_sec=search_window_sec,
+                min_silence_sec=min_silence_sec,
+                silence_noise_db=silence_noise_db,
+                idle_poll_interval_sec=idle_poll_interval_sec,
+                max_parallel_chunks=max_parallel_chunks,
+                per_instance_parallelism_cap=per_instance_parallelism_cap,
+                max_chunk_retries=max_chunk_retries,
+            )
+
+        @app.post("/audio/transcriptions/long")
+        async def audio_transcriptions_long_alias_route(
+            file: UploadFile = File(...),
+            model: str = Form(default=""),
+            language: str | None = Form(default=None),
+            prompt: str | None = Form(default=None),
+            response_format: str = Form(default="json"),
+            temperature: float | None = Form(default=None),
+            timestamp_granularities: list[str] | None = Form(default=None),
+            long_audio_min_duration_sec: float = Form(
+                default=LONG_AUDIO_AUTO_MIN_DURATION_SEC
+            ),
+            target_chunk_sec: float = Form(default=60.0),
+            min_chunk_sec: float = Form(default=35.0),
+            max_chunk_sec: float = Form(default=90.0),
+            overlap_sec: float = Form(default=4.0),
+            search_window_sec: float = Form(default=12.0),
+            min_silence_sec: float = Form(default=0.35),
+            silence_noise_db: float = Form(default=-32.0),
+            idle_poll_interval_sec: float = Form(default=1.0),
+            max_parallel_chunks: int | None = Form(default=None),
+            per_instance_parallelism_cap: int | None = Form(
+                default=LONG_AUDIO_PER_INSTANCE_PARALLELISM_CAP
+            ),
+            max_chunk_retries: int = Form(default=2),
+        ):
+            return await self.audio_transcriptions(
+                file=file,
+                model=model,
+                language=language,
+                prompt=prompt,
+                response_format=response_format,
+                temperature=temperature,
+                timestamp_granularities=timestamp_granularities,
+                long_audio_mode="force",
+                long_audio_min_duration_sec=long_audio_min_duration_sec,
+                target_chunk_sec=target_chunk_sec,
+                min_chunk_sec=min_chunk_sec,
+                max_chunk_sec=max_chunk_sec,
+                overlap_sec=overlap_sec,
+                search_window_sec=search_window_sec,
+                min_silence_sec=min_silence_sec,
+                silence_noise_db=silence_noise_db,
+                idle_poll_interval_sec=idle_poll_interval_sec,
+                max_parallel_chunks=max_parallel_chunks,
+                per_instance_parallelism_cap=per_instance_parallelism_cap,
+                max_chunk_retries=max_chunk_retries,
             )
 
         return app

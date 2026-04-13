@@ -1,11 +1,16 @@
 """Tests for tfmx.qsrs.machine."""
 
 import asyncio
+import io
 import orjson
 
 from fastapi.responses import JSONResponse
 from unittest.mock import AsyncMock, MagicMock, patch
 
+from starlette.datastructures import UploadFile
+
+from tfmx.qsrs.long_audio import AudioMetadata
+from tfmx.qsrs.long_audio import LongAudioTranscriptionResult
 from tfmx.qsrs.machine import ChatCompletionRequest
 from tfmx.qsrs.machine import ChatCompletionResponse
 from tfmx.qsrs.machine import QSRInstance
@@ -172,6 +177,8 @@ class TestQSRMachineServer:
         assert "/v1/chat/completions" in route_paths
         assert "/audio/transcriptions" in route_paths
         assert "/v1/audio/transcriptions" in route_paths
+        assert "/audio/transcriptions/long" in route_paths
+        assert "/v1/audio/transcriptions/long" in route_paths
 
     def test_check_instance_health_marks_sleeping_instance_unhealthy(self):
         instance = QSRInstance(
@@ -394,3 +401,94 @@ class TestQSRMachineServer:
         server._reset_transcription_client.assert_called_once_with(
             instance.transcription_url
         )
+
+    @patch("tfmx.qsrs.machine.probe_audio")
+    def test_forward_long_audio_transcription_auto_skips_short_input(
+        self,
+        mock_probe_audio,
+    ):
+        mock_probe_audio.return_value = AudioMetadata(
+            path="/tmp/input.wav",
+            duration_sec=30.0,
+        )
+        server = QSRMachineServer(instances=[])
+
+        response = asyncio.run(
+            server._forward_long_audio_transcription(
+                filename="sample.wav",
+                payload=b"RIFF1234WAVEfmt ",
+                content_type="audio/wav",
+                response_format="json",
+                long_audio_mode="auto",
+                long_audio_min_duration_sec=120.0,
+            )
+        )
+
+        assert response is None
+
+    @patch("tfmx.qsrs.machine.LongAudioTranscriber")
+    @patch("tfmx.qsrs.machine.probe_audio")
+    def test_forward_long_audio_transcription_returns_extended_json(
+        self,
+        mock_probe_audio,
+        mock_transcriber_cls,
+    ):
+        mock_probe_audio.return_value = AudioMetadata(
+            path="/tmp/input.wav",
+            duration_sec=360.0,
+        )
+        transcriber = MagicMock()
+        transcriber.transcribe.return_value = LongAudioTranscriptionResult(
+            audio="/tmp/input.wav",
+            metadata=AudioMetadata(path="/tmp/input.wav", duration_sec=360.0),
+            chunks=[],
+            silence_regions=[],
+            chunk_results=[],
+            total_time_sec=12.3,
+            max_parallel_chunks=10,
+            endpoint="http://127.0.0.1:27900",
+            machine_snapshot={"healthy_instances": 5},
+            text="甲乙丙丁",
+            language="zh",
+        )
+        mock_transcriber_cls.return_value = transcriber
+        server = QSRMachineServer(instances=[])
+
+        response = asyncio.run(
+            server._forward_long_audio_transcription(
+                filename="sample.wav",
+                payload=b"RIFF1234WAVEfmt ",
+                content_type="audio/wav",
+                response_format="json",
+                long_audio_mode="force",
+                per_instance_parallelism_cap=3,
+            )
+        )
+
+        assert isinstance(response, JSONResponse)
+        payload = orjson.loads(response.body)
+        assert payload["text"] == "甲乙丙丁"
+        assert payload["language"] == "zh"
+        assert payload["tfmx_long_audio"]["scheduling"]["max_parallel_chunks"] == 10
+        config = mock_transcriber_cls.call_args.kwargs["config"]
+        assert config.per_instance_parallelism_cap == 3
+
+    def test_audio_transcriptions_uses_machine_long_audio_mode(self):
+        server = QSRMachineServer(instances=[])
+        server._forward_long_audio_transcription = AsyncMock(
+            return_value=JSONResponse(content={"text": "ok"})
+        )
+        server._forward_transcription = AsyncMock()
+        upload = UploadFile(filename="sample.wav", file=io.BytesIO(b"RIFF1234WAVEfmt "))
+
+        response = asyncio.run(
+            server.audio_transcriptions(
+                file=upload,
+                response_format="json",
+                long_audio_mode="force",
+            )
+        )
+
+        assert isinstance(response, JSONResponse)
+        server._forward_long_audio_transcription.assert_awaited_once()
+        server._forward_transcription.assert_not_awaited()

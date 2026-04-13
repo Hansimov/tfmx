@@ -11,6 +11,7 @@ import time
 
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
+from difflib import SequenceMatcher
 from pathlib import Path
 from typing import TYPE_CHECKING, Optional
 
@@ -217,6 +218,7 @@ class LongAudioTranscriptionConfig:
     silence_noise_db: float = -32.0
     idle_poll_interval_sec: float = 1.0
     max_parallel_chunks: int | None = None
+    per_instance_parallelism_cap: int | None = 3
     max_chunk_retries: int = 2
     keep_chunks: bool = False
     work_dir: str | None = None
@@ -417,43 +419,100 @@ def plan_audio_chunks(
     return chunks
 
 
+def extract_audio_chunk(
+    audio_path: str,
+    chunk: AudioChunk,
+    *,
+    output_dir: str,
+) -> AudioChunk:
+    ffmpeg = _require_binary("ffmpeg")
+    output_root = Path(output_dir)
+    output_root.mkdir(parents=True, exist_ok=True)
+    chunk_path = output_root / f"chunk_{chunk.index:04d}.wav"
+    if chunk.output_path and Path(chunk.output_path).exists():
+        return chunk
+    duration_sec = max(0.01, chunk.duration_sec)
+    _run_command(
+        [
+            ffmpeg,
+            "-hide_banner",
+            "-loglevel",
+            "error",
+            "-y",
+            "-ss",
+            f"{chunk.start_sec:.3f}",
+            "-t",
+            f"{duration_sec:.3f}",
+            "-i",
+            str(Path(audio_path).expanduser().resolve()),
+            "-vn",
+            "-ac",
+            "1",
+            "-ar",
+            "16000",
+            "-c:a",
+            "pcm_s16le",
+            str(chunk_path),
+        ]
+    )
+    chunk.output_path = str(chunk_path)
+    return chunk
+
+
 def extract_audio_chunks(
     audio_path: str,
     chunks: list[AudioChunk],
     *,
     output_dir: str,
 ) -> list[AudioChunk]:
-    ffmpeg = _require_binary("ffmpeg")
-    output_root = Path(output_dir)
-    output_root.mkdir(parents=True, exist_ok=True)
     for chunk in chunks:
-        chunk_path = output_root / f"chunk_{chunk.index:04d}.wav"
-        duration_sec = max(0.01, chunk.duration_sec)
-        _run_command(
-            [
-                ffmpeg,
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                "-y",
-                "-ss",
-                f"{chunk.start_sec:.3f}",
-                "-t",
-                f"{duration_sec:.3f}",
-                "-i",
-                str(Path(audio_path).expanduser().resolve()),
-                "-vn",
-                "-ac",
-                "1",
-                "-ar",
-                "16000",
-                "-c:a",
-                "pcm_s16le",
-                str(chunk_path),
-            ]
-        )
-        chunk.output_path = str(chunk_path)
+        extract_audio_chunk(audio_path, chunk, output_dir=output_dir)
     return chunks
+
+
+def _normalize_boundary_text(text: str) -> tuple[str, list[int]]:
+    normalized_chars: list[str] = []
+    index_map: list[int] = []
+    for index, char in enumerate(text):
+        if not char.isalnum():
+            continue
+        normalized_chars.append(char.casefold())
+        index_map.append(index)
+    return "".join(normalized_chars), index_map
+
+
+def _find_normalized_overlap_cut(
+    left_text: str,
+    right_text: str,
+    *,
+    max_chars: int,
+) -> int | None:
+    left_normalized, _left_map = _normalize_boundary_text(left_text)
+    right_normalized, right_map = _normalize_boundary_text(right_text)
+    max_overlap = min(len(left_normalized), len(right_normalized), max_chars)
+    if max_overlap <= 0:
+        return None
+
+    for width in range(max_overlap, 0, -1):
+        if left_normalized[-width:] == right_normalized[:width]:
+            return right_map[width - 1] + 1
+
+    if max_overlap < 2:
+        return None
+
+    left_window = left_normalized[-max_overlap:]
+    right_window = right_normalized[:max_overlap]
+    match = SequenceMatcher(
+        None,
+        left_window,
+        right_window,
+        autojunk=False,
+    ).find_longest_match(0, len(left_window), 0, len(right_window))
+    if match.size < 2:
+        return None
+    if match.a + match.size != len(left_window) or match.b != 0:
+        return None
+    return right_map[match.size - 1] + 1
 
 
 def _strip_duplicate_boundary(left: str, right: str, *, max_chars: int = 64) -> str:
@@ -463,6 +522,13 @@ def _strip_duplicate_boundary(left: str, right: str, *, max_chars: int = 64) -> 
     for width in range(max_overlap, 0, -1):
         if left_text[-width:] == right_text[:width]:
             return left_text + right_text[width:]
+    normalized_cut = _find_normalized_overlap_cut(
+        left_text,
+        right_text,
+        max_chars=max_chars,
+    )
+    if normalized_cut is not None:
+        return left_text + right_text[normalized_cut:]
     return left_text + right_text
 
 
@@ -530,10 +596,50 @@ def count_idle_healthy_instances(info: "InfoResponse") -> int:
     )
 
 
-def machine_snapshot(info: "InfoResponse") -> dict:
+def count_available_healthy_slots(info: "InfoResponse") -> int:
+    return sum(
+        max(0, instance.available_slots)
+        for instance in info.instances
+        if instance.healthy and not getattr(instance, "sleeping", False)
+    )
+
+
+def count_schedulable_healthy_slots(
+    info: "InfoResponse",
+    *,
+    per_instance_parallelism_cap: int | None = None,
+) -> int:
+    total_slots = 0
+    for instance in info.instances:
+        if not instance.healthy or getattr(instance, "sleeping", False):
+            continue
+        available_slots = max(0, instance.available_slots)
+        if (
+            per_instance_parallelism_cap is not None
+            and per_instance_parallelism_cap > 0
+        ):
+            available_slots = min(
+                available_slots,
+                max(0, per_instance_parallelism_cap - max(0, instance.active_requests)),
+            )
+        total_slots += available_slots
+    return total_slots
+
+
+def machine_snapshot(
+    info: "InfoResponse",
+    *,
+    per_instance_parallelism_cap: int | None = None,
+) -> dict:
     return {
         "healthy_instances": sum(1 for instance in info.instances if instance.healthy),
         "idle_healthy_instances": count_idle_healthy_instances(info),
+        "available_healthy_slots": count_available_healthy_slots(info),
+        "schedulable_healthy_slots": count_schedulable_healthy_slots(
+            info,
+            per_instance_parallelism_cap=per_instance_parallelism_cap,
+        ),
+        "per_instance_parallelism_cap": per_instance_parallelism_cap,
         "instances": [
             {
                 "name": instance.name,
@@ -571,10 +677,13 @@ class LongAudioTranscriber:
 
     def _transcribe_chunk(
         self,
+        audio_path: str,
+        work_dir: str,
         chunk: AudioChunk,
         attempt: int,
     ) -> ChunkTranscriptionResult:
         started_at = time.perf_counter()
+        extract_audio_chunk(audio_path, chunk, output_dir=work_dir)
         from .client import QSRClient
 
         with QSRClient(
@@ -604,6 +713,20 @@ class LongAudioTranscriber:
             output_path=chunk.output_path,
         )
 
+    def _dispatch_capacity(self, info: "InfoResponse" | None) -> int:
+        if info is None:
+            return 1
+        healthy_instances = sum(
+            1
+            for instance in info.instances
+            if instance.healthy and not getattr(instance, "sleeping", False)
+        )
+        schedulable_slots = count_schedulable_healthy_slots(
+            info,
+            per_instance_parallelism_cap=self.config.per_instance_parallelism_cap,
+        )
+        return max(healthy_instances, schedulable_slots)
+
     def _effective_parallelism(
         self, info: "InfoResponse" | None, chunk_count: int
     ) -> int:
@@ -612,8 +735,7 @@ class LongAudioTranscriber:
             return min(configured, chunk_count)
         if info is None:
             return 1
-        healthy = max(1, sum(1 for instance in info.instances if instance.healthy))
-        return min(healthy, chunk_count)
+        return min(max(1, self._dispatch_capacity(info)), chunk_count)
 
     def transcribe(self, audio: str) -> LongAudioTranscriptionResult:
         metadata = probe_audio(audio)
@@ -642,8 +764,6 @@ class LongAudioTranscriber:
 
         started_at = time.perf_counter()
         try:
-            extract_audio_chunks(metadata.path, chunks, output_dir=str(work_dir))
-
             info = self._machine_info()
             effective_parallelism = self._effective_parallelism(info, len(chunks))
             pending = sorted(
@@ -659,24 +779,32 @@ class LongAudioTranscriber:
                 while pending or running:
                     if pending and len(running) < effective_parallelism:
                         latest_info = self._machine_info()
-                        idle_slots = (
-                            count_idle_healthy_instances(latest_info)
+                        dispatch_capacity = (
+                            min(
+                                effective_parallelism,
+                                self._dispatch_capacity(latest_info),
+                            )
                             if latest_info is not None
-                            else 1
+                            else effective_parallelism
                         )
                         allowed_new = max(
                             0,
                             min(
-                                effective_parallelism - len(running),
-                                idle_slots,
+                                dispatch_capacity - len(running),
                                 len(pending),
                             ),
                         )
+                        if allowed_new == 0 and not running and pending:
+                            allowed_new = 1
                         for _ in range(allowed_new):
                             chunk = pending.pop(0)
                             attempts[chunk.index] += 1
                             future = executor.submit(
-                                self._transcribe_chunk, chunk, attempts[chunk.index]
+                                self._transcribe_chunk,
+                                metadata.path,
+                                str(work_dir),
+                                chunk,
+                                attempts[chunk.index],
                             )
                             running[future] = (chunk, attempts[chunk.index])
 
@@ -712,7 +840,14 @@ class LongAudioTranscriber:
             merged_text, language, merged_segments = merge_transcribed_chunks(
                 chunks, results
             )
-            snapshot = machine_snapshot(info) if info is not None else None
+            snapshot = (
+                machine_snapshot(
+                    info,
+                    per_instance_parallelism_cap=self.config.per_instance_parallelism_cap,
+                )
+                if info is not None
+                else None
+            )
             return LongAudioTranscriptionResult(
                 audio=metadata.path,
                 metadata=metadata,
