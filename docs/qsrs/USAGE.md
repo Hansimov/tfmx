@@ -24,6 +24,7 @@ qsr compose warmup --gpu-layout uniform -g 0,1
 qsr compose wake --wait-healthy
 qsr compose sleep --sleep-level 1 --sleep-mode abort
 qsr compose sleep-status
+python debugs/qsrs/profile_startup.py qsr-uniform--gpu0 qsr-uniform--gpu1
 qsr compose up --gpu-configs "0,2"
 qsr compose up --gpu-configs "0:Qwen/Qwen3-ASR-0.6B,1:Qwen/Qwen3-ASR-0.6B"
 qsr compose generate -j qsr-demo --gpu-configs "0"
@@ -50,6 +51,7 @@ qsr compose down
 - `compose warmup --audio`：对运行中的 backend 发起一次短转写预热；未提供时自动使用内置 WAV
 - `compose warmup --wait-timeout/--request-timeout`：控制 warmup 前健康等待和单 backend 请求超时
 - `compose sleep` / `compose wake --wait-healthy`：把已部署 backend 切到 vLLM sleep 模式，再以明显低于 cold start 的代价恢复
+- `debugs/qsrs/profile_startup.py`：进一步解析 backend docker 日志，把内部冷启动拆成 model load、torch.compile、KV cache、graph capture、server start 等阶段
 
 ### 行为说明
 
@@ -170,6 +172,7 @@ bash runs/qsrs/02_start_machine.sh
 bash runs/qsrs/03_health_check.sh
 bash runs/qsrs/04_benchmark.sh
 bash runs/qsrs/05_test_scheduling.sh
+bash runs/qsrs/06_soak_mixed.sh
 bash runs/qsrs/98_sleep_backends.sh
 ```
 
@@ -177,6 +180,7 @@ bash runs/qsrs/98_sleep_backends.sh
 - 若想只跑子集，可先导出 `QSR_DEPLOY_GPUS=0,1`
 - staged workflow 现在默认就会启用 sleep mode 并优先走 wake-first；若你需要退回旧的 cold-start-only 行为，请导出 `QSR_ENABLE_SLEEP_MODE=0`
 - 若想让 staged deploy 额外打印 cold-start phase profile，请导出 `QSR_PROFILE_STARTUP=1`
+- 若想跑混合 chat/transcribe 长压，可用 `bash runs/qsrs/06_soak_mixed.sh`，并通过 `QSR_SOAK_*` 环境变量覆盖样本数、音频和并发度
 - 更多分步说明见 `runs/qsrs/README.md`
 
 ## Python API

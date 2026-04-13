@@ -178,6 +178,7 @@ bash runs/qsrs/01_deploy_default.sh
 bash runs/qsrs/02_start_machine.sh
 bash runs/qsrs/03_health_check.sh
 bash runs/qsrs/04_benchmark.sh
+bash runs/qsrs/06_soak_mixed.sh
 ```
 
 repo 内置 staged workflow 现在默认就会启用 sleep mode 并优先走 wake-first；如果你想保留旧的 cold-start-only 行为：
@@ -192,5 +193,13 @@ export QSR_ENABLE_SLEEP_MODE=0
 export QSR_PROFILE_STARTUP=1
 bash runs/qsrs/01_deploy_default.sh
 ```
+
+如果你想继续往 backend 内部阶段深挖，而不是只看 compose 层时间：
+
+```bash
+python debugs/qsrs/profile_startup.py qsr-uniform--gpu0 qsr-uniform--gpu1
+```
+
+它会从 docker logs 中解析 model load、torch.compile、KV cache、graph capture、server start、first health 等阶段时间。
 
 更多 staged workflow 见 `runs/qsrs/README.md`。

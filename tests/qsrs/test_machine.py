@@ -325,3 +325,32 @@ class TestQSRMachineServer:
 
         server._probe_instance_http_health.assert_awaited_once_with(instance)
         server._mark_instance_unhealthy.assert_not_called()
+
+    def test_handle_retryable_upstream_status_preserves_healthy_backend(self):
+        instance = QSRInstance(
+            container_name="qsr-multi--gpu0",
+            host="localhost",
+            port=27980,
+            gpu_id=0,
+            healthy=True,
+        )
+        server = QSRMachineServer(instances=[instance])
+        server._request_instance_maintenance = AsyncMock(return_value=True)
+        server._probe_instance_http_health = AsyncMock(return_value=True)
+        server._mark_instance_unhealthy = MagicMock()
+
+        asyncio.run(
+            server._handle_retryable_upstream_status(
+                instance,
+                status_code=500,
+                detail={"message": "Internal server error"},
+                reset_mm_cache=True,
+            )
+        )
+
+        server._request_instance_maintenance.assert_awaited_once_with(
+            instance,
+            "/reset_mm_cache",
+        )
+        server._probe_instance_http_health.assert_awaited_once_with(instance)
+        server._mark_instance_unhealthy.assert_not_called()

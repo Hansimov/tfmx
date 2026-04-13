@@ -1009,6 +1009,35 @@ class QSRMachineServer:
         instance._latency_ms = 0.0
         return True
 
+    async def _request_instance_maintenance(
+        self,
+        instance: QSRInstance,
+        route: str,
+    ) -> bool:
+        if self._client is None:
+            self._client = httpx.AsyncClient(timeout=httpx.Timeout(self.timeout))
+        try:
+            response = await self._client.post(
+                f"{instance.endpoint}{route}",
+                timeout=httpx.Timeout(SLEEP_CONTROL_TIMEOUT_SEC),
+            )
+        except Exception as exc:
+            logger.warn(
+                f"[qsr_machine] Maintenance request failed for {instance.container_name} {route}: {exc}"
+            )
+            return False
+
+        if response.status_code == 200:
+            logger.note(
+                f"[qsr_machine] Requested backend maintenance {route} for {instance.container_name}"
+            )
+            return True
+        if response.status_code != 404:
+            logger.warn(
+                f"[qsr_machine] Maintenance request failed for {instance.container_name} {route}: HTTP {response.status_code}"
+            )
+        return False
+
     async def _handle_retryable_instance_error(
         self,
         instance: QSRInstance,
@@ -1025,6 +1054,24 @@ class QSRMachineServer:
             )
             return
         self._mark_instance_unhealthy(instance, exc)
+
+    async def _handle_retryable_upstream_status(
+        self,
+        instance: QSRInstance,
+        *,
+        status_code: int,
+        detail: object,
+        reset_mm_cache: bool = False,
+    ) -> None:
+        instance.last_error = str(detail)
+        if reset_mm_cache:
+            await self._request_instance_maintenance(instance, "/reset_mm_cache")
+        if await self._probe_instance_http_health(instance):
+            logger.note(
+                f"[qsr_machine] Preserving healthy backend after upstream HTTP {status_code}: {instance.container_name}"
+            )
+            return
+        self._mark_instance_unhealthy(instance, detail)
 
     def _post_transcription_sync(
         self,
@@ -1060,7 +1107,12 @@ class QSRMachineServer:
                     if self._is_retryable_upstream_status(response.status_code):
                         excluded_instances.add(instance.container_name)
                         self.stats.total_failovers += 1
-                        self._mark_instance_unhealthy(instance, detail)
+                        await self._handle_retryable_upstream_status(
+                            instance,
+                            status_code=response.status_code,
+                            detail=detail,
+                            reset_mm_cache=response.status_code == 500,
+                        )
                         last_exc = HTTPException(
                             status_code=response.status_code,
                             detail=detail,
@@ -1141,7 +1193,12 @@ class QSRMachineServer:
                             if self._is_retryable_upstream_status(response.status_code):
                                 excluded_instances.add(instance.container_name)
                                 self.stats.total_failovers += 1
-                                self._mark_instance_unhealthy(instance, detail)
+                                await self._handle_retryable_upstream_status(
+                                    instance,
+                                    status_code=response.status_code,
+                                    detail=detail,
+                                    reset_mm_cache=response.status_code == 500,
+                                )
                                 continue
                             self.stats.total_errors += 1
                             yield self._build_stream_error_chunk(
@@ -1225,7 +1282,12 @@ class QSRMachineServer:
                     if self._is_retryable_upstream_status(response.status_code):
                         excluded_instances.add(instance.container_name)
                         self.stats.total_failovers += 1
-                        self._mark_instance_unhealthy(instance, detail)
+                        await self._handle_retryable_upstream_status(
+                            instance,
+                            status_code=response.status_code,
+                            detail=detail,
+                            reset_mm_cache=response.status_code == 500,
+                        )
                         continue
                     self.stats.total_errors += 1
                     raise HTTPException(status_code=response.status_code, detail=detail)
