@@ -5,6 +5,7 @@ from unittest.mock import patch
 import httpx
 
 from tfmx.qsrs.long_audio import AudioChunk
+from tfmx.qsrs.long_audio import ChunkRequestPlan
 from tfmx.qsrs.client import InfoResponse
 from tfmx.qsrs.long_audio import ChunkTranscriptionResult
 from tfmx.qsrs.long_audio import LongAudioTranscriber
@@ -358,3 +359,186 @@ class TestLongAudioResponseFormat:
 
         assert request_plan.response_format == "verbose_json"
         assert resolved_probe_result is probe_result
+
+
+class TestLongAudioQualityFallback:
+    def test_transcribe_chunk_splits_pathologically_repetitive_output(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
+        chunk = AudioChunk(
+            index=7,
+            start_sec=100.0,
+            end_sec=142.0,
+            keep_start_sec=100.0,
+            keep_end_sec=142.0,
+        )
+
+        def side_effect(
+            audio_path: str,
+            work_dir: str,
+            requested_chunk: AudioChunk,
+            attempt: int,
+            request_plan: ChunkRequestPlan,
+        ) -> ChunkTranscriptionResult:
+            del audio_path
+            del work_dir
+            del request_plan
+            if requested_chunk.start_sec == 100.0 and requested_chunk.end_sec == 142.0:
+                return ChunkTranscriptionResult(
+                    chunk_index=requested_chunk.index,
+                    start_sec=requested_chunk.start_sec,
+                    end_sec=requested_chunk.end_sec,
+                    keep_start_sec=requested_chunk.keep_start_sec,
+                    keep_end_sec=requested_chunk.keep_end_sec,
+                    latency_sec=0.5,
+                    attempt=attempt,
+                    text=("九十年代，我们是被苏联的猎人。" * 12).strip(),
+                    language="zh",
+                    duration_sec=requested_chunk.duration_sec,
+                )
+            if requested_chunk.keep_start_sec <= 100.0:
+                text = "前半段。"
+            else:
+                text = "后半段。"
+            return ChunkTranscriptionResult(
+                chunk_index=requested_chunk.index,
+                start_sec=requested_chunk.start_sec,
+                end_sec=requested_chunk.end_sec,
+                keep_start_sec=requested_chunk.keep_start_sec,
+                keep_end_sec=requested_chunk.keep_end_sec,
+                latency_sec=0.5,
+                attempt=attempt,
+                text=text,
+                language="zh",
+                duration_sec=requested_chunk.duration_sec,
+            )
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            side_effect=side_effect,
+        ) as mock_transcribe:
+            result = transcriber._transcribe_chunk(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+                1,
+                ChunkRequestPlan(),
+            )
+
+        assert result.text == "前半段。后半段。"
+        assert result.language == "zh"
+        assert mock_transcribe.call_count == 3
+
+    def test_transcribe_chunk_collapses_repetition_when_split_is_exhausted(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
+        chunk = AudioChunk(
+            index=8,
+            start_sec=200.0,
+            end_sec=212.0,
+            keep_start_sec=200.0,
+            keep_end_sec=212.0,
+        )
+        repetitive_text = ("九十年代，我们是被苏联的猎人。" * 12).strip()
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            return_value=ChunkTranscriptionResult(
+                chunk_index=chunk.index,
+                start_sec=chunk.start_sec,
+                end_sec=chunk.end_sec,
+                keep_start_sec=chunk.keep_start_sec,
+                keep_end_sec=chunk.keep_end_sec,
+                latency_sec=0.5,
+                attempt=1,
+                text=repetitive_text,
+                language="zh",
+                duration_sec=chunk.duration_sec,
+            ),
+        ):
+            result = transcriber._transcribe_chunk(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+                1,
+                ChunkRequestPlan(),
+            )
+
+        assert result.text == "九十年代，我们是被苏联的猎人。"
+        assert result.language == "zh"
+
+    def test_transcribe_chunk_collapses_ascii_sentence_repetition(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
+        chunk = AudioChunk(
+            index=9,
+            start_sec=300.0,
+            end_sec=312.0,
+            keep_start_sec=300.0,
+            keep_end_sec=312.0,
+        )
+        repetitive_text = ("To bylo prilis jasne. " * 12).strip()
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            return_value=ChunkTranscriptionResult(
+                chunk_index=chunk.index,
+                start_sec=chunk.start_sec,
+                end_sec=chunk.end_sec,
+                keep_start_sec=chunk.keep_start_sec,
+                keep_end_sec=chunk.keep_end_sec,
+                latency_sec=0.5,
+                attempt=1,
+                text=repetitive_text,
+                language="cs",
+                duration_sec=chunk.duration_sec,
+            ),
+        ):
+            result = transcriber._transcribe_chunk(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+                1,
+                ChunkRequestPlan(),
+            )
+
+        assert result.text == "To bylo prilis jasne."
+        assert result.language == "cs"
+
+    def test_transcribe_chunk_collapses_repeated_word_runs(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27900")
+        chunk = AudioChunk(
+            index=10,
+            start_sec=400.0,
+            end_sec=412.0,
+            keep_start_sec=400.0,
+            keep_end_sec=412.0,
+        )
+        repetitive_text = ("ја " * 64).strip()
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            return_value=ChunkTranscriptionResult(
+                chunk_index=chunk.index,
+                start_sec=chunk.start_sec,
+                end_sec=chunk.end_sec,
+                keep_start_sec=chunk.keep_start_sec,
+                keep_end_sec=chunk.keep_end_sec,
+                latency_sec=0.5,
+                attempt=1,
+                text=repetitive_text,
+                language="sr",
+                duration_sec=chunk.duration_sec,
+            ),
+        ):
+            result = transcriber._transcribe_chunk(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+                1,
+                ChunkRequestPlan(),
+            )
+
+        assert result.text == "ја"
+        assert result.language == "sr"

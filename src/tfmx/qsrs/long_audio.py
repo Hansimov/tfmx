@@ -10,6 +10,7 @@ import subprocess
 import tempfile
 import time
 
+from collections import Counter
 from concurrent.futures import FIRST_COMPLETED, Future, ThreadPoolExecutor, wait
 from dataclasses import dataclass, field
 from difflib import SequenceMatcher
@@ -30,6 +31,7 @@ FFMPEG_REQUIRED_MESSAGE = (
 _SILENCE_START_TOKEN = "silence_start:"
 _SILENCE_END_TOKEN = "silence_end:"
 _BOUNDARY_DELIMITERS = frozenset("。！？!?；;\n")
+_REPETITION_DELIMITERS = frozenset(".。！？!?；;，,\n")
 _SIMILAR_BOUNDARY_MIN_CHARS = 12
 _SIMILAR_BOUNDARY_MIN_RATIO = 0.82
 _SIMILAR_BOUNDARY_MAX_FRAGMENTS = 2
@@ -37,6 +39,23 @@ _SIMILAR_BOUNDARY_MAX_PREFIX_SKIP = 1
 _SIMILAR_BOUNDARY_MAX_PREFIX_SKIP_CHARS = 10
 _FUZZY_NORMALIZED_OVERLAP_MIN_CHARS = 18
 _FUZZY_NORMALIZED_OVERLAP_MIN_RATIO = 0.9
+_PATHOLOGICAL_REPETITION_MIN_TOTAL_CHARS = 64
+_PATHOLOGICAL_REPETITION_MIN_FRAGMENT_CHARS = 1
+_PATHOLOGICAL_REPETITION_MAX_FRAGMENT_CHARS = 80
+_PATHOLOGICAL_REPETITION_MIN_OCCURRENCES = 8
+_PATHOLOGICAL_REPETITION_MIN_COVERAGE = 0.33
+_PATHOLOGICAL_REPETITION_MIN_CONSECUTIVE = 4
+_PATHOLOGICAL_REPETITION_MIN_CONSECUTIVE_COVERAGE = 0.2
+_PATHOLOGICAL_REPETITION_MIN_TOKEN_CHARS = 1
+_PATHOLOGICAL_REPETITION_MAX_TOKEN_CHARS = 24
+_PATHOLOGICAL_REPETITION_MIN_TOKEN_OCCURRENCES = 16
+_PATHOLOGICAL_REPETITION_MIN_TOKEN_COVERAGE = 0.18
+_PATHOLOGICAL_REPETITION_MIN_TOKEN_CONSECUTIVE = 8
+_PATHOLOGICAL_REPETITION_MIN_TOKEN_CONSECUTIVE_COVERAGE = 0.12
+_QUALITY_REPAIR_MAX_PASSES = 4
+_QUALITY_SPLIT_MAX_DEPTH = 3
+_QUALITY_SPLIT_MIN_CHILD_SEC = 8.0
+_QUALITY_SPLIT_OVERLAP_SEC = 1.5
 _VERBOSE_JSON_CAPABILITY_CACHE: dict[str, bool] = {}
 _VERBOSE_JSON_CAPABILITY_LOCK = threading.Lock()
 
@@ -513,15 +532,19 @@ def _normalize_boundary_text(text: str) -> tuple[str, list[int]]:
     return "".join(normalized_chars), index_map
 
 
-def _split_boundary_fragments(text: str) -> list[tuple[int, int, str]]:
+def _split_text_fragments(
+    text: str,
+    *,
+    delimiters: frozenset[str],
+) -> list[tuple[int, int, str]]:
     fragments: list[tuple[int, int, str]] = []
     start = 0
     index = 0
 
     while index < len(text):
-        if text[index] in _BOUNDARY_DELIMITERS:
+        if text[index] in delimiters:
             end = index + 1
-            while end < len(text) and text[end] in _BOUNDARY_DELIMITERS:
+            while end < len(text) and text[end] in delimiters:
                 end += 1
             fragment = text[start:end].strip()
             if fragment:
@@ -537,6 +560,261 @@ def _split_boundary_fragments(text: str) -> list[tuple[int, int, str]]:
     if tail_fragment:
         fragments.append((start, len(text), tail_fragment))
     return fragments
+
+
+def _split_boundary_fragments(text: str) -> list[tuple[int, int, str]]:
+    return _split_text_fragments(text, delimiters=_BOUNDARY_DELIMITERS)
+
+
+def _split_word_tokens(text: str) -> list[str]:
+    tokens: list[str] = []
+    current: list[str] = []
+
+    for char in text:
+        if char.isalnum():
+            current.append(char.casefold())
+            continue
+        if current:
+            tokens.append("".join(current))
+            current = []
+
+    if current:
+        tokens.append("".join(current))
+    return tokens
+
+
+def _has_pathological_repetition(text: str) -> bool:
+    normalized_text, _ = _normalize_boundary_text(text)
+    if len(normalized_text) < _PATHOLOGICAL_REPETITION_MIN_TOTAL_CHARS:
+        return False
+
+    fragment_counts: Counter[str] = Counter()
+    fragment_runs: dict[str, int] = {}
+    previous_fragment = ""
+    current_run = 0
+
+    for _start, _end, fragment in _split_text_fragments(
+        text,
+        delimiters=_REPETITION_DELIMITERS,
+    ):
+        normalized_fragment, _ = _normalize_boundary_text(fragment)
+        if not (
+            _PATHOLOGICAL_REPETITION_MIN_FRAGMENT_CHARS
+            <= len(normalized_fragment)
+            <= _PATHOLOGICAL_REPETITION_MAX_FRAGMENT_CHARS
+        ):
+            if previous_fragment:
+                fragment_runs[previous_fragment] = max(
+                    fragment_runs.get(previous_fragment, 0),
+                    current_run,
+                )
+            previous_fragment = ""
+            current_run = 0
+            continue
+
+        fragment_counts[normalized_fragment] += 1
+        if normalized_fragment == previous_fragment:
+            current_run += 1
+        else:
+            if previous_fragment:
+                fragment_runs[previous_fragment] = max(
+                    fragment_runs.get(previous_fragment, 0),
+                    current_run,
+                )
+            previous_fragment = normalized_fragment
+            current_run = 1
+
+    if previous_fragment:
+        fragment_runs[previous_fragment] = max(
+            fragment_runs.get(previous_fragment, 0),
+            current_run,
+        )
+
+    total_chars = len(normalized_text)
+    for fragment, count in fragment_counts.items():
+        coverage = (count * len(fragment)) / total_chars
+        if (
+            count >= _PATHOLOGICAL_REPETITION_MIN_OCCURRENCES
+            and coverage >= _PATHOLOGICAL_REPETITION_MIN_COVERAGE
+        ):
+            return True
+        if (
+            fragment_runs.get(fragment, 0) >= _PATHOLOGICAL_REPETITION_MIN_CONSECUTIVE
+            and coverage >= _PATHOLOGICAL_REPETITION_MIN_CONSECUTIVE_COVERAGE
+        ):
+            return True
+
+    token_counts: Counter[str] = Counter()
+    token_runs: dict[str, int] = {}
+    previous_token = ""
+    current_run = 0
+    for token in _split_word_tokens(text):
+        if not (
+            _PATHOLOGICAL_REPETITION_MIN_TOKEN_CHARS
+            <= len(token)
+            <= _PATHOLOGICAL_REPETITION_MAX_TOKEN_CHARS
+        ):
+            if previous_token:
+                token_runs[previous_token] = max(
+                    token_runs.get(previous_token, 0),
+                    current_run,
+                )
+            previous_token = ""
+            current_run = 0
+            continue
+
+        token_counts[token] += 1
+        if token == previous_token:
+            current_run += 1
+        else:
+            if previous_token:
+                token_runs[previous_token] = max(
+                    token_runs.get(previous_token, 0),
+                    current_run,
+                )
+            previous_token = token
+            current_run = 1
+
+    if previous_token:
+        token_runs[previous_token] = max(
+            token_runs.get(previous_token, 0),
+            current_run,
+        )
+
+    for token, count in token_counts.items():
+        coverage = (count * len(token)) / total_chars
+        if (
+            count >= _PATHOLOGICAL_REPETITION_MIN_TOKEN_OCCURRENCES
+            and coverage >= _PATHOLOGICAL_REPETITION_MIN_TOKEN_COVERAGE
+        ):
+            return True
+        if (
+            token_runs.get(token, 0) >= _PATHOLOGICAL_REPETITION_MIN_TOKEN_CONSECUTIVE
+            and coverage >= _PATHOLOGICAL_REPETITION_MIN_TOKEN_CONSECUTIVE_COVERAGE
+        ):
+            return True
+    return False
+
+
+def _are_similar_repetition_fragments(left: str, right: str) -> bool:
+    if not left or not right:
+        return False
+    shorter = min(len(left), len(right))
+    longer = max(len(left), len(right))
+    if shorter / longer < 0.65:
+        return False
+    if left == right or left.endswith(right) or right.endswith(left):
+        return True
+    return (
+        SequenceMatcher(
+            None,
+            left,
+            right,
+            autojunk=False,
+        ).ratio()
+        >= _SIMILAR_BOUNDARY_MIN_RATIO
+    )
+
+
+def _collapse_repeated_word_runs(text: str) -> str:
+    words = text.split()
+    if len(words) < 4:
+        return text
+
+    collapsed: list[str] = []
+    previous_word = ""
+    for word in words:
+        normalized_word, _ = _normalize_boundary_text(word)
+        if normalized_word and normalized_word == previous_word:
+            continue
+        collapsed.append(word)
+        previous_word = normalized_word
+    return " ".join(collapsed)
+
+
+def _join_repetition_fragments(fragments: list[str]) -> str:
+    if not fragments:
+        return ""
+
+    joined: list[str] = []
+    for fragment in fragments:
+        if not fragment:
+            continue
+        if joined:
+            previous = joined[-1]
+            if (
+                previous
+                and not previous[-1].isspace()
+                and not fragment[0].isspace()
+                and (
+                    (previous[-1].isalnum() and fragment[0].isalnum())
+                    or (previous[-1] in ".!?;:," and fragment[0].isalnum())
+                )
+            ):
+                joined.append(" ")
+        joined.append(fragment)
+    return "".join(joined).strip()
+
+
+def _collapse_similar_fragment_runs(text: str) -> str:
+    fragments = [
+        (
+            text[start:end].strip(),
+            _normalize_boundary_text(fragment)[0],
+        )
+        for start, end, fragment in _split_text_fragments(
+            text,
+            delimiters=_REPETITION_DELIMITERS,
+        )
+        if text[start:end].strip()
+    ]
+    if len(fragments) < 2:
+        return text
+
+    collapsed: list[str] = []
+    index = 0
+    while index < len(fragments):
+        matched = False
+        max_width = min(4, (len(fragments) - index) // 2)
+        for width in range(max_width, 0, -1):
+            pattern = fragments[index : index + width]
+            if not all(normalized for _raw, normalized in pattern):
+                continue
+
+            scan_index = index + width
+            repeat_count = 1
+            while scan_index + width <= len(fragments):
+                candidate = fragments[scan_index : scan_index + width]
+                if all(
+                    _are_similar_repetition_fragments(
+                        pattern[item_index][1],
+                        candidate[item_index][1],
+                    )
+                    for item_index in range(width)
+                ):
+                    repeat_count += 1
+                    scan_index += width
+                    continue
+                break
+
+            if repeat_count >= 2:
+                collapsed.extend(raw for raw, _normalized in pattern)
+                index = scan_index
+                matched = True
+                break
+
+        if matched:
+            continue
+
+        collapsed.append(fragments[index][0])
+        index += 1
+    return _join_repetition_fragments(collapsed)
+
+
+def _repair_pathological_repetition(text: str) -> str:
+    repaired = _collapse_repeated_word_runs(text)
+    repaired = _collapse_similar_fragment_runs(repaired)
+    return repaired.strip() or text
 
 
 def _find_similar_fragment_overlap_cut(left_text: str, right_text: str) -> int | None:
@@ -942,12 +1220,112 @@ class LongAudioTranscriber:
         attempt: int,
         request_plan: ChunkRequestPlan,
     ) -> ChunkTranscriptionResult:
-        return self._transcribe_chunk_with_plan(
+        return self._transcribe_chunk_with_quality_fallback(
             audio_path,
             work_dir,
             chunk,
             attempt,
             request_plan,
+        )
+
+    def _split_chunk_for_quality_fallback(self, chunk: AudioChunk) -> list[AudioChunk]:
+        if chunk.duration_sec < _QUALITY_SPLIT_MIN_CHILD_SEC * 2:
+            return []
+
+        boundary_sec = chunk.start_sec + chunk.duration_sec / 2.0
+        overlap_sec = min(
+            _QUALITY_SPLIT_OVERLAP_SEC,
+            max(0.5, self.config.overlap_sec / 2.0),
+        )
+        left_end_sec = min(chunk.end_sec, boundary_sec + overlap_sec / 2.0)
+        right_start_sec = max(chunk.start_sec, boundary_sec - overlap_sec / 2.0)
+        if right_start_sec >= left_end_sec:
+            left_end_sec = boundary_sec
+            right_start_sec = boundary_sec
+
+        return [
+            AudioChunk(
+                index=0,
+                start_sec=chunk.start_sec,
+                end_sec=left_end_sec,
+                keep_start_sec=chunk.start_sec,
+                keep_end_sec=boundary_sec,
+            ),
+            AudioChunk(
+                index=1,
+                start_sec=right_start_sec,
+                end_sec=chunk.end_sec,
+                keep_start_sec=boundary_sec,
+                keep_end_sec=chunk.end_sec,
+            ),
+        ]
+
+    def _transcribe_chunk_with_quality_fallback(
+        self,
+        audio_path: str,
+        work_dir: str,
+        chunk: AudioChunk,
+        attempt: int,
+        request_plan: ChunkRequestPlan,
+        *,
+        split_depth: int = 0,
+    ) -> ChunkTranscriptionResult:
+        started_at = time.perf_counter()
+        result = self._transcribe_chunk_with_plan(
+            audio_path,
+            work_dir,
+            chunk,
+            attempt,
+            request_plan,
+        )
+        if result.segments or not _has_pathological_repetition(result.text):
+            return result
+
+        final_text = result.text
+        final_language = result.language
+        final_segments = result.segments
+        if split_depth < _QUALITY_SPLIT_MAX_DEPTH:
+            child_chunks = self._split_chunk_for_quality_fallback(chunk)
+            if len(child_chunks) >= 2:
+                child_results = [
+                    self._transcribe_chunk_with_quality_fallback(
+                        audio_path,
+                        work_dir,
+                        child_chunk,
+                        attempt,
+                        request_plan,
+                        split_depth=split_depth + 1,
+                    )
+                    for child_chunk in child_chunks
+                ]
+                final_text, final_language, final_segments = merge_transcribed_chunks(
+                    child_chunks,
+                    child_results,
+                )
+                if not final_text:
+                    final_text = result.text
+                if not final_language:
+                    final_language = result.language
+
+        for _ in range(_QUALITY_REPAIR_MAX_PASSES):
+            repaired_text = _repair_pathological_repetition(final_text)
+            if repaired_text == final_text:
+                break
+            final_text = repaired_text
+
+        return ChunkTranscriptionResult(
+            chunk_index=chunk.index,
+            start_sec=chunk.start_sec,
+            end_sec=chunk.end_sec,
+            keep_start_sec=chunk.keep_start_sec,
+            keep_end_sec=chunk.keep_end_sec,
+            latency_sec=time.perf_counter() - started_at,
+            attempt=attempt,
+            text=final_text,
+            language=final_language,
+            duration_sec=result.duration_sec,
+            segments=final_segments,
+            output_path=result.output_path,
         )
 
     def _dispatch_capacity(self, info: "InfoResponse" | None) -> int:
