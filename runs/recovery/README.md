@@ -90,3 +90,33 @@ QSR_RUN_BENCHMARK=1 \
 QSR_BENCH_SAMPLES=200 \
 bash runs/recovery/restart_tei_qsr.sh
 ```
+
+若你想专门测试 TEI + QSR 共存时的稳定性与吞吐，可直接执行：
+
+```bash
+bash runs/recovery/benchmark_tei_qsr_coexist.sh
+```
+
+默认会：
+
+- 读取当前已经运行中的 TEI `28800` 与 QSR `27900`
+- 先抓一次 pre-state 的 `/health` 与 `/info`
+- 并发执行 TEI benchmark 与 QSR benchmark
+- 再抓一次 post-state，并生成一份 Markdown 摘要
+
+常用覆盖参数：
+
+```bash
+TEI_BENCH_SAMPLES=12000 \
+QSR_BENCH_SAMPLES=1200 \
+QSR_BENCH_MODE=transcribe \
+bash runs/recovery/benchmark_tei_qsr_coexist.sh
+```
+
+主要产物：
+
+- `runs/recovery/results/tei_qsr_coexist_*.md`
+- `runs/recovery/results/tei_qsr_coexist_pre_*.json`
+- `runs/recovery/results/tei_qsr_coexist_post_*.json`
+- `runs/teis/results/coexist_*.json`
+- `runs/qsrs/results/coexist_*.json`
