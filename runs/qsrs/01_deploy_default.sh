@@ -4,6 +4,7 @@ set -euo pipefail
 source "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/_common.sh"
 
 deploy_gpus="$(resolve_qsr_gpus)"
+project_name="$(resolve_qsr_project_name)"
 if [[ -z "$deploy_gpus" ]]; then
     echo "[qsr-runs] no visible GPUs detected" >&2
     exit 1
@@ -11,7 +12,7 @@ fi
 
 echo "[qsr-runs] deploying QSR on GPUs: $deploy_gpus"
 
-compose_args=(--gpu-layout uniform -g "$deploy_gpus")
+compose_args=(--gpu-layout "$QSR_GPU_LAYOUT" --project-name "$project_name" -g "$deploy_gpus")
 if [[ -n "${QSR_PROXY_URL:-}" ]]; then
     compose_args+=(--proxy "$QSR_PROXY_URL")
 fi

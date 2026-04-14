@@ -10,6 +10,8 @@ QSR_MACHINE_PORT="${QSR_MACHINE_PORT:-27900}"
 QSR_BACKEND_BASE_PORT="${QSR_BACKEND_BASE_PORT:-27980}"
 QSR_DEFAULT_AUDIO="${QSR_DEFAULT_AUDIO:-https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_zh.wav}"
 QSR_ALT_AUDIO="${QSR_ALT_AUDIO:-https://qianwen-res.oss-cn-beijing.aliyuncs.com/Qwen3-ASR-Repo/asr_en.wav}"
+QSR_GPU_LAYOUT="${QSR_GPU_LAYOUT:-uniform}"
+QSR_PROJECT_NAME="${QSR_PROJECT_NAME:-}"
 QSR_ENABLE_SLEEP_MODE="${QSR_ENABLE_SLEEP_MODE:-1}"
 QSR_PROFILE_STARTUP="${QSR_PROFILE_STARTUP:-0}"
 
@@ -59,6 +61,15 @@ resolve_qsr_gpus() {
         return
     fi
     detect_visible_gpu_csv
+}
+
+resolve_qsr_project_name() {
+    if [[ -n "$QSR_PROJECT_NAME" ]]; then
+        printf '%s\n' "$QSR_PROJECT_NAME"
+        return
+    fi
+
+    printf 'qsr-%s\n' "$(printf '%s' "$QSR_GPU_LAYOUT" | tr '[:upper:]' '[:lower:]' | sed -E 's/[^a-z0-9_-]+/-/g')"
 }
 
 count_csv_items() {

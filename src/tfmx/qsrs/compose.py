@@ -814,7 +814,6 @@ class ComposeFileGenerator:
     def _generate_common_config(self) -> list[str]:
         lines = [
             "x-common-config: &common-config",
-            "  restart: unless-stopped",
             "  volumes:",
             f"    - ${{HOME}}/{self.cache_hf}:/root/{self.cache_hf}",
             f"    - ${{HOME}}/{self.cache_vllm}:/root/{self.cache_vllm}",

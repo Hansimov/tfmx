@@ -139,5 +139,6 @@ Machine 层：
 
 - `tei machine` 现在支持内建后台 daemon 模式，可直接执行 `tei machine run --background --auto-start --on-conflict replace`
 - daemon 的 PID / 日志默认写到 `~/.cache/tfmx/tei_machine.pid` 与 `~/.cache/tfmx/tei_machine.log`
-- 如果要长期驻留或做开机自启，仍然建议把这条命令放到 `tmux`、`screen`、`systemd`、Supervisor 或你现有的运维系统里
+- 如果是 TEI + QSR 这种依赖 GPU 与 Docker 的重资源组合，更推荐主机重启后按需执行 `bash runs/recovery/start_tei_qsr.sh`，而不是默认做开机自启
+- 如果只是短期驻留单独的 TEI machine，再考虑放到 `tmux`、`screen` 或你现有的运维系统里
 - 如果你担心旧进程占住 `28800`，直接在启动命令里加 `--on-conflict replace`
