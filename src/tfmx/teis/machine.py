@@ -11,6 +11,7 @@ Examples:
     tei machine run                   # Start on default port 28800 with smart GPU LSH
     tei machine run -p 28800          # Start on specific port
     tei machine run --auto-start      # Auto-start compose backends if none are running
+    tei machine run --background --auto-start --on-conflict replace
   
   # Filter containers by name pattern
     tei machine run -n "qwen3-embedding"  # Only match containers with this pattern
@@ -32,12 +33,19 @@ Examples:
   
   # Health check all instances
     tei machine health                # Check health of all instances
+
+  # Daemon management
+    tei machine status
+    tei machine logs -f
+    tei machine stop
+    tei machine restart --auto-start --on-conflict replace
 """
 
 import argparse
 import asyncio
-import subprocess
 import re
+import subprocess
+import sys
 
 import httpx
 import numpy as np
@@ -47,12 +55,14 @@ import uvicorn
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from fastapi import FastAPI, HTTPException
+from pathlib import Path
 from pydantic import BaseModel, Field
 from tclogger import logger, logstr
 from typing import Callable, Optional, Union
 from webu import setup_swagger_ui
 
 from ..utils.lsh import LSHConverter
+from ..utils.machine_daemon import ManagedMachineDaemon
 from ..utils.service_bootstrap import docker_status_to_health
 from ..utils.service_bootstrap import ensure_backend_instances
 from ..utils.service_bootstrap import handle_port_conflicts
@@ -77,6 +87,22 @@ BACKEND_STARTUP_TIMEOUT_SEC = 300.0
 BACKEND_STARTUP_POLL_INTERVAL_SEC = 5.0
 BACKEND_DISCOVERY_SETTLE_SEC = 10.0
 HEALTH_REFRESH_INTERVAL_SEC = 10.0
+
+_CACHE_DIR = Path.home() / ".cache" / "tfmx"
+_PID_FILE = _CACHE_DIR / "tei_machine.pid"
+_LOG_FILE = _CACHE_DIR / "tei_machine.log"
+
+
+class TEIMachineDaemon(ManagedMachineDaemon):
+    def __init__(self, pid_file: Path = _PID_FILE, log_file: Path = _LOG_FILE):
+        super().__init__(
+            label="[tei_machine]",
+            module_name="tfmx.teis.machine",
+            daemon_env_flag="_TEI_MACHINE_DAEMON",
+            pid_file=pid_file,
+            log_file=log_file,
+            background_flags=("-B", "--background"),
+        )
 
 
 class TEIBackendRequestError(RuntimeError):
@@ -1347,6 +1373,13 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
     parser.formatter_class = argparse.RawDescriptionHelpFormatter
     parser.epilog = CLI_EPILOG
     parser.add_argument(
+        "action",
+        nargs="?",
+        choices=["run", "discover", "health", "stop", "restart", "status", "logs"],
+        default=None,
+        help="Action to perform: run, discover, health, stop, restart, status, or logs",
+    )
+    parser.add_argument(
         "-p",
         "--port",
         type=int,
@@ -1382,6 +1415,12 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         help=f"Micro-batch size for pipeline scheduling (default: {MICRO_BATCH_SIZE})",
     )
     parser.add_argument(
+        "-B",
+        "--background",
+        action="store_true",
+        help="Run as background daemon",
+    )
+    parser.add_argument(
         "-t",
         "--timeout",
         type=float,
@@ -1392,7 +1431,7 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         "--on-conflict",
         choices=["report", "replace"],
         default="report",
-        help="How to handle an existing machine listener on the target port",
+        help="How to handle an existing machine listener or daemon on the target port",
     )
     parser.add_argument(
         "--no-gpu-lsh",
@@ -1467,12 +1506,9 @@ def configure_parser(parser: argparse.ArgumentParser) -> None:
         help='Per-GPU config for auto-started backends: "GPU[:MODEL],..."',
     )
     parser.add_argument(
-        "action",
-        nargs="?",
-        choices=["run", "discover", "health"],
-        default=None,
-        help="Action to perform: run, discover, or health",
+        "-f", "--follow", action="store_true", help="Follow logs in real time"
     )
+    parser.add_argument("--tail", type=int, default=50, help="Log lines to show")
 
 
 def _discover_instances_from_docker(name_pattern: Optional[str]) -> list[TEIInstance]:
@@ -1581,6 +1617,37 @@ async def check_health(instances: list[TEIInstance]) -> None:
 
 
 def run_from_args(args: argparse.Namespace) -> None:
+    if args.action is None:
+        raise ValueError("Action is required")
+
+    daemon = TEIMachineDaemon()
+
+    if args.action == "stop":
+        daemon.stop()
+        return
+
+    if args.action == "status":
+        daemon.status()
+        return
+
+    if args.action == "logs":
+        daemon.show_logs(follow=args.follow, tail=args.tail)
+        return
+
+    if args.action == "restart":
+        daemon.stop()
+        if not handle_port_conflicts(
+            args.port,
+            policy="replace",
+            label="[tei_machine]",
+        ):
+            return
+        argv = [arg if arg != "restart" else "run" for arg in sys.argv]
+        if "-B" not in argv and "--background" not in argv:
+            argv.append("--background")
+        daemon.start_background(argv)
+        return
+
     instances = discover_instances(args)
 
     if args.action == "discover":
@@ -1596,6 +1663,25 @@ def run_from_args(args: argparse.Namespace) -> None:
             logger.warn(
                 "× No TEI instances found. Use -e to specify endpoints manually."
             )
+            return
+
+        if args.background:
+            if daemon.is_running():
+                if getattr(args, "on_conflict", "report") == "report":
+                    logger.warn(
+                        f"[tei_machine] Daemon already running (PID {daemon.get_pid()}). Use 'restart' or '--on-conflict replace' to replace it."
+                    )
+                    return
+                logger.warn("[tei_machine] Replacing existing daemon before restart")
+                if not daemon.stop():
+                    return
+            if not handle_port_conflicts(
+                args.port,
+                policy=getattr(args, "on_conflict", "report"),
+                label="[tei_machine]",
+            ):
+                return
+            daemon.start_background(sys.argv)
             return
 
         if not handle_port_conflicts(
@@ -1615,6 +1701,10 @@ def run_from_args(args: argparse.Namespace) -> None:
             f"[tei_machine] Adaptive pipeline scheduling (probe_batch_size={args.micro_batch_size})"
         )
 
+        is_daemon = daemon.is_daemon_process()
+        if is_daemon:
+            daemon.write_pid()
+
         server = TEIMachineServer(
             instances=instances,
             port=args.port,
@@ -1629,7 +1719,14 @@ def run_from_args(args: argparse.Namespace) -> None:
                 else lambda: _discover_instances_from_docker(args.name_pattern)
             ),
         )
-        server.run()
+        try:
+            server.run()
+        finally:
+            if is_daemon:
+                daemon.remove_pid()
+        return
+
+    raise ValueError(f"Unknown machine action: {args.action}")
 
 
 class TEIMachineArgParser:

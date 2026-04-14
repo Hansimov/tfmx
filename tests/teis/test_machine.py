@@ -218,9 +218,13 @@ class TestTEIMachineAutoStart:
             micro_batch_size=8,
             no_gpu_lsh=False,
             perf_track=False,
+            background=False,
             endpoints=None,
             name_pattern=None,
+            auto_start=False,
             on_conflict="report",
+            follow=False,
+            tail=50,
         )
 
         run_from_args(args)
@@ -231,3 +235,50 @@ class TestTEIMachineAutoStart:
             label="[tei_machine]",
         )
         mock_server_cls.assert_not_called()
+
+    @patch("tfmx.teis.machine.handle_port_conflicts", return_value=True)
+    @patch("tfmx.teis.machine.discover_instances")
+    @patch("tfmx.teis.machine.TEIMachineDaemon")
+    def test_run_from_args_background_replace_existing_daemon(
+        self,
+        mock_daemon_cls,
+        mock_discover_instances,
+        mock_handle_conflicts,
+    ):
+        instance = TEIInstance(
+            container_name="tei--gpu0",
+            host="localhost",
+            port=28880,
+            gpu_id=0,
+        )
+        mock_discover_instances.return_value = [instance]
+        daemon = mock_daemon_cls.return_value
+        daemon.is_running.return_value = True
+        daemon.stop.return_value = True
+
+        args = Namespace(
+            action="run",
+            background=True,
+            on_conflict="replace",
+            port=28800,
+            timeout=1.0,
+            batch_size=32,
+            micro_batch_size=8,
+            no_gpu_lsh=False,
+            perf_track=False,
+            endpoints=None,
+            name_pattern=None,
+            auto_start=False,
+            follow=False,
+            tail=50,
+        )
+
+        run_from_args(args)
+
+        daemon.stop.assert_called_once_with()
+        mock_handle_conflicts.assert_called_once_with(
+            28800,
+            policy="replace",
+            label="[tei_machine]",
+        )
+        daemon.start_background.assert_called_once()

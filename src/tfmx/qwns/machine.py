@@ -2,9 +2,7 @@
 
 import argparse
 import asyncio
-import os
 import re
-import signal
 import subprocess
 import sys
 import time
@@ -23,6 +21,7 @@ from tclogger import logger, logstr
 from typing import Callable, Literal, Optional, Union
 from webu import setup_swagger_ui
 
+from ..utils.machine_daemon import ManagedMachineDaemon
 from ..utils.service_bootstrap import docker_status_to_health
 from ..utils.service_bootstrap import ensure_backend_instances
 from ..utils.service_bootstrap import handle_port_conflicts
@@ -2164,131 +2163,16 @@ _PID_FILE = _CACHE_DIR / "qwn_machine.pid"
 _LOG_FILE = _CACHE_DIR / "qwn_machine.log"
 
 
-class QWNMachineDaemon:
+class QWNMachineDaemon(ManagedMachineDaemon):
     def __init__(self, pid_file: Path = _PID_FILE, log_file: Path = _LOG_FILE):
-        self.pid_file = pid_file
-        self.log_file = log_file
-        self._ensure_cache_dir()
-
-    def _ensure_cache_dir(self) -> None:
-        self.pid_file.parent.mkdir(parents=True, exist_ok=True)
-
-    def get_pid(self) -> Optional[int]:
-        if not self.pid_file.exists():
-            return None
-        try:
-            pid = int(self.pid_file.read_text().strip())
-            os.kill(pid, 0)
-            return pid
-        except (ValueError, ProcessLookupError, PermissionError):
-            self.pid_file.unlink(missing_ok=True)
-            return None
-
-    def is_running(self) -> bool:
-        return self.get_pid() is not None
-
-    def write_pid(self) -> None:
-        self.pid_file.write_text(str(os.getpid()))
-
-    def remove_pid(self) -> None:
-        self.pid_file.unlink(missing_ok=True)
-
-    @staticmethod
-    def _normalize_background_argv(argv: list[str]) -> list[str]:
-        normalized_args = list(argv[1:])
-        if normalized_args and normalized_args[0] == "machine":
-            normalized_args = normalized_args[1:]
-
-        cleaned_args: list[str] = []
-        for arg in normalized_args:
-            if arg in {"-b", "--background"}:
-                continue
-            cleaned_args.append(arg)
-        return cleaned_args
-
-    def start_background(self, argv: list[str]) -> None:
-        cmd = [sys.executable, "-m", "tfmx.qwns.machine"]
-        for arg in self._normalize_background_argv(argv):
-            cmd.append(arg)
-
-        log_handle = open(self.log_file, "a")
-        proc = subprocess.Popen(
-            cmd,
-            stdout=log_handle,
-            stderr=subprocess.STDOUT,
-            start_new_session=True,
-            env={**os.environ, "_QWN_MACHINE_DAEMON": "1"},
+        super().__init__(
+            label="[qwn_machine]",
+            module_name="tfmx.qwns.machine",
+            daemon_env_flag="_QWN_MACHINE_DAEMON",
+            pid_file=pid_file,
+            log_file=log_file,
+            background_flags=("-b", "--background"),
         )
-        self.pid_file.write_text(str(proc.pid))
-        logger.okay(f"[qwn_machine] Started in background (PID {proc.pid})")
-        logger.mesg(f"  Log: {self.log_file}")
-        logger.mesg(f"  PID: {self.pid_file}")
-
-    def stop(self) -> bool:
-        pid = self.get_pid()
-        if pid is None:
-            logger.mesg("[qwn_machine] No running daemon found")
-            return False
-
-        logger.mesg(f"[qwn_machine] Stopping daemon (PID {pid})...")
-        try:
-            os.kill(pid, signal.SIGTERM)
-            for _ in range(100):
-                try:
-                    os.kill(pid, 0)
-                    time.sleep(0.1)
-                except ProcessLookupError:
-                    break
-            else:
-                logger.warn(f"[qwn_machine] Force killing PID {pid}")
-                os.kill(pid, signal.SIGKILL)
-        except ProcessLookupError:
-            pass
-        except PermissionError:
-            logger.warn(f"x Permission denied killing PID {pid}")
-            return False
-
-        self.remove_pid()
-        logger.okay("[qwn_machine] Daemon stopped")
-        return True
-
-    def status(self) -> None:
-        pid = self.get_pid()
-        if pid is None:
-            logger.mesg("[qwn_machine] Status: not running")
-            return
-        logger.okay(f"[qwn_machine] Status: running (PID {pid})")
-        logger.mesg(f"  PID file: {self.pid_file}")
-        logger.mesg(f"  Log file: {self.log_file}")
-        if self.log_file.exists():
-            size = self.log_file.stat().st_size
-            if size < 1024:
-                logger.mesg(f"  Log size: {size} B")
-            elif size < 1024 * 1024:
-                logger.mesg(f"  Log size: {size / 1024:.1f} KB")
-            else:
-                logger.mesg(f"  Log size: {size / 1024 / 1024:.1f} MB")
-
-    def show_logs(self, follow: bool = False, tail: int = 50) -> None:
-        if not self.log_file.exists():
-            logger.mesg("[qwn_machine] No log file found")
-            return
-        if follow:
-            try:
-                subprocess.run(["tail", "-f", "-n", str(tail), str(self.log_file)])
-            except KeyboardInterrupt:
-                pass
-            return
-
-        result = subprocess.run(
-            ["tail", "-n", str(tail), str(self.log_file)],
-            capture_output=True,
-            text=True,
-        )
-        if result.stdout:
-            print(result.stdout, end="")
-        else:
-            logger.mesg("[qwn_machine] Log file is empty")
 
 
 CLI_EPILOG = """
@@ -2612,7 +2496,7 @@ def run_from_args(args: argparse.Namespace) -> None:
         ):
             return
 
-        is_daemon = os.environ.get("_QWN_MACHINE_DAEMON") == "1"
+        is_daemon = daemon.is_daemon_process()
         if is_daemon:
             daemon.write_pid()
 

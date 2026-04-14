@@ -37,3 +37,9 @@ from .perf_tracker import (
     get_global_tracker,
     reset_global_tracker,
 )
+from .machine import (
+    TEIInstance,
+    TEIInstanceDiscovery,
+    TEIMachineDaemon,
+    TEIMachineServer,
+)

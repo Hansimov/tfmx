@@ -55,7 +55,9 @@ tei machine run --auto-start --on-conflict replace
 
 - `report`：发现冲突就报错退出
 - `replace`：先清掉旧监听器，再启动新的 machine
-- `tei machine` 没有 `qwn machine -b` 那样的 daemon 管理，所以长期驻留更建议用 `tmux` 或 `systemd`
+- `tei machine` 现在支持内建 daemon 管理，可直接用 `tei machine run --background --auto-start --on-conflict replace`
+- daemon 的 PID / 日志默认在 `~/.cache/tfmx/tei_machine.pid` 与 `~/.cache/tfmx/tei_machine.log`
+- 如果你要做开机自启，再把这条命令放进 `systemd`、Supervisor 或你现有的运维系统里
 
 ## OOM / 容量不足时怎么处理
 

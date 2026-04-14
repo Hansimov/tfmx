@@ -42,6 +42,7 @@ from .teis.perf_tracker import (
     get_global_tracker,
     reset_global_tracker,
 )
+from .teis.machine import TEIMachineServer, TEIInstance, TEIMachineDaemon
 
 # QWN
 from .qwns import QWNBenchmark, BenchmarkMetrics as QWNBenchmarkMetrics

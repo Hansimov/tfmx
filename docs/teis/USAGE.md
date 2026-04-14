@@ -45,6 +45,8 @@ tei compose down
 ### 行为说明
 
 - 默认会先检测当前健康 GPU，再为这些 GPU 启动后端
+- 这里的“健康 GPU”只是在硬件 / runtime 层面可用，不会因为同一张卡上已经跑了 `qsr` 就自动排除；如果显存足够，TEI 与 QSR 可以共存在同一批 GPU 上
+- 因此当你当前服务器有 `6` 张可见且健康的 GPU 时，默认行为就是把这 `6` 张都纳入部署；若只想用子集，再显式传 `-g` 或 `--gpu-configs`
 - 如果你用 `--gpu-configs` 配置了多个不同模型，而又没有手动指定 `--project-name`，compose 项目名会自动使用 `tei-multi`
 - `tei compose setup` 适合在首次启动前跑一次，减少首次容器启动时的补文件等待
 
@@ -53,13 +55,19 @@ tei compose down
 ```bash
 tei machine run
 tei machine run --auto-start
+tei machine run --background --auto-start --on-conflict replace
 tei machine run --auto-start --perf-track --on-conflict replace
+tei machine run --background --auto-start --compose-gpus "0,1,2,3,4,5" --on-conflict replace
 tei machine run --auto-start --compose-gpus "0,1"
 tei machine run --auto-start --compose-gpu-configs "0,1"
 tei machine run --auto-start --compose-gpu-configs "0:Qwen/Qwen3-Embedding-0.6B,1:Alibaba-NLP/gte-multilingual-base"
 tei machine run -e "$TEI_BACKENDS"
 tei machine discover
 tei machine health
+tei machine status
+tei machine logs --tail 200
+tei machine stop
+tei machine restart --auto-start --on-conflict replace
 ```
 
 ### 常用参数
@@ -68,16 +76,19 @@ tei machine health
 - `-e/--endpoints`：跳过容器自动发现，直接使用给定后端地址
 - `-b/--batch-size`：每个实例允许的最大批量，默认 `300`
 - `-m/--micro-batch-size`：自适应流水线调度用的小批量探测大小，默认 `100`
+- `-B/--background`：以 daemon 模式在后台运行 machine
 - `--perf-track`：打印更细的 pipeline 与 LSH 性能日志
 - `--no-gpu-lsh`：关闭 GPU LSH，加速逻辑改为 CPU
 - `--auto-start`：没有后端时自动调用 compose 拉起后端
 - `--compose-gpus`：限制 auto-start 只用哪些 GPU
 - `--compose-gpu-configs`：用 `GPU[:MODEL],...` 方式更精确地控制 auto-start 的 per-GPU 模型配置
 - `--on-conflict report|replace`：控制当 `28800` 已被旧进程占用时是报错还是替换
+- `status|logs|stop|restart`：查看 daemon 状态、读取日志、停止或重启后台 machine
 
 ### 行为说明
 
 - `tei machine` 是单机多 GPU 聚合层，不是多机器入口
+- 若使用 `--background`，daemon 的 PID / 日志默认写到 `~/.cache/tfmx/tei_machine.pid` 与 `~/.cache/tfmx/tei_machine.log`
 - 如果 auto-start 阶段只有部分后端变健康，machine 会先带着这些健康实例启动
 - 如果某个后端运行期掉卡、launch failed 或健康检查明确 unhealthy，machine 会把它摘出调度
 - 如果只是请求期 OOM / capacity 错误，machine 会先自动拆小 batch 再重试，并记住该实例当前已验证过的安全批量上限，后续请求会优先按这个上限预切分，而不是每次都重新撞到同样的过载错误
@@ -154,6 +165,7 @@ bash runs/teis/04_benchmark.sh
 
 - 默认使用当前 VM 中全部可见 GPU
 - 若想只跑子集，可先导出 `TEI_DEPLOY_GPUS=0,1`
+- `02_start_machine.sh` 现在直接走 `tei machine run --background --auto-start --compose-gpus ... --on-conflict replace`
 - 更多分步说明见 `runs/teis/README.md`
 
 ## 联合恢复脚本

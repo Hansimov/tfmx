@@ -37,12 +37,36 @@ class TestTeiCliParser:
         assert args.compose_gpus == "0,2"
         assert args.compose_gpu_configs == "0,2"
 
+    def test_machine_parse_background(self):
+        parser = build_parser()
+        args = parser.parse_args(
+            [
+                "machine",
+                "run",
+                "--background",
+                "--auto-start",
+                "--compose-gpus",
+                "0,1,2,3,4,5",
+            ]
+        )
+        assert args.command == "machine"
+        assert args.action == "run"
+        assert args.background is True
+        assert args.auto_start is True
+        assert args.compose_gpus == "0,1,2,3,4,5"
+
     def test_machine_parse_on_conflict(self):
         parser = build_parser()
         args = parser.parse_args(["machine", "run", "--on-conflict", "replace"])
         assert args.command == "machine"
         assert args.action == "run"
         assert args.on_conflict == "replace"
+
+    def test_machine_parse_status(self):
+        parser = build_parser()
+        args = parser.parse_args(["machine", "status"])
+        assert args.command == "machine"
+        assert args.action == "status"
 
     def test_client_parse(self):
         parser = build_parser()

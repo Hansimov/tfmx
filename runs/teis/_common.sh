@@ -6,8 +6,6 @@ TEI_RESULTS_DIR="$TEI_REPO_ROOT/runs/teis/results"
 TEI_MACHINE_URL="${TEI_MACHINE_URL:-http://127.0.0.1:28800}"
 TEI_MACHINE_PORT="${TEI_MACHINE_PORT:-28800}"
 TEI_BACKEND_BASE_PORT="${TEI_BACKEND_BASE_PORT:-28880}"
-TEI_PID_FILE="$TEI_RESULTS_DIR/tei_machine.pid"
-TEI_LOG_FILE="$TEI_RESULTS_DIR/tei_machine.log"
 
 mkdir -p "$TEI_RESULTS_DIR"
 
@@ -129,32 +127,4 @@ while time.time() < deadline:
 print(f'[tei-runs] machine health timed out after {timeout_sec:.0f}s', file=sys.stderr)
 sys.exit(1)
 PY
-}
-
-stop_tei_machine_if_present() {
-    if [[ -f "$TEI_PID_FILE" ]]; then
-        local pid
-        pid="$(cat "$TEI_PID_FILE" 2>/dev/null || true)"
-        if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
-            kill "$pid" >/dev/null 2>&1 || true
-        fi
-        rm -f "$TEI_PID_FILE"
-    fi
-}
-
-start_tei_machine_background() {
-    stop_tei_machine_if_present
-    cd "$TEI_REPO_ROOT"
-    if command -v setsid >/dev/null 2>&1; then
-        if command -v tei >/dev/null 2>&1; then
-            setsid tei machine run --perf-track --on-conflict replace < /dev/null >"$TEI_LOG_FILE" 2>&1 &
-        else
-            setsid python -m tfmx.teis.cli machine run --perf-track --on-conflict replace < /dev/null >"$TEI_LOG_FILE" 2>&1 &
-        fi
-    elif command -v tei >/dev/null 2>&1; then
-        nohup tei machine run --perf-track --on-conflict replace < /dev/null >"$TEI_LOG_FILE" 2>&1 &
-    else
-        nohup python -m tfmx.teis.cli machine run --perf-track --on-conflict replace < /dev/null >"$TEI_LOG_FILE" 2>&1 &
-    fi
-    echo "$!" > "$TEI_PID_FILE"
 }
