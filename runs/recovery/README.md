@@ -1,4 +1,6 @@
-# TEI + QWN Recovery Workflow
+# Recovery Workflows
+
+## TEI + QWN
 
 这组脚本用于把本机的 TEI `28800` 与 QWN `27800` 一起重启，并补完最小可用的 live 验证。
 
@@ -56,3 +58,35 @@ bash runs/recovery/restart_tei_qwn.sh
 - 主机重启后，需要快速恢复 TEI + QWN 到当前 VM 中全部可见 GPU
 - 想把“重启 + live 验证 + 轻量 benchmark”压缩成一个可复用入口
 - 想在更高负载下复测两套服务共存时的稳定性
+
+## TEI + QSR
+
+若你现在要恢复的是 TEI `28800` 与 QSR `27900`，可直接执行：
+
+```bash
+bash runs/recovery/restart_tei_qsr.sh
+```
+
+默认行为：
+
+- 默认使用当前全部可见 GPU，并允许 TEI / QSR 共存在同一批 GPU 上
+- 先清理旧的 TEI/QSR machine 与 compose 部署
+- 重新拉起 TEI backend + machine，并执行 `runs/teis/03_health_check.sh`
+- 重新拉起 QSR backend + machine，并执行 `runs/qsrs/03_health_check.sh`
+
+常用覆盖参数：
+
+```bash
+TEI_GPUS=0,1,2,3,4,5 \
+QSR_GPUS=0,1,2,3,4,5 \
+bash runs/recovery/restart_tei_qsr.sh
+```
+
+若你想让它在恢复完成后顺手跑 benchmark：
+
+```bash
+TEI_RUN_BENCHMARK=1 \
+QSR_RUN_BENCHMARK=1 \
+QSR_BENCH_SAMPLES=200 \
+bash runs/recovery/restart_tei_qsr.sh
+```

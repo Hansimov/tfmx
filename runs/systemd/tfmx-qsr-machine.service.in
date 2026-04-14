@@ -1,0 +1,20 @@
+[Unit]
+Description=tfmx QSR machine service
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=@REPO_ROOT@
+Environment=HOME=%h
+Environment=PATH=@PATH@
+Environment=PYTHONUNBUFFERED=1
+ExecStart=/usr/bin/env bash -lc 'GPUS="${QSR_SERVICE_GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | paste -sd, -)}"; exec "@PYTHON@" -m tfmx.qsrs.cli machine run --auto-start --compose-gpus "$GPUS" --compose-gpu-layout uniform --compose-enable-sleep-mode --on-conflict replace'
+ExecStopPost=/usr/bin/env bash -lc 'GPUS="${QSR_SERVICE_GPUS:-$(nvidia-smi --query-gpu=index --format=csv,noheader,nounits 2>/dev/null | paste -sd, -)}"; cd "@REPO_ROOT@" && "@PYTHON@" -m tfmx.qsrs.cli compose down -g "$GPUS" || true'
+Restart=always
+RestartSec=10
+TimeoutStartSec=0
+TimeoutStopSec=180
+
+[Install]
+WantedBy=default.target
