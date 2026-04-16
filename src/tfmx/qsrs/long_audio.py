@@ -181,6 +181,30 @@ class QualityFallbackTrace:
 
 
 @dataclass
+class SchedulingDiagnostics:
+    dispatch_cycle_count: int = 0
+    forced_machine_refresh_count: int = 0
+    forced_machine_refresh_hit_count: int = 0
+    completion_refill_trigger_count: int = 0
+    completion_refill_hit_count: int = 0
+    completion_refill_dispatched_chunk_count: int = 0
+    idle_poll_wait_count: int = 0
+    wait_timeout_count: int = 0
+
+    def to_dict(self) -> dict:
+        return {
+            "dispatch_cycle_count": self.dispatch_cycle_count,
+            "forced_machine_refresh_count": self.forced_machine_refresh_count,
+            "forced_machine_refresh_hit_count": self.forced_machine_refresh_hit_count,
+            "completion_refill_trigger_count": self.completion_refill_trigger_count,
+            "completion_refill_hit_count": self.completion_refill_hit_count,
+            "completion_refill_dispatched_chunk_count": self.completion_refill_dispatched_chunk_count,
+            "idle_poll_wait_count": self.idle_poll_wait_count,
+            "wait_timeout_count": self.wait_timeout_count,
+        }
+
+
+@dataclass
 class ChunkTranscriptionResult:
     chunk_index: int
     start_sec: float
@@ -229,6 +253,9 @@ class LongAudioTranscriptionResult:
     machine_snapshot: dict | None
     text: str
     language: str
+    scheduling_diagnostics: SchedulingDiagnostics = field(
+        default_factory=SchedulingDiagnostics
+    )
     merged_segments: list[dict] = field(default_factory=list)
     chunk_response_format: str = "json"
     stitching_mode: str = "text_overlap"
@@ -302,6 +329,7 @@ class LongAudioTranscriptionResult:
                     if total_audio_duration_sec > 0
                     else None
                 ),
+                "diagnostics": self.scheduling_diagnostics.to_dict(),
             },
             "machine_snapshot": self.machine_snapshot,
             "transcription": {
@@ -331,8 +359,8 @@ class LongAudioTranscriptionConfig:
     search_window_sec: float = 12.0
     min_silence_sec: float = 0.35
     silence_noise_db: float = -32.0
-    idle_poll_interval_sec: float = 1.0
-    machine_info_refresh_sec: float = 0.5
+    idle_poll_interval_sec: float = 0.2
+    machine_info_refresh_sec: float = 0.2
     max_parallel_chunks: int | None = None
     per_instance_parallelism_cap: int | None = 4
     max_chunk_retries: int = 2
@@ -1713,6 +1741,106 @@ class LongAudioTranscriber:
                 )
         return min(max(1, count_available_healthy_slots(info)), chunk_count)
 
+    def _dispatch_pending_chunks(
+        self,
+        *,
+        executor,
+        metadata: AudioMetadata,
+        work_dir: Path,
+        pending: list[AudioChunk],
+        running: dict[Future, tuple[AudioChunk, int]],
+        attempts: dict[int, int],
+        request_plan: ChunkRequestPlan,
+        executor_parallelism_limit: int,
+        chunk_count: int,
+        get_latest_info,
+        diagnostics: SchedulingDiagnostics | None = None,
+        initial_info: "InfoResponse" | None = None,
+        initial_info_was_forced: bool = False,
+    ) -> int:
+        dispatched = 0
+        if diagnostics is not None:
+            diagnostics.dispatch_cycle_count += 1
+        use_initial_info = initial_info_was_forced or initial_info is not None
+        latest_info_override = initial_info
+        latest_info_override_was_forced = initial_info_was_forced
+        while pending:
+            if use_initial_info:
+                current_info = latest_info_override
+                current_info_was_forced = latest_info_override_was_forced
+                use_initial_info = False
+                latest_info_override = None
+                latest_info_override_was_forced = False
+            else:
+                current_info = get_latest_info()
+                current_info_was_forced = False
+            current_parallelism_target = min(
+                executor_parallelism_limit,
+                self._effective_parallelism(current_info, chunk_count),
+            )
+            if len(running) >= current_parallelism_target:
+                break
+
+            latest_info = current_info
+            dispatch_capacity = (
+                min(
+                    current_parallelism_target,
+                    self._dispatch_capacity(latest_info),
+                )
+                if latest_info is not None
+                else current_parallelism_target
+            )
+            allowed_new = max(
+                0,
+                min(
+                    dispatch_capacity - len(running),
+                    len(pending),
+                ),
+            )
+            if current_info_was_forced and diagnostics is not None and allowed_new > 0:
+                diagnostics.forced_machine_refresh_hit_count += 1
+            if (
+                allowed_new == 0
+                and latest_info is not None
+                and len(running) < current_parallelism_target
+            ):
+                if diagnostics is not None:
+                    diagnostics.forced_machine_refresh_count += 1
+                latest_info = get_latest_info(force=True)
+                dispatch_capacity = min(
+                    current_parallelism_target,
+                    self._dispatch_capacity(latest_info),
+                )
+                allowed_new = max(
+                    0,
+                    min(
+                        dispatch_capacity - len(running),
+                        len(pending),
+                    ),
+                )
+                if diagnostics is not None and allowed_new > 0:
+                    diagnostics.forced_machine_refresh_hit_count += 1
+            if allowed_new == 0:
+                if not running:
+                    allowed_new = 1
+                else:
+                    break
+
+            for _ in range(allowed_new):
+                chunk = pending.pop(0)
+                attempts[chunk.index] += 1
+                future = executor.submit(
+                    self._transcribe_chunk,
+                    metadata.path,
+                    str(work_dir),
+                    chunk,
+                    attempts[chunk.index],
+                    request_plan,
+                )
+                running[future] = (chunk, attempts[chunk.index])
+                dispatched += 1
+        return dispatched
+
     def transcribe(self, audio: str) -> LongAudioTranscriptionResult:
         metadata = probe_audio(audio)
         silence_regions = detect_silence_regions(
@@ -1743,6 +1871,7 @@ class LongAudioTranscriber:
             info = self._machine_info()
             latest_info = info
             latest_info_refreshed_at = time.monotonic()
+            scheduling_diagnostics = SchedulingDiagnostics()
 
             def get_latest_info(force: bool = False) -> "InfoResponse" | None:
                 nonlocal latest_info, latest_info_refreshed_at
@@ -1787,43 +1916,22 @@ class LongAudioTranscriber:
                 max_workers=max(1, executor_parallelism_limit)
             ) as executor:
                 while pending or running:
-                    current_parallelism_target = min(
-                        executor_parallelism_limit,
-                        self._effective_parallelism(get_latest_info(), len(chunks)),
+                    self._dispatch_pending_chunks(
+                        executor=executor,
+                        metadata=metadata,
+                        work_dir=work_dir,
+                        pending=pending,
+                        running=running,
+                        attempts=attempts,
+                        request_plan=request_plan,
+                        executor_parallelism_limit=executor_parallelism_limit,
+                        chunk_count=len(chunks),
+                        get_latest_info=get_latest_info,
+                        diagnostics=scheduling_diagnostics,
                     )
-                    if pending and len(running) < current_parallelism_target:
-                        latest_info = get_latest_info()
-                        dispatch_capacity = (
-                            min(
-                                current_parallelism_target,
-                                self._dispatch_capacity(latest_info),
-                            )
-                            if latest_info is not None
-                            else current_parallelism_target
-                        )
-                        allowed_new = max(
-                            0,
-                            min(
-                                dispatch_capacity - len(running),
-                                len(pending),
-                            ),
-                        )
-                        if allowed_new == 0 and not running and pending:
-                            allowed_new = 1
-                        for _ in range(allowed_new):
-                            chunk = pending.pop(0)
-                            attempts[chunk.index] += 1
-                            future = executor.submit(
-                                self._transcribe_chunk,
-                                metadata.path,
-                                str(work_dir),
-                                chunk,
-                                attempts[chunk.index],
-                                request_plan,
-                            )
-                            running[future] = (chunk, attempts[chunk.index])
 
                     if not running:
+                        scheduling_diagnostics.idle_poll_wait_count += 1
                         time.sleep(self.config.idle_poll_interval_sec)
                         continue
 
@@ -1833,6 +1941,7 @@ class LongAudioTranscriber:
                         return_when=FIRST_COMPLETED,
                     )
                     if not done:
+                        scheduling_diagnostics.wait_timeout_count += 1
                         continue
 
                     for future in done:
@@ -1850,6 +1959,29 @@ class LongAudioTranscriber:
                                 )
                                 continue
                             raise
+                    if pending:
+                        scheduling_diagnostics.completion_refill_trigger_count += 1
+                        scheduling_diagnostics.forced_machine_refresh_count += 1
+                        completion_dispatched = self._dispatch_pending_chunks(
+                            executor=executor,
+                            metadata=metadata,
+                            work_dir=work_dir,
+                            pending=pending,
+                            running=running,
+                            attempts=attempts,
+                            request_plan=request_plan,
+                            executor_parallelism_limit=executor_parallelism_limit,
+                            chunk_count=len(chunks),
+                            get_latest_info=get_latest_info,
+                            diagnostics=scheduling_diagnostics,
+                            initial_info=get_latest_info(force=True),
+                            initial_info_was_forced=True,
+                        )
+                        if completion_dispatched > 0:
+                            scheduling_diagnostics.completion_refill_hit_count += 1
+                            scheduling_diagnostics.completion_refill_dispatched_chunk_count += (
+                                completion_dispatched
+                            )
 
             total_time_sec = time.perf_counter() - started_at
             merged_text, language, merged_segments = merge_transcribed_chunks(
@@ -1876,6 +2008,7 @@ class LongAudioTranscriber:
                 max_parallel_chunks=effective_parallelism,
                 endpoint=self.endpoint,
                 machine_snapshot=snapshot,
+                scheduling_diagnostics=scheduling_diagnostics,
                 text=merged_text,
                 language=language,
                 merged_segments=merged_segments,

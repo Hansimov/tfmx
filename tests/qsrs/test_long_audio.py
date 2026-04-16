@@ -12,6 +12,7 @@ from tfmx.qsrs.long_audio import ChunkTranscriptionResult
 from tfmx.qsrs.long_audio import LongAudioTranscriptionResult
 from tfmx.qsrs.long_audio import LongAudioTranscriber
 from tfmx.qsrs.long_audio import QualityFallbackTrace
+from tfmx.qsrs.long_audio import SchedulingDiagnostics
 from tfmx.qsrs.long_audio import SilenceRegion
 from tfmx.qsrs.long_audio import _repair_pathological_repetition
 from tfmx.qsrs.long_audio import _targeted_edge_resplit_side
@@ -364,6 +365,214 @@ class TestLongAudioResponseFormat:
 
         assert request_plan.response_format == "verbose_json"
         assert resolved_probe_result is probe_result
+
+
+class TestLongAudioScheduling:
+    def test_dispatch_pending_chunks_fills_available_capacity(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27993")
+        metadata = AudioMetadata(path="/tmp/input.wav", duration_sec=30.0)
+        pending = [
+            AudioChunk(index=1, start_sec=10.0, end_sec=20.0),
+            AudioChunk(index=2, start_sec=20.0, end_sec=30.0),
+        ]
+        running = {object(): (AudioChunk(index=0, start_sec=0.0, end_sec=10.0), 1)}
+        attempts = {0: 1, 1: 0, 2: 0}
+        request_plan = ChunkRequestPlan()
+
+        class FakeExecutor:
+            def __init__(self):
+                self.calls: list[tuple[int, int]] = []
+
+            def submit(self, func, audio_path, work_dir, chunk, attempt, plan):
+                del func
+                del audio_path
+                del work_dir
+                del plan
+                self.calls.append((chunk.index, attempt))
+                return object()
+
+        info = InfoResponse.from_dict(
+            {
+                "port": 27900,
+                "instances": [
+                    {
+                        "name": "gpu0",
+                        "endpoint": "http://localhost:27980",
+                        "healthy": True,
+                        "sleeping": False,
+                        "active_requests": 0,
+                        "available_slots": 1,
+                        "scheduler": {},
+                    },
+                    {
+                        "name": "gpu1",
+                        "endpoint": "http://localhost:27981",
+                        "healthy": True,
+                        "sleeping": False,
+                        "active_requests": 0,
+                        "available_slots": 1,
+                        "scheduler": {},
+                    },
+                ],
+                "stats": {},
+                "available_models": [],
+                "scheduler": {},
+            }
+        )
+        executor = FakeExecutor()
+        diagnostics = SchedulingDiagnostics()
+
+        dispatched = transcriber._dispatch_pending_chunks(
+            executor=executor,
+            metadata=metadata,
+            work_dir="/tmp",
+            pending=pending,
+            running=running,
+            attempts=attempts,
+            request_plan=request_plan,
+            executor_parallelism_limit=2,
+            chunk_count=3,
+            get_latest_info=lambda force=False: info,
+            diagnostics=diagnostics,
+        )
+
+        assert dispatched == 1
+        assert executor.calls == [(1, 1)]
+        assert attempts[1] == 1
+        assert len(running) == 2
+        assert [chunk.index for chunk in pending] == [2]
+        assert diagnostics.to_dict() == {
+            "dispatch_cycle_count": 1,
+            "forced_machine_refresh_count": 0,
+            "forced_machine_refresh_hit_count": 0,
+            "completion_refill_trigger_count": 0,
+            "completion_refill_hit_count": 0,
+            "completion_refill_dispatched_chunk_count": 0,
+            "idle_poll_wait_count": 0,
+            "wait_timeout_count": 0,
+        }
+
+    def test_dispatch_pending_chunks_counts_forced_refresh_hits(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27994")
+        transcriber.config.max_parallel_chunks = 2
+        metadata = AudioMetadata(path="/tmp/input.wav", duration_sec=30.0)
+        pending = [AudioChunk(index=0, start_sec=0.0, end_sec=10.0)]
+        running = {object(): (AudioChunk(index=1, start_sec=10.0, end_sec=20.0), 1)}
+        attempts = {0: 0, 1: 1}
+        request_plan = ChunkRequestPlan()
+        diagnostics = SchedulingDiagnostics()
+
+        class FakeExecutor:
+            def __init__(self):
+                self.calls: list[tuple[int, int]] = []
+
+            def submit(self, func, audio_path, work_dir, chunk, attempt, plan):
+                del func
+                del audio_path
+                del work_dir
+                del plan
+                self.calls.append((chunk.index, attempt))
+                return object()
+
+        stale_info = InfoResponse.from_dict(
+            {
+                "port": 27900,
+                "instances": [
+                    {
+                        "name": "gpu0",
+                        "endpoint": "http://localhost:27980",
+                        "healthy": True,
+                        "sleeping": False,
+                        "active_requests": 1,
+                        "available_slots": 0,
+                        "scheduler": {},
+                    }
+                ],
+                "stats": {},
+                "available_models": [],
+                "scheduler": {},
+            }
+        )
+        refreshed_info = InfoResponse.from_dict(
+            {
+                "port": 27900,
+                "instances": [
+                    {
+                        "name": "gpu0",
+                        "endpoint": "http://localhost:27980",
+                        "healthy": True,
+                        "sleeping": False,
+                        "active_requests": 0,
+                        "available_slots": 2,
+                        "scheduler": {},
+                    }
+                ],
+                "stats": {},
+                "available_models": [],
+                "scheduler": {},
+            }
+        )
+
+        def latest_info(force: bool = False):
+            return refreshed_info if force else stale_info
+
+        executor = FakeExecutor()
+
+        dispatched = transcriber._dispatch_pending_chunks(
+            executor=executor,
+            metadata=metadata,
+            work_dir="/tmp",
+            pending=pending,
+            running=running,
+            attempts=attempts,
+            request_plan=request_plan,
+            executor_parallelism_limit=2,
+            chunk_count=2,
+            get_latest_info=latest_info,
+            diagnostics=diagnostics,
+        )
+
+        assert dispatched == 1
+        assert executor.calls == [(0, 1)]
+        assert diagnostics.forced_machine_refresh_count == 1
+        assert diagnostics.forced_machine_refresh_hit_count == 1
+
+
+class TestLongAudioResultSerialization:
+    def test_to_dict_includes_scheduling_diagnostics(self):
+        result = LongAudioTranscriptionResult(
+            audio="/tmp/input.wav",
+            metadata=AudioMetadata(path="/tmp/input.wav", duration_sec=12.0),
+            chunks=[AudioChunk(index=0, start_sec=0.0, end_sec=12.0)],
+            silence_regions=[],
+            chunk_results=[],
+            total_time_sec=3.0,
+            max_parallel_chunks=2,
+            endpoint="http://127.0.0.1:27900",
+            machine_snapshot={"healthy_instances": 1},
+            scheduling_diagnostics=SchedulingDiagnostics(
+                completion_refill_trigger_count=2,
+                completion_refill_hit_count=1,
+                completion_refill_dispatched_chunk_count=3,
+                forced_machine_refresh_count=4,
+                forced_machine_refresh_hit_count=2,
+            ),
+            text="ok",
+            language="zh",
+        )
+
+        payload = result.to_dict()
+
+        assert payload["scheduling"]["diagnostics"] == {
+            "dispatch_cycle_count": 0,
+            "forced_machine_refresh_count": 4,
+            "forced_machine_refresh_hit_count": 2,
+            "completion_refill_trigger_count": 2,
+            "completion_refill_hit_count": 1,
+            "completion_refill_dispatched_chunk_count": 3,
+            "idle_poll_wait_count": 0,
+            "wait_timeout_count": 0,
+        }
 
 
 class TestLongAudioQualityFallback:
