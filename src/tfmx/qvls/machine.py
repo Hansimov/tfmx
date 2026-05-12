@@ -206,6 +206,8 @@ class ChatCompletionResponse(BaseModel):
 class InstanceHealthDetail(BaseModel):
     """Per-instance health detail for health endpoint."""
 
+    model_config = {"protected_namespaces": ()}
+
     name: str = Field(..., description="Container/instance name")
     endpoint: str = Field(..., description="HTTP endpoint URL")
     healthy: bool = Field(..., description="Whether instance is healthy")
@@ -246,6 +248,8 @@ class ModelsResponse(BaseModel):
 
 class InstanceInfo(BaseModel):
     """Information about a single vLLM instance."""
+
+    model_config = {"protected_namespaces": ()}
 
     name: str = Field(..., description="Container name")
     endpoint: str = Field(..., description="HTTP endpoint URL")

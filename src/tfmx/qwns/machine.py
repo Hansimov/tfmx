@@ -133,6 +133,8 @@ class ChatCompletionResponse(BaseModel):
 
 
 class InstanceHealthDetail(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     name: str = Field(..., description="Container or instance name")
     endpoint: str = Field(..., description="HTTP endpoint URL")
     healthy: bool = Field(..., description="Whether instance is healthy")
@@ -185,6 +187,8 @@ class InstanceSchedulerInfo(BaseModel):
 
 
 class InstanceInfo(BaseModel):
+    model_config = {"protected_namespaces": ()}
+
     name: str = Field(...)
     endpoint: str = Field(...)
     gpu_id: int | None = Field(None)
