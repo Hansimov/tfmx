@@ -333,6 +333,35 @@ class TestLongAudioResponseFormat:
         assert request_plan.response_format == "json"
         assert probe_result is None
 
+    def test_cached_verbose_json_support_is_reprobed_before_reuse(self):
+        transcriber = LongAudioTranscriber("http://127.0.0.1:27995")
+        transcriber._set_cached_verbose_json_support(True)
+        chunk = AudioChunk(index=0, start_sec=0.0, end_sec=10.0)
+        request = httpx.Request(
+            "POST",
+            "http://127.0.0.1:27995/v1/audio/transcriptions",
+        )
+        response = httpx.Response(400, request=request, text='{"detail":"unsupported"}')
+
+        with patch.object(
+            LongAudioTranscriber,
+            "_transcribe_chunk_with_plan",
+            side_effect=httpx.HTTPStatusError(
+                "unsupported verbose_json",
+                request=request,
+                response=response,
+            ),
+        ) as transcribe:
+            request_plan, probe_result = transcriber._resolve_chunk_request_plan(
+                "/tmp/input.wav",
+                "/tmp/work",
+                chunk,
+            )
+
+        assert request_plan.response_format == "json"
+        assert probe_result is None
+        assert transcribe.call_count == 1
+
     def test_resolve_chunk_request_plan_keeps_segment_probe_result(self):
         transcriber = LongAudioTranscriber("http://127.0.0.1:27992")
         chunk = AudioChunk(index=0, start_sec=0.0, end_sec=10.0)

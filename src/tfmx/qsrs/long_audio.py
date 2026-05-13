@@ -1427,8 +1427,6 @@ class LongAudioTranscriber:
             return _JSON_CHUNK_REQUEST_PLAN, None
 
         cached_support = self._get_cached_verbose_json_support()
-        if cached_support is True:
-            return _VERBOSE_JSON_CHUNK_REQUEST_PLAN, None
         if cached_support is False:
             return _JSON_CHUNK_REQUEST_PLAN, None
 
